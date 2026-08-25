@@ -1,6 +1,7 @@
 package com.deepseek.harness;
 
 import android.content.Context;
+import android.content.Intent;
 import android.util.Log;
 
 import java.io.BufferedReader;
@@ -25,18 +26,12 @@ import java.util.Locale;
 public final class ScheduleExecutor {
     private static final String TAG = "ScheduleExecutor";
     private static final String REL_BINJS = "lib/node_modules/@deepseek-ai/dsh/lib/bin.js";
-    private static final String PREFS = "dsh_setup";
 
     private ScheduleExecutor() {}
 
-    /** 引擎端口：与 MainActivity 保持一致（它换端口后会持久化到 SharedPreferences）。
-     *  修复 v1.5.1：原来硬编码 3080，主引擎换端口后定时任务仍连 3080 → 连到占位服务/失败。 */
+    /** 引擎端口：固定默认端口（v1.5.4 起移除「端口冲突自动换端口」，与 MainActivity 一致，不再读 engine_port）。 */
     private static int enginePort(Context ctx) {
-        try {
-            int saved = ctx.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).getInt("engine_port", 0);
-            if (saved >= 3080 && saved <= 3099) return saved;
-        } catch (Throwable ignored) {}
-        return 3080; // 默认（与 MainActivity 一致）
+        return 3080; // 默认（正式版；Lite 版由构建时改 3082 / 抢先版 3084）
     }
 
     /** 执行一条定时任务（后台线程，调用方勿阻塞主线程）。 */
@@ -66,14 +61,55 @@ public final class ScheduleExecutor {
                 return;
             }
             String promptResp = sendPromptRaw(ctx, sessionId, task);
-            log(ctx, promptResp == null
-                    ? "任务发送失败（无响应）: " + task
-                    : (promptResp.contains("\"ok\":true")
-                        ? "任务已发送给 AI: " + task
-                        : "任务发送失败，响应: " + promptResp.replace("\n", " ").substring(0, Math.min(300, promptResp.length()))));
+            boolean ok = promptResp != null && promptResp.contains("\"ok\":true");
+            String summary;
+            if (promptResp == null) {
+                summary = "任务发送失败（无响应）: " + task;
+            } else if (ok) {
+                summary = "任务已发送给 AI: " + task;
+            } else {
+                summary = "任务发送失败，响应: " + promptResp.replace("\n", " ").substring(0, Math.min(300, promptResp.length()));
+            }
+            log(ctx, summary);
+            notifyResult(ctx, ok, ok ? "✅ 定时任务已执行：\n" + task : summary);
         } catch (Throwable t) {
-            log(ctx, "执行异常: " + t.getMessage());
+            String msg = "执行异常: " + t.getMessage();
+            log(ctx, msg);
+            notifyResult(ctx, false, msg);
         }
+    }
+
+    /** 定时任务结果通知（Kun 式回报：执行成功/失败都通知用户，点开进 App）。 */
+    private static void notifyResult(Context ctx, boolean ok, String summary) {
+        try {
+            android.app.NotificationManager nm = (android.app.NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm == null) return;
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                android.app.NotificationChannel ch = new android.app.NotificationChannel("dsh_schedule", "定时任务",
+                        android.app.NotificationManager.IMPORTANCE_HIGH);
+                ch.setDescription("AI 设置的定时提醒与任务结果");
+                nm.createNotificationChannel(ch);
+            }
+            Intent open = new Intent(ctx, MainActivity.class);
+            open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+            android.app.PendingIntent pi = android.app.PendingIntent.getActivity(ctx, 0, open,
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT | android.app.PendingIntent.FLAG_IMMUTABLE);
+            android.app.Notification.Builder b;
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                b = new android.app.Notification.Builder(ctx, "dsh_schedule");
+            } else {
+                b = new android.app.Notification.Builder(ctx);
+            }
+            String title = ok ? "✅ 定时任务执行成功" : "❌ 定时任务执行失败";
+            String text = summary != null && summary.length() > 200 ? summary.substring(0, 200) : summary;
+            android.app.Notification n = b.setContentTitle(title)
+                    .setContentText(text)
+                    .setSmallIcon(R.drawable.ic_launcher)
+                    .setContentIntent(pi)
+                    .setAutoCancel(true)
+                    .build();
+            nm.notify(ok ? 9003 : 9004, n);
+        } catch (Throwable ignored) {}
     }
 
     /** 引擎是否已在目标端口响应，且确认是 DSH 引擎（首页含 <title>DeepSeek Harness</title>）。
@@ -87,11 +123,18 @@ public final class ScheduleExecutor {
             int code = c.getResponseCode();
             if (code < 200 || code >= 500) return false;
             InputStream in = c.getInputStream();
-            byte[] buf = new byte[4096];
-            int n = in.read(buf);
+            // v1.5.5 修复：首页约 14KB，<title> 在页面末尾（旧实现只读 4096 字节永远匹配不到）。
+            // 读完整页（上限 256KB），与 MainActivity.isDshEngine 保持一致。
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int total = 0;
+            int r;
+            while ((r = in.read(chunk)) > 0 && total < 262144) {
+                body.write(chunk, 0, r);
+                total += r;
+            }
             try { in.close(); } catch (Throwable ignored) {}
-            if (n <= 0) return false;
-            return new String(buf, 0, n, "UTF-8").contains("<title>DeepSeek Harness</title>");
+            return body.toString("UTF-8").contains("<title>DeepSeek Harness</title>");
         } catch (Throwable t) {
             return false;
         } finally {
@@ -105,19 +148,21 @@ public final class ScheduleExecutor {
         try {
             File payload = new File(ctx.getFilesDir(), "payload");
             File node = new File(payload, "runtime/bin/node");
-            // dshroot：本包外部目录优先（正式版 DeepSeekHarness / Lite DeepSeekHarnessLite），
-            // 再回退另一版本目录，最后内部 fallback（修复 v1.5.1：原顺序 Lite 恒优先，正式版会错用 Lite 的 dshroot）
-            String selfRoot = ctx.getPackageName().contains(".beta")
-                    ? "DeepSeekHarnessLite" : "DeepSeekHarness";
-            String otherRoot = selfRoot.equals("DeepSeekHarnessLite") ? "DeepSeekHarness" : "DeepSeekHarnessLite";
+            // dshroot：v1.5.3 起【内部优先】（主引擎同款——内部存储读内核快，避免真机外部 FUSE
+            // 2 万+ 文件 stat 风暴造成 50-60s 慢启动）；内部缺失时回退本包外部目录
+            //（正式版 DeepSeekHarness / Lite DeepSeekHarnessLite），再回退另一版本目录。
             File dshroot = null;
-            for (String root : new String[]{selfRoot, otherRoot}) {
-                File ext = new File(android.os.Environment.getExternalStorageDirectory(), root + "/dshroot");
-                if (new File(ext, REL_BINJS).exists()) { dshroot = ext; break; }
-            }
-            if (dshroot == null) {
-                File internal = new File(payload, "dshroot");
-                if (new File(internal, REL_BINJS).exists()) dshroot = internal;
+            File internal = new File(payload, "dshroot");
+            if (new File(internal, REL_BINJS).exists()) {
+                dshroot = internal;
+            } else {
+                String selfRoot = ctx.getPackageName().contains(".beta")
+                        ? "DeepSeekHarnessLite" : "DeepSeekHarness";
+                String otherRoot = selfRoot.equals("DeepSeekHarnessLite") ? "DeepSeekHarness" : "DeepSeekHarnessLite";
+                for (String root : new String[]{selfRoot, otherRoot}) {
+                    File ext = new File(android.os.Environment.getExternalStorageDirectory(), root + "/dshroot");
+                    if (new File(ext, REL_BINJS).exists()) { dshroot = ext; break; }
+                }
             }
             if (dshroot == null) { log(ctx, "dshroot 未找到"); return false; }
             File binjs = new File(dshroot, REL_BINJS);
