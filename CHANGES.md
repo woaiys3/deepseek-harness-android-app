@@ -1,5 +1,46 @@
 # DeepSeek Harness Android · 移动端优化改动清单
 
+## v1.6.5（正式版 + Lite + 兼容版 · 2026-08-25）
+
+> 内核 DSH 0.1.1-rc.2，versionCode 16，targetSdk 28。三个版本可共存：正式版（com.deepseek.harness，3080）/ Lite（.beta，3082）/ **兼容版（.compat，3084，新）**。
+
+### ✨ 新功能
+- **AI 工作区（可选）**：权限页 SAF 选择外部共享存储文件夹（如 /sdcard/Documents）作为 AI 文件操作工作根目录，启动时经 `DSH_WORKSPACE` 环境变量传给引擎，bash 工具 cwd 自动切换；不限制工作区外访问权限
+- **悬浮窗改 DSH 官方黑鲸鱼图标**（无背景）+ 展开面板显示引擎状态与 **AI 回复状态**（空闲/回复中，每 ~6 秒经 session.list 的 running 字段刷新）
+- **内置 curl**：Android 系统无 curl，打包 termux NDK 原生构建的 curl 8.21.0 + libcurl/libnghttp2/3/libngtcp2/libssh2 依赖到 runtime，AI 可直接使用
+
+### 🐛 修复
+- **老安卓 WebView 兼容**：DSH 前端（Vite 6）需 Chromium 80+（module script + 可选链/nullish），Android 7/8 出厂 WebView（Chromium 51/59）白屏被误认“引擎启动失败”。正式版/Lite 启动检测 WebView 版本并提示引导；新增**兼容版 APK**（esbuild 打包 + polyfill 转译，老 WebView 可用）
+- **版本比较 bug**：versionName 带后缀（1.6.5-test/lite/compat）时版本段解析失败变 0，导致误弹“发现新版本”，已改为提取数字前缀
+- 悬浮窗会话状态解析（session.list 响应结构为 result.value.items，此前多解析一层）
+
+### 发布
+- GitHub Release v1.6.5：正式版 / Lite / 兼容版 三 APK
+
+## v1.6.1（2026-08-24）
+
+- Write 工具修复（dsh-tool-fs 写文件链路）
+
+## v1.6.0（2026-08-24）
+
+- 修复：history unavailable（attachment-local 缺 maxImageDimension → 默认 2000）、识图必挂（补 readImageRequest）、read_image EACCES（syncDirectory 容错）、grep/glob（内置 rg 15.2.0 + libpcre2）、android_usage/overlay（GET 读超时 + JSON.parse + schema）、Lite SHIZUKU_APP_ID
+- 新功能：定时任务 Kun 式增强（repeat daily/interval + 结果通知）、应用使用时长（UsageStats /usage）、小鲸鱼悬浮窗（OverlayService）、android_overlay 工具
+
+## v1.5.5（✅ 正式版：慢启动根因修复 · 2026-08-23）
+
+> 纯修复版：功能基线同 v1.5.4（无端口冲突自动换端口，端口被占会启动失败属预期）。
+> 内核 DSH 0.1.1-rc.2。真机验证（MT6835 / Android 15）：第二次冷启动 ~4s（正式版）/ ~4.6s（Lite，删除外部旧目录后完全内部存储），无超时。
+
+### 已修复
+- **慢启动根因（90s 超时）**：v1.5.1 引入的 `isDshEngine()` 健康检查只读首页**前 4096 字节**查找 `<title>DeepSeek Harness</title>`，但 DSH 首页实际约 14KB，`<title>` 位于**第 ~13.4KB 处**（13KB 内联引导脚本在前）→ 永远匹配不到 → `waitForServer` 干等 90s 超时（引擎其实 5s 就绪）。改为**读完整页面**（上限 256KB，本地读取 <50ms）；`ScheduleExecutor.engineReady()` 同步修复
+- **排查排除项（有实测证据）**：payload 与 v1.4.0 逐字节一致；真机 cpuset 0-7 / top-app / ~2GHz 无资源限制；外部 FUSE 存储非主因（内部模式同样生效）
+
+### 发布
+- GitHub Release v1.5.5：`DeepSeekHarness-v1.5.5.apk`（正式版 com.deepseek.harness，versionCode 12）+ `DeepSeekHarness-Lite-v1.5.5.apk`（Lite 共存版 com.deepseek.harness.beta，端口 3082）
+
+### 📌 说明
+- 规划中的新功能（定时任务 Kun 式增强 / 应用使用时长 UsageStats / 小鲸鱼悬浮窗 / 插件适配加强）**代码已完成**（工作区 build/ 与 build-lite/），归入 **v1.6**
+
 ## v1.5.0（⚠️ 测试版本：功能增强 + 稳定性修复 · 2026-08-21）
 
 > ⚠️ **本版本为测试版本（非正式版）**：新功能已实现且主要链路验证通过，
