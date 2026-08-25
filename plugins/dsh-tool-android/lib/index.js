@@ -15,6 +15,7 @@
  */
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { spawn } from "node:child_process";
+import { get as httpGet } from "node:http";
 import { chmodSync, existsSync } from "node:fs";
 
 const name = "tool-android";
@@ -53,6 +54,28 @@ function ensureDexReadOnly(dex) {
 /** 只允许安全的 shell 令牌字符，防止命令注入。 */
 function safe(s) {
   return String(s ?? "").replace(/[^a-zA-Z0-9._\/:=-]/g, "");
+}
+
+/** App 本地 HTTP 服务端口（MainActivity 注入环境变量 APP_NOTIFY_PORT，默认 3081）。 */
+const appPort = () => parseInt(process.env.APP_NOTIFY_PORT || "3081", 10);
+
+/** 调 App 本地 HTTP 端点（GET）。用于 usage/overlay 等 App 层能力，无需特权通道。 */
+function appRequest(path, params) {
+  return new Promise((resolve) => {
+    const qs = params
+      ? "?" + Object.entries(params).map(([k, v]) =>
+          encodeURIComponent(k) + "=" + encodeURIComponent(v)).join("&")
+      : "";
+    const req = httpGet({ host: "127.0.0.1", port: appPort(), path: path + qs, timeout: 8000 }, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { data += c; if (data.length > 65536) req.destroy(); });
+      res.on("end", () => resolve(data || "{\"ok\":false,\"error\":\"empty response\"}"));
+    });
+    req.on("error", () => resolve("{\"ok\":false,\"error\":\"App 本地服务不可用（请先启动 DeepSeek Harness）\"}"));
+    req.on("timeout", () => { req.destroy(); resolve("{\"ok\":false,\"error\":\"App 本地服务超时\"}"); });
+    req.end();
+  });
 }
 
 /** 异步执行一条 Shizuku shell 命令。 */
@@ -198,8 +221,45 @@ function apply(ctx) {
   const dex = () => process.env.SHIZUKU_DEX;
   const appId = () => process.env.SHIZUKU_APP_ID;
 
-  // 未授予 root 且未授予 Shizuku 时**不注册任何工具**：
-  // AI 工具列表里没有 android_*，就不会反复尝试系统操作；
+  // ===== App 层工具（无需 root/Shizuku，走 App 本地 HTTP 服务）=====
+  // 这些能力由 DeepSeek Harness App 自身实现（UsageStats/悬浮窗权限），
+  // 不依赖特权通道，因此即使未授权 root/Shizuku 也注册。
+
+  // 应用使用时长（UsageStats：需用户在系统设置授予「使用情况访问」权限）
+  ctx.tools.register(defineTool({
+    name: "android_usage",
+    description:
+      "查询手机各应用的使用时长（UsageStats）：返回最近 N 天每个应用的前台使用时长（毫秒/分钟），按时长降序。" +
+      "可用于回答「今天/本周哪些应用用得最多」「某应用用了多久」等问题。App 需已授予「使用情况访问」权限。",
+    parameters: {
+      days: { type: "number", description: "查询最近几天（默认 1，上限 30）" }
+    },
+    output: { schema: resultSchema(), render: (_a, v) => renderResult(v) },
+    async execute(args, exec) {
+      return await appRequest("/usage", args.days ? { days: String(Math.max(1, Math.min(30, Number(args.days) || 1))) } : undefined);
+    }
+  }));
+
+  // 小鲸鱼悬浮窗控制（含引擎状态显示；需已授予悬浮窗权限）
+  ctx.tools.register(defineTool({
+    name: "android_overlay",
+    description:
+      "控制 DeepSeek Harness 的小鲸鱼悬浮窗：show=显示悬浮窗（小鲸鱼图标，点击展开引擎状态面板）；" +
+      "hide=隐藏；status=查询悬浮窗与引擎运行状态。需已授予悬浮窗权限。",
+    parameters: {
+      action: {
+        type: "string", required: true, enum: ["show", "hide", "status"],
+        description: "show=显示悬浮窗；hide=隐藏；status=查询状态"
+      }
+    },
+    output: { schema: resultSchema(), render: (_a, v) => renderResult(v) },
+    async execute(args, exec) {
+      return await appRequest("/overlay", { action: String(args.action || "status") });
+    }
+  }));
+
+  // 未授予 root 且未授予 Shizuku 时：不注册下面这些系统操作工具（android_package 等），
+  // AI 工具列表里没有特权工具，就不会反复尝试系统操作；
   // 此时文件读写用 DSH 自带的 fs/bash 工具（只需所有文件访问权限）。
   if (!privilegedAvailable()) return;
 
