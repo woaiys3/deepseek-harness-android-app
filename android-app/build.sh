@@ -34,6 +34,20 @@ mkdir -p "$P/staging/runtime/bin" "$P/staging/runtime/lib" \
          "$P/staging/dshhome/profiles/web" "$P/assets"
 
 cp -L "$H/runtime/bin/node" "$P/staging/runtime/bin/node"
+# Android 内置 ripgrep（grep/glob 工具用，@vscode/ripgrep 无 android 平台包）：
+# rg 由 dsh-tool-fs-search 在 @vscode/ripgrep 解析失败后回退查找（runtime/bin/rg）
+if [ -f "$H/runtime/bin/rg" ]; then
+  cp -L "$H/runtime/bin/rg" "$P/staging/runtime/bin/rg"
+  chmod +x "$P/staging/runtime/bin/rg"
+  echo "  内置 rg: runtime/bin/rg"
+# Android 内置 curl（AI 的 bash 工具用，Android 系统不带 curl）：
+# termux 静态构建（NDK r29，interpreter /system/bin/linker64），依赖 libcurl/libnghttp2/3/ngtcp2/libssh2/openssl
+if [ -f "$H/runtime/bin/curl" ]; then
+  cp -L "$H/runtime/bin/curl" "$P/staging/runtime/bin/curl"
+  chmod +x "$P/staging/runtime/bin/curl"
+  echo "  内置 curl: runtime/bin/curl"
+fi
+fi
 
 for f in $(find "$H/runtime/lib" -maxdepth 1 -type f); do
   cp -L "$f" "$P/staging/runtime/lib/"
@@ -84,6 +98,17 @@ mkdir -p "$P/staging/dshroot/lib"
 DSHROOT_REV="$(date +%Y%m%d%H%M%S)"
 echo "$DSHROOT_REV" > "$P/staging/dshroot/REVISION"
 echo "$DSHROOT_REV" > "$P/assets/dshroot_revision.txt"
+
+# 内核版本标记（v1.5.2 慢启动修复）：REVISION 是构建时间戳，每次构建都变；
+# App 用它区分「同内核升级（内容几乎不变，快速同步即可）」与「内核升级（新增文件，需全量补齐）」。
+DSHROOT_PKG_JSON="$P/staging/dshroot/lib/node_modules/@deepseek-ai/dsh/package.json"
+if [ -f "$DSHROOT_PKG_JSON" ]; then
+  grep -m1 '"version"' "$DSHROOT_PKG_JSON" | sed -E 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' > "$P/assets/dshroot_kernel_version.txt"
+  echo "  内核版本标记: $(cat "$P/assets/dshroot_kernel_version.txt")"
+else
+  echo "  !! 未找到 dsh/package.json，内核版本标记留空（App 将保守全量补齐）"
+  : > "$P/assets/dshroot_kernel_version.txt"
+fi
 
 cat > "$P/staging/bin/bash" <<'EOF'
 #!/system/bin/sh
@@ -146,7 +171,7 @@ fi
 # javac 必须成功：失败立即中止（曾因 javac 找不到而产出无 MainActivity 的坏 APK，安装即闪退）
 if ! "$JAVA/javac" -source 1.8 -target 1.8 -bootclasspath "$AJ" \
   -classpath "$GEN_CP${CP_SEP}$SHIZUKU_JARS" -d "$P/out/classes" \
-  "$P/src/com/deepseek/harness/MainActivity.java" "$P/src/com/deepseek/harness/EngineService.java" "$P/src/com/deepseek/harness/AlarmReceiver.java" "$P/src/com/deepseek/harness/ScheduleExecutor.java" "$P/out/gen/com/deepseek/harness/R.java" \
+  "$P/src/com/deepseek/harness/MainActivity.java" "$P/src/com/deepseek/harness/EngineService.java" "$P/src/com/deepseek/harness/AlarmReceiver.java" "$P/src/com/deepseek/harness/ScheduleExecutor.java" "$P/src/com/deepseek/harness/OverlayService.java" "$P/src/com/deepseek/harness/UsageStatsHelper.java" "$P/out/gen/com/deepseek/harness/R.java" \
   >"$P/out/javac.log" 2>&1; then
   echo "!! javac 编译失败，日志：$P/out/javac.log"
   tail -20 "$P/out/javac.log"
