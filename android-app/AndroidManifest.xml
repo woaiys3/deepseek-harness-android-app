@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.deepseek.harness"
-    android:versionCode="8"
-    android:versionName="1.5.1">
+    android:versionCode="16"
+    android:versionName="1.6.5">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
 
@@ -56,6 +56,11 @@
         <!-- 定时任务闹钟接收器（⑥）：AI 设置定时后由系统闹钟唤醒，即使 App 被杀也能触发 -->
         <receiver
             android:name=".AlarmReceiver"
+            android:exported="false" />
+
+        <!-- 小鲸鱼悬浮窗（含引擎状态显示） -->
+        <service
+            android:name=".OverlayService"
             android:exported="false" />
 
         <provider
