@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">DeepSeek Harness</string>
+    <!-- v1.7 无障碍服务：系统设置里的描述文案（用户开启无障碍时可见） -->
+    <string name="accessibility_service_description">让 AI 读取当前屏幕内容（控件文字与位置）并替你点击、输入、滚动，实现「看着屏幕操作手机」。开启后 AI 才能执行屏幕操作类任务；所有操作仅在你主动发起对话时执行，不采集任何数据。</string>
 </resources>
