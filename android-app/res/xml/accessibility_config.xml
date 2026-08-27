@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  v1.7 无障碍服务配置：给 AI 提供「读屏幕节点树 + 模拟操作 + 无障碍截图」能力。
+  - canRetrieveWindowContent：读取窗口节点树（dump/tap 查找的基础）
+  - canPerformGestures：任意坐标点击/滑动（dispatchGesture，API 24+）
+  - canTakeScreenshot：Android 11+ 无障碍截图（免 MediaProjection 弹窗）
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged|typeWindowsChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canRetrieveWindowContent="true"
+    android:canPerformGestures="true"
+    android:canTakeScreenshot="true"
+    android:notificationTimeout="200"
+    android:description="@string/accessibility_service_description" />
