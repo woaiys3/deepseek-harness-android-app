@@ -12,6 +12,7 @@
 - 🔓 **免 Root 系统特权**：通过 Shizuku 打通系统 shell —— AI 能**装应用、点屏幕、改系统设置、截图、模拟输入**，这是"手机上的 AI Agent"，不只是聊天窗口
 - 🟢 **可选特权，不授予也能正常用**（v1.4.0）：不装 Shizuku/无 root 也能用——文件读写、预览、编辑只需「所有文件访问」权限；未授权时 AI 不会反复尝试系统操作，需要时会**引导你授权**
 - 🔀 **Root 优先，Shizuku 备用**（v1.4.0）：有 root 走 su 通道，无 root 走 Shizuku，自动选择
+- 👁️ **无障碍屏幕助手**（v1.7.0）：系统设置开启「DeepSeek Harness 屏幕助手」后，AI 能**读屏、点击、输入、滚动、无障碍截图理解**——**不需要 root / Shizuku**，与特权通道互补
 - ⏰ **前台保活**（v1.4.0）：AI 干活时挂后台/锁屏不被杀，任务完成推送通知
 - 🔔 **AI 发通知**（v1.4.0）：只需通知权限，任务完成/需要关注时推送到通知栏
 - 🧠 **完整 DSH 内核**：`@deepseek-ai/dsh` 0.1.0-rc.6，保留插件生态 + RPC API，前端用 DSH 原生界面
@@ -40,15 +41,38 @@
 |---|---|
 | `dsh-tool-shizuku` | 特权 shell：任意系统命令（pm/am/settings/dumpsys…），异步执行 + 环境消毒 + dex 只读自愈 |
 | `dsh-tool-android` | 结构化系统操作：包管理 / 应用管理 / 系统设置 / 截图 / 模拟输入 |
+| `dsh-tool-accessibility` | 无障碍读屏 + 模拟操作（v1.7.0）：读控件树 / 点击 / 输入 / 返回主页 / 滚动 / 无障碍截图理解 |
 
-> 通过这两个插件，AI 不再只是"聊聊天"，而是能**真正控制你的手机**。
+> 通过这三个插件，AI 不再只是"聊聊天"，而是能**真正控制你的手机**——特权通道（root/Shizuku）负责系统级操作，无障碍通道（无需授权）负责读屏与交互。
+
+## 👁️ 无障碍屏幕助手（v1.7.0）
+
+让 AI **看着屏幕操作手机**：读屏、点击、输入、滚动、截图理解——**不需要 root / Shizuku**。
+
+### 开启方式
+1. 系统设置 → 无障碍 →（已下载的服务/服务）→ 开启「DeepSeek Harness 屏幕助手」
+2. 在 App 里让 AI：先用 `android_screen` 读屏 → 用 `android_tap` / `android_type` / `android_scroll` 操作 → 需要看图时用 `android_see` 截图理解
+
+### AI 可用工具
+| 工具 | 能力 |
+|---|---|
+| `android_a11y_status` | 查询无障碍服务状态（未开启时返回引导文案） |
+| `android_screen` | 读当前屏幕控件树（文字 / 坐标 / 可点击性 / 可输入性） |
+| `android_tap` | 按文字 / 描述 / 坐标点击 |
+| `android_type` | 输入文本到输入框（WebView / 网页输入框用 `paste:true` 走剪贴板粘贴） |
+| `android_back` / `android_home` | 系统返回键 / 回桌面 |
+| `android_scroll` | 上 / 下 / 左 / 右滚动 |
+| `android_see` | 无障碍截图并发送给视觉模型理解（需 Android 11+ 与支持图片的模型，如 `deepseek-v4-flash-vision-exp`） |
+
+> 无障碍通道与特权通道互补：无障碍不依赖授权、擅长读屏与点击；Shizuku/root 通道擅长系统级操作（装应用 / 改设置 / 系统输入）。
 
 ## 📦 安装
 
 下载 [Releases](https://github.com/woaiys3/deepseek-harness-android-app/releases) 里的 APK 安装即可：
 
-- **`DeepSeekHarness.apk`（v1.4.0，推荐）**：正式版，从旧版本同签名升级
-- **`DeepSeekHarness-Lite.apk`（v1.4.0-lite）**：**共存版**，包名 `com.deepseek.harness.beta`，与正式版完全独立、可同时安装——适合**不敢直接升级、想先试用**的用户；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填，测完可随时卸载（不影响正式版）
+- **`DeepSeekHarness-v1.7.0.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
+- **`DeepSeekHarness-Lite-v1.7.0.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
+- **`DeepSeekHarness-Compat-v1.7.0.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
 
 要求：
 - Android 7.0（API 24）及以上
@@ -78,7 +102,8 @@ mobile-patch/            移动端适配（注入 DSH 前端，不覆盖原生�
 
 plugins/                 手机端自定义 DSH 工具插件
 ├── dsh-tool-shizuku/    特权 shell（Shizuku 通道）
-└── dsh-tool-android/    结构化系统操作（包管理/应用/设置/截图/输入）
+├── dsh-tool-android/    结构化系统操作（包管理/应用/设置/截图/输入）
+└── dsh-tool-accessibility/  无障碍读屏/模拟操作（v1.7.0）
 
 dsh-patches/             DSH 源码补丁归档 + overlay
 ├── README.md            补丁说明（适配原因/升级 DSH/打包）
