@@ -1,0 +1,15 @@
+{
+  "name": "@deepseek-ai/dsh-tool-accessibility",
+  "version": "0.1.0",
+  "description": "Model-facing Android accessibility tools (read screen / tap / input / scroll / screenshot) over the harness App AccessibilityService.",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.0-rc.6",
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}
