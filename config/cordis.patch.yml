@@ -8,8 +8,11 @@
   disabled: true
 - id: bash-sandbox
   disabled: true
-# rc.2 新增：PowerShell 沙箱（Android 无 pwsh，禁用）
-- id: dsh-pwsh-sandbox
+# rc.2 新增：PowerShell 沙箱（Android 无 pwsh，禁用）。
+# 注意：树里该插件的条目 id 是 pwsh-sandbox（不是 dsh-pwsh-sandbox）——
+# v1.6.5 起 id 不匹配导致禁用不生效，引擎启动时 pwsh-sandbox 等待 sandbox 服务
+# （sandbox 被禁用）→ pending → 启动失败、node 反复崩溃。v1.7.1 修正。
+- id: pwsh-sandbox
   disabled: true
 # 会话日志导出按钮（右上角 session log，下载 ZIP）：移动端用不上，禁用留出空间
 - id: session-log-download
@@ -31,9 +34,14 @@
     - id: bash-local
       name: '@deepseek-ai/dsh-bash-local'
       config:
-        cwd: !!js process.cwd()
+        # AI 工作区（可选）：MainActivity 选择外部共享存储目录后通过 DSH_WORKSPACE 环境变量传入；
+        # 未设置时回退引擎进程目录。这样 bash/文件操作的工作根目录 = 用户选的文件夹。
+        cwd: !!js (process.env.DSH_WORKSPACE || process.cwd())
         timeoutMs: 60000
     - id: tool-shizuku
       name: '@deepseek-ai/dsh-tool-shizuku'
     - id: tool-android
       name: '@deepseek-ai/dsh-tool-android'
+    # v1.7：无障碍屏幕助手（读屏/点击/输入/滚动/截图，需用户在系统设置开启无障碍服务）
+    - id: tool-accessibility
+      name: '@deepseek-ai/dsh-tool-accessibility'
