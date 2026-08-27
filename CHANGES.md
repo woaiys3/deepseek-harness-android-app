@@ -1,5 +1,23 @@
 # DeepSeek Harness Android · 移动端优化改动清单
 
+## v1.7.0（正式版 + Lite + 兼容版 · 2026-08-27）
+
+> 内核 DSH 0.1.1-rc.2，versionCode 17，targetSdk 28。新增**无障碍自动化（读屏 + 模拟操作）+ 屏幕理解（无障碍截图 + 视觉模型）**。
+
+### ✨ 新功能
+- **无障碍屏幕助手**：系统设置 → 无障碍开启「DeepSeek Harness 屏幕助手」后，AI 可读屏（android_screen）、点击（android_tap）、输入（android_type）、返回/主页（android_back/android_home）、滚动（android_scroll）、截图理解（android_see，无障碍截图 + attachments 发给视觉模型）
+- 无障碍服务本地 HTTP 端口 = 通知端口 + 100（正式版 3181 / Lite 3183 / 兼容版 3185），三版本共存不冲突
+- **启动失败诊断**：失败时多位置写 startup-diag.txt（外部目录/App 专属/Download），引擎日志镜像到外部 dsh-web.log（无需 root/adb 可读排查）
+
+### 🐛 修复
+- **工具名冲突导致引擎启动失败**：无障碍插件 android_input 与特权版（dsh-tool-android）android_input 重名，真机有 Shizuku/root 授权时引擎加载插件树报 duplicate → 无障碍输入改名 **android_type**
+- **pwsh-sandbox 禁用不生效**：cordis.patch.yml 里条目 id 写的是 dsh-pwsh-sandbox，插件树实际 id 是 pwsh-sandbox → 禁用匹配不上、引擎启动 pending 崩溃 → 修正 id
+- **表格窄屏被裁切无法横滑**：mobile.css 表格滚动类名哈希随前端构建变化失效 + 前端 md-table-wide 依赖 hover 显示滚动条（触屏无 hover）→ 改用稳定选择器 `[class*="tableScroll"]` 且移动端始终 `overflow-x: auto`
+- **无障碍输入不进 WebView/网页输入框**：setText 只改无障碍节点、不触发前端 input 事件 → android_type 支持 `paste:true`（剪贴板粘贴，触发前端更新）
+
+### 发布
+- GitHub Release v1.7.0：正式版 / Lite / 兼容版 三 APK
+
 ## v1.6.5（正式版 + Lite + 兼容版 · 2026-08-25）
 
 > 内核 DSH 0.1.1-rc.2，versionCode 16，targetSdk 28。三个版本可共存：正式版（com.deepseek.harness，3080）/ Lite（.beta，3082）/ **兼容版（.compat，3084，新）**。
