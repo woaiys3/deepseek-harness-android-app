@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.deepseek.harness"
-    android:versionCode="16"
-    android:versionName="1.6.5">
+    android:versionCode="17"
+    android:versionName="1.7.0">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
 
@@ -62,6 +62,20 @@
         <service
             android:name=".OverlayService"
             android:exported="false" />
+
+        <!-- v1.7 无障碍服务：AI 读屏 + 模拟操作 + 无障碍截图（用户需在系统设置开启） -->
+        <service
+            android:name=".AccessibilityService"
+            android:exported="false"
+            android:label="DeepSeek Harness 屏幕助手"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_config" />
+        </service>
 
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
