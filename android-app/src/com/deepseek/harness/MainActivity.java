@@ -1329,10 +1329,58 @@ public class MainActivity extends Activity {
                     waitForServer();
                 } catch (Throwable t) {
                     Log.e(TAG, "engine error", t);
-                    setStatus("引擎启动失败：" + String.valueOf(t.getMessage()));
+                    String msg = String.valueOf(t.getMessage());
+                    setStatus("引擎启动失败：" + msg);
+                    writeStartupDiag(msg);
                 }
             }
         }, "engine-boot").start();
+    }
+
+    /** v1.7：启动失败时把引擎日志尾部与状态写进外部目录（多位置，保证至少一处成功），用户无需 adb 即可反馈排查。 */
+    private void writeStartupDiag(String errorMsg) {
+        try {
+            String sub = getPackageName().contains("beta") ? "DeepSeekHarnessLite"
+                    : getPackageName().contains("compat") ? "DeepSeekHarnessCompat" : "DeepSeekHarness";
+            StringBuilder sb = new StringBuilder();
+            sb.append("时间: ").append(new java.util.Date()).append('\n');
+            sb.append("错误: ").append(errorMsg).append('\n');
+            sb.append("enginePort=").append(enginePort).append(" notifyPort=").append(notifyPort()).append('\n');
+            sb.append("node存活=").append(nodeProcess != null && nodeProcess.isAlive()).append('\n');
+            File log = new File(getFilesDir(), "dsh-web.log");
+            if (log.exists()) {
+                java.io.RandomAccessFile raf = new java.io.RandomAccessFile(log, "r");
+                long len = raf.length();
+                long start = Math.max(0, len - 65536);
+                raf.seek(start);
+                byte[] buf = new byte[(int) (len - start)];
+                raf.readFully(buf);
+                raf.close();
+                sb.append("--- dsh-web.log 尾部 ---\n").append(new String(buf, "UTF-8"));
+            }
+            byte[] content = sb.toString().getBytes("UTF-8");
+            // 多位置都尝试：外部目录（需存储权限）、App 专属外部目录（无需权限）、Download（最易找）
+            String[] paths = new String[]{
+                    new File(android.os.Environment.getExternalStorageDirectory(), sub + "/startup-diag.txt").getAbsolutePath(),
+                    new File(getExternalFilesDir(null), "startup-diag.txt").getAbsolutePath(),
+                    new File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), "DeepSeekHarness-startup-diag.txt").getAbsolutePath()
+            };
+            String written = "";
+            for (String p : paths) {
+                try {
+                    File f = new File(p);
+                    File parent = f.getParentFile();
+                    if (parent != null && !parent.exists()) parent.mkdirs();
+                    FileOutputStream fos = new FileOutputStream(f);
+                    fos.write(content);
+                    fos.close();
+                    written += "\n" + p;
+                } catch (Throwable ignored) {
+                }
+            }
+            Log.i(TAG, "启动诊断已写入:" + written);
+        } catch (Throwable ignored) {
+        }
     }
 
     // ============ ③ 补丁启动自检 ============
@@ -2320,6 +2368,11 @@ public class MainActivity extends Activity {
         env.put("SHIZUKU_AVAILABLE", shizukuAvailable() ? "1" : "0");
         env.put("ROOT_AVAILABLE", rootAvailable() ? "1" : "0");
         env.put("APP_NOTIFY_PORT", String.valueOf(notifyPort()));
+        // v1.7 无障碍服务端口（通知端口 + 100，三版本共存不冲突）：插件 dsh-tool-accessibility 经此端口
+        // 调用 App 的无障碍服务（读屏/点击/输入/截图）。端口同时写入 dsh_prefs，供无障碍服务读取。
+        final int a11yPort = notifyPort() + 100;
+        env.put("APP_A11Y_PORT", String.valueOf(a11yPort));
+        getSharedPreferences("dsh_prefs", MODE_PRIVATE).edit().putInt("a11y_port", a11yPort).apply();
         // AI 工作区（可选）：用户选择的外部共享存储目录，作为 bash/文件工具的工作根目录
         String ws = workspacePath();
         if (ws != null && !ws.isEmpty()) env.put("DSH_WORKSPACE", ws);
@@ -2328,17 +2381,33 @@ public class MainActivity extends Activity {
         final Process proc = pb.start();
         nodeProcess = proc;
         final File logFile = new File(getFilesDir(), "dsh-web.log");
+        // v1.7.1：同时镜像一份引擎日志到外部目录（无需 root/adb 可读），
+        // 覆盖「node 反复崩溃但 waitForServer 未抛异常」时不产生 startup-diag.txt 的场景。
+        final File extLogFile = new File(android.os.Environment.getExternalStorageDirectory(),
+                (getPackageName().contains("beta") ? "DeepSeekHarnessLite"
+                        : getPackageName().contains("compat") ? "DeepSeekHarnessCompat" : "DeepSeekHarness")
+                        + "/dsh-web.log");
         new Thread(new Runnable() {
             @Override public void run() {
                 FileOutputStream fos = null;
+                FileOutputStream extFos = null;
                 try {
                     fos = new FileOutputStream(logFile, true);
+                    try {
+                        File extParent = extLogFile.getParentFile();
+                        if (extParent != null && !extParent.exists()) extParent.mkdirs();
+                        extFos = new FileOutputStream(extLogFile, true);
+                    } catch (Throwable ignored) {
+                    }
                     InputStream is = proc.getInputStream();
                     byte[] b = new byte[4096];
                     int n;
                     while ((n = is.read(b)) > 0) {
                         fos.write(b, 0, n);
                         fos.flush();
+                        if (extFos != null) {
+                            try { extFos.write(b, 0, n); extFos.flush(); } catch (Throwable ignored) {}
+                        }
                         String s = new String(b, 0, n, "UTF-8");
                         for (String line : s.split("\n")) {
                             String t = line.trim();
@@ -2349,6 +2418,7 @@ public class MainActivity extends Activity {
                     Log.w(TAG, "log reader error", e);
                 } finally {
                     try { if (fos != null) fos.close(); } catch (IOException ignored) {}
+                    try { if (extFos != null) extFos.close(); } catch (IOException ignored) {}
                 }
             }
         }, "node-log").start();
