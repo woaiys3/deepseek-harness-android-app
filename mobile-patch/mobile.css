@@ -99,7 +99,7 @@ input[type="search"] {
 
 /* 消息/回答内容：移动端全宽阅读，不挤压 */
 ._answer_d4nqi_19,
-._markdown_1nba0_5,
+._markdown_1r4m5_5,
 ._content_biesw_99 {
   max-width: 100% !important;
 }
@@ -111,10 +111,18 @@ input[type="search"] {
   max-width: 100% !important;
 }
 
-/* 表格：窄屏可横向滚动 */
-._tableScroll_1nba0_174 {
-  overflow-x: auto;
+/* 表格：窄屏可横向滚动
+   注：类名哈希随前端构建变化（_tableScroll_1nba0 → _tableScroll_1r4m5），
+   改用属性选择器匹配，避免前端更新后失效；同时覆盖前端 md-table-wide
+   的「hover 才显示滚动条」设计——触屏设备没有 hover，滚动条永远隐藏
+   导致宽表格无法横向滑动。移动端始终允许横向滚动。 */
+[class*="tableScroll"],
+.md-table-wide {
+  max-width: 100% !important;
+  overflow-x: auto !important;
   -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+  padding-bottom: 0 !important;
 }
 
 /* 图片画廊：间距收紧 */
@@ -137,7 +145,7 @@ input[type="search"] {
 
   /* 会话/回答内容宽度：竖屏给足空间 */
   ._answer_d4nqi_19,
-  ._markdown_1nba0_5 {
+  ._markdown_1r4m5_5 {
     width: 100%;
     max-width: 100% !important;
   }
