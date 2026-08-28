@@ -179,6 +179,12 @@ public final class ScheduleExecutor {
                     "web", "--host", "127.0.0.1", "--port", String.valueOf(enginePort(ctx)));
             java.util.Map<String, String> env = pb.environment();
             env.put("LD_LIBRARY_PATH", lib.getAbsolutePath());
+            // Termux 共存修复（v1.7.4）：同 MainActivity.spawnNode——内置 node 的 OPENSSLDIR
+            // 编译死为 /data/data/com.termux/files/usr，装了 Termux 时读其 openssl.cnf EACCES
+            // 启动即崩。注入 OPENSSL_CONF 指向 payload 自带的可读配置；存在才注入，避免升级
+            // 中途文件缺失时显式指向不存在的路径反而比原来的 ENOENT 静默更糟。
+            File osslConf = new File(payload, "runtime/etc/openssl.cnf");
+            if (osslConf.exists()) env.put("OPENSSL_CONF", osslConf.getAbsolutePath());
             env.put("PATH", bin.getAbsolutePath() + ":" +
                     new File(payload, "runtime/bin").getAbsolutePath() + ":/system/bin:/system/xbin");
             env.put("HOME", ctx.getFilesDir().getAbsolutePath());

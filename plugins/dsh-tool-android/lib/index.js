@@ -59,7 +59,8 @@ function safe(s) {
 /** App 本地 HTTP 服务端口（MainActivity 注入环境变量 APP_NOTIFY_PORT，默认 3081）。 */
 const appPort = () => parseInt(process.env.APP_NOTIFY_PORT || "3081", 10);
 
-/** 调 App 本地 HTTP 端点（GET）。用于 usage/overlay 等 App 层能力，无需特权通道。 */
+/** 调 App 本地 HTTP 端点（GET）。用于 usage/overlay 等 App 层能力，无需特权通道。
+ *  返回解析后的 JSON 对象（DSH 工具运行时要求 execute 返回对象，字符串会被 schema 校验拒绝）。 */
 function appRequest(path, params) {
   return new Promise((resolve) => {
     const qs = params
@@ -70,10 +71,17 @@ function appRequest(path, params) {
       let data = "";
       res.setEncoding("utf8");
       res.on("data", (c) => { data += c; if (data.length > 65536) req.destroy(); });
-      res.on("end", () => resolve(data || "{\"ok\":false,\"error\":\"empty response\"}"));
+      res.on("end", () => {
+        if (!data) return resolve({ ok: false, error: "empty response" });
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          resolve({ ok: false, error: "App 响应解析失败: " + String(data).slice(0, 120) });
+        }
+      });
     });
-    req.on("error", () => resolve("{\"ok\":false,\"error\":\"App 本地服务不可用（请先启动 DeepSeek Harness）\"}"));
-    req.on("timeout", () => { req.destroy(); resolve("{\"ok\":false,\"error\":\"App 本地服务超时\"}"); });
+    req.on("error", () => resolve({ ok: false, error: "App 本地服务不可用（请先启动 DeepSeek Harness）" }));
+    req.on("timeout", () => { req.destroy(); resolve({ ok: false, error: "App 本地服务超时" }); });
     req.end();
   });
 }
@@ -202,6 +210,33 @@ function renderResult(value) {
   }];
 }
 
+/** android_usage 专用渲染：把 apps 数组展示出来（通用 renderResult 只读 shell 字段，会吞掉数据）。 */
+function renderUsage(value) {
+  if (!value.ok) return renderResult(value);
+  const lines = [`应用使用时长（最近 ${value.days ?? 1} 天，按时长降序）：`];
+  const apps = Array.isArray(value.apps) ? value.apps : [];
+  if (apps.length === 0) {
+    lines.push("（无数据：可能未授予「使用情况访问」权限，或该时段无使用记录）");
+  }
+  for (const a of apps) {
+    const label = (a && a.name) || (a && a.pkg) || "未知应用";
+    const min = a && typeof a.min === "number" ? a.min : Math.round((a && a.ms || 0) / 60000);
+    lines.push(`- ${label} (${a.pkg || ""}): ${min} 分钟`);
+  }
+  return [{ type: "text", text: lines.join("\n") }];
+}
+
+/** android_overlay 专用渲染：展示 running/engineUp/granted（通用 renderResult 只读 shell 字段）。 */
+function renderOverlay(value) {
+  if (!value.ok) return renderResult(value);
+  const parts = [];
+  if (typeof value.running === "boolean") parts.push("悬浮窗运行中: " + value.running);
+  if (typeof value.engineUp === "boolean") parts.push("引擎在线: " + value.engineUp);
+  if (typeof value.granted === "boolean") parts.push("悬浮窗权限: " + (value.granted ? "已授予" : "未授予"));
+  if (parts.length === 0) parts.push("操作成功。");
+  return [{ type: "text", text: parts.join("，") }];
+}
+
 /** 在 SHIZUKU_APPROVE=ask 时对危险操作做审批。 */
 async function maybeApprove(ctx, exec, toolName, action, reason) {
   if (process.env.SHIZUKU_APPROVE !== "ask") return;
@@ -234,7 +269,31 @@ function apply(ctx) {
     parameters: {
       days: { type: "number", description: "查询最近几天（默认 1，上限 30）" }
     },
-    output: { schema: resultSchema(), render: (_a, v) => renderResult(v) },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          ok: { type: "boolean", required: true },
+          error: { type: "string" },
+          days: { type: "number" },
+          apps: {
+            type: "array",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                pkg: { type: "string" },
+                name: { type: "string" },
+                ms: { type: "number" },
+                min: { type: "number" }
+              }
+            }
+          }
+        }
+      },
+      render: (_a, v) => renderUsage(v)
+    },
     async execute(args, exec) {
       return await appRequest("/usage", args.days ? { days: String(Math.max(1, Math.min(30, Number(args.days) || 1))) } : undefined);
     }
@@ -252,7 +311,21 @@ function apply(ctx) {
         description: "show=显示悬浮窗；hide=隐藏；status=查询状态"
       }
     },
-    output: { schema: resultSchema(), render: (_a, v) => renderResult(v) },
+    output: {
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          ok: { type: "boolean", required: true },
+          error: { type: "string" },
+          running: { type: "boolean" },
+          engineUp: { type: "boolean" },
+          granted: { type: "boolean" },
+          msg: { type: "string" }
+        }
+      },
+      render: (_a, v) => renderOverlay(v)
+    },
     async execute(args, exec) {
       return await appRequest("/overlay", { action: String(args.action || "status") });
     }

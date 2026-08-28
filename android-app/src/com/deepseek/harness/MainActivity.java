@@ -1557,9 +1557,9 @@ public class MainActivity extends Activity {
                     } else if (path.startsWith("/schedule")) {
                         respBody = handleScheduleRequest(body.toString());
                     } else if (path.startsWith("/usage")) {
-                        respBody = handleUsageRequest(body.toString());
+                        respBody = handleUsageRequest(path, body.toString());
                     } else if (path.startsWith("/overlay")) {
-                        respBody = handleOverlayRequest(body.toString());
+                        respBody = handleOverlayRequest(path, body.toString());
                     } else if (path.startsWith("/status")) {
                         respBody = handleStatusRequest();
                     } else {
@@ -1579,10 +1579,10 @@ public class MainActivity extends Activity {
     }
 
     /** 处理 /usage：查询应用使用时长（UsageStats）。参数 days=N（默认 1，上限 30）。 */
-    private String handleUsageRequest(String raw) {
+    private String handleUsageRequest(String path, String raw) {
         try {
             String days = jsonField(raw, "days");
-            if (days.isEmpty()) days = queryField(raw, "days");
+            if (days.isEmpty()) days = queryField(path, "days");
             int d = 1;
             try { if (!days.isEmpty()) d = Integer.parseInt(days.trim()); } catch (Exception ignored) {}
             return UsageStatsHelper.queryUsageJson(this, d);
@@ -1607,10 +1607,10 @@ public class MainActivity extends Activity {
     }
 
     /** 处理 /overlay：控制小鲸鱼悬浮窗。action=show|hide|toggle|status。 */
-    private String handleOverlayRequest(String raw) {
+    private String handleOverlayRequest(String path, String raw) {
         try {
             String action = jsonField(raw, "action");
-            if (action.isEmpty()) action = queryField(raw, "action");
+            if (action.isEmpty()) action = queryField(path, "action");
             if (action.isEmpty()) action = "status";
             if (action.equals("status")) {
                 return "{\"ok\":true,\"running\":" + OverlayService.isRunning
@@ -2355,6 +2355,12 @@ public class MainActivity extends Activity {
                 "web", "--host", "127.0.0.1", "--port", String.valueOf(enginePort));
         java.util.Map<String, String> env = pb.environment();
         env.put("LD_LIBRARY_PATH", lib.getAbsolutePath());
+        // Termux 共存修复（v1.7.4）：内置 node 在 Termux 环境编译，OPENSSLDIR 被编译死为
+        // /data/data/com.termux/files/usr。装了 Termux 的设备读其 openssl.cnf 触发 EACCES，
+        // node 启动即崩；没装 Termux 时靠 ENOENT 静默才碰巧正常。注入 OPENSSL_CONF 指向
+        // payload 自带的可读 openssl.cnf（build.sh 生成），有无 Termux 都稳定。
+        File osslConf = new File(payload, "runtime/etc/openssl.cnf");
+        if (osslConf.exists()) env.put("OPENSSL_CONF", osslConf.getAbsolutePath());
         env.put("PATH", bin.getAbsolutePath() + ":" +
                 new File(payload, "runtime/bin").getAbsolutePath() + ":/system/bin:/system/xbin");
         env.put("HOME", getFilesDir().getAbsolutePath());

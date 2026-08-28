@@ -30,8 +30,26 @@ sh "$P/../mobile-patch/inject.sh"
 
 rm -rf "$P/staging" "$P/out" "$P/assets"
 mkdir -p "$P/staging/runtime/bin" "$P/staging/runtime/lib" \
+         "$P/staging/runtime/etc" \
          "$P/staging/bin" "$P/staging/dshroot" \
          "$P/staging/dshhome/profiles/web" "$P/assets"
+
+# Termux 共存修复（v1.7.4）：内置 node 在 Termux 环境编译，OPENSSLDIR 编译死为
+# /data/data/com.termux/files/usr。装了 Termux 的设备读其 openssl.cnf 触发 EACCES，
+# node 启动即崩；没装 Termux 时靠 ENOENT 静默才碰巧正常。App 启动引擎时注入
+# OPENSSL_CONF 指向本文件（最小配置，显式激活内置 default provider，无需外部模块）。
+cat > "$P/staging/runtime/etc/openssl.cnf" <<'EOF'
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+default = default_sect
+
+[default_sect]
+activate = 1
+EOF
 
 cp -L "$H/runtime/bin/node" "$P/staging/runtime/bin/node"
 # Android 内置 ripgrep（grep/glob 工具用，@vscode/ripgrep 无 android 平台包）：

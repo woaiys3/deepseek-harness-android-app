@@ -1,3 +1,17 @@
+## v1.7.5（正式版 + Lite 共存版 + 兼容版 · 2026-08-28）
+
+> 内核 DSH 0.1.1-rc.2，versionCode 21，targetSdk 28。Termux 共存修复 + 无障碍手势引擎 + 工具输出校验修复。
+
+### 🐛 修复
+- **Termux 共存**：内置 node 在 Termux 环境编译，OPENSSLDIR 被编译死为 /data/data/com.termux/files/usr——装了 Termux 的设备启动即崩（EACCES），没装时靠 ENOENT 静默才碰巧正常。payload 内置最小 openssl.cnf，启动时注入 OPENSSL_CONF 指向它，有无 Termux 均稳定。
+- **android_usage 报错/空结果**：appRequest 不解析 JSON（execute 返回字符串，被 DSH 工具运行时 schema 校验拒绝："value" must be an object）；已改为返回对象，并为 android_usage / android_overlay 补全输出 schema（days/apps/running/engineUp/granted/msg）；days 参数（GET query 丢失）与 android_overlay 的 action 参数一并修复。
+- **无障碍手势引擎**：新增通用触摸原语（多指同时、按住保持、拖动、分数坐标 fx/fy、网格截图）；修复等待时序下手指数误抬起、手势中途出错的状态污染、同请求内 down 后 move 误判；网格截图 Immutable bitmap 崩溃修复。
+
+### ✨ 新增（无障碍）
+- android_swipe / android_hold / android_touch（状态式虚拟触摸屏，多指核心）/ android_gesture（多笔组合手势）/ android_touch_status（查询按住的手指）
+- android_tap 支持 fx/fy 分数坐标（免疫截图缩放误差）；android_see 返回屏幕/截图尺寸与换算系数 + grid 网格叠加；android_screen 无节点界面（Unity/游戏）自动提示改用截图 + 分数坐标
+
+
 # DeepSeek Harness Android · 移动端优化改动清单
 
 ## v1.7.0（正式版 + Lite + 兼容版 · 2026-08-27）
