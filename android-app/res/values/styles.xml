@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 去掉 Fullscreen 黑边：状态栏/手势条跟页面浅色对齐 -->
+    <style name="DshAppTheme" parent="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+        <item name="android:windowFullscreen">false</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowTranslucentStatus">false</item>
+        <item name="android:windowTranslucentNavigation">false</item>
+        <item name="android:statusBarColor">#fff7f8fb</item>
+        <item name="android:navigationBarColor">#fff7f8fb</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowBackground">#fff7f8fb</item>
+    </style>
+</resources>

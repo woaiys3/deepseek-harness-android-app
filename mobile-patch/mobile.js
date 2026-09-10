@@ -8,6 +8,65 @@
  * 注：窄屏侧栏改造（三条杠 + 浮层）在核心源码 dsh-client-ui-layout，不在此文件。
  */
 (function () {
+  try {
+    var meta = document.querySelector('meta[name="viewport"]');
+    if (!meta) {
+      meta = document.createElement('meta');
+      meta.name = 'viewport';
+      if (document.head) document.head.appendChild(meta);
+    }
+    meta.content = 'width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover';
+    document.documentElement.classList.add('dsh-android-webview');
+    function fitPhoneWidth() {
+      var root = document.getElementById('root') || document.body;
+      if (!root) return;
+      root.style.minWidth = '0';
+      root.style.width = '100%';
+      root.style.maxWidth = '100vw';
+      document.documentElement.style.maxWidth = '100vw';
+      document.body && (document.body.style.maxWidth = '100vw');
+    }
+    fitPhoneWidth();
+    setTimeout(fitPhoneWidth, 200);
+    setTimeout(fitPhoneWidth, 800);
+  } catch (e) {}
+})();
+
+(function () {
+  function isDarkTheme() {
+    var el = document.documentElement;
+    if (!el) return false;
+    if (el.hasAttribute('data-ds-dark-theme')) return true;
+    if (el.getAttribute('data-theme') === 'dark') return true;
+    if (el.classList.contains('dark')) return true;
+    if (el.hasAttribute('data-ds-light-theme')) return false;
+    if (el.getAttribute('data-theme') === 'light') return false;
+    try {
+      return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    } catch (e) {
+      return false;
+    }
+  }
+  function notifyAndroidBars() {
+    try {
+      if (window.DshAndroid && window.DshAndroid.onThemeChanged) {
+        window.DshAndroid.onThemeChanged(isDarkTheme());
+      }
+    } catch (e) {}
+  }
+  notifyAndroidBars();
+  setTimeout(notifyAndroidBars, 300);
+  setTimeout(notifyAndroidBars, 1200);
+  try {
+    var mo = new MutationObserver(notifyAndroidBars);
+    mo.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-ds-dark-theme', 'data-ds-light-theme', 'data-theme', 'class']
+    });
+  } catch (e) {}
+})();
+
+(function () {
   if (!window.visualViewport) return;
   var vv = window.visualViewport;
   var app = document.getElementById('root') || document.body;

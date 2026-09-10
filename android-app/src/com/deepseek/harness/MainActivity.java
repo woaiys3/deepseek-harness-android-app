@@ -13,6 +13,7 @@ import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Color;
+import android.graphics.drawable.ColorDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -29,6 +30,9 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.Window;
+import android.view.WindowManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -134,6 +138,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        applySystemBars();
         installCrashHandler();
         checkAbiCompat(); // ② ABI 检测：非 arm64 设备引擎可能无法运行，弹提示
         checkBatteryOptimization(); // ④ 电池优化引导：被限制时提示（挂后台可能被杀）
@@ -145,13 +150,15 @@ public class MainActivity extends Activity {
         ws.setDomStorageEnabled(true);
         ws.setAllowFileAccess(true);
         ws.setDatabaseEnabled(true);
-        ws.setUseWideViewPort(true);
-        ws.setLoadWithOverviewMode(true);
+        // 小米等高 DPI 竖屏：不要按桌面宽视口再缩放，否则英文空格丢失、标题重叠。
+        ws.setUseWideViewPort(false);
+        ws.setLoadWithOverviewMode(false);
         ws.setSupportZoom(false);
         ws.setBuiltInZoomControls(false);
         ws.setDisplayZoomControls(false);
         ws.setTextZoom(100);
-        webView.setBackgroundColor(Color.parseColor("#0b0f1a"));
+        webView.setBackgroundColor(cBg());
+        webView.addJavascriptInterface(new JsBridge(), "DshAndroid");
         checkWebViewCompat(); // WebView 兼容检测：老内核提示引导（DSH 前端需 Chromium 80+）
         webView.setWebViewClient(new android.webkit.WebViewClient() {
             private int errorRetries = 0;
@@ -172,6 +179,19 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 errorRetries = 0;
+                view.evaluateJavascript(
+                        "(function(){var m=document.querySelector('meta[name=viewport]');"
+                                + "if(!m){m=document.createElement('meta');m.name='viewport';"
+                                + "document.head&&document.head.appendChild(m);}"
+                                + "m.content='width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover';"
+                                + "document.documentElement.classList.add('dsh-android-webview');"
+                                + "var el=document.documentElement;"
+                                + "var dark=!!(el.getAttribute('data-ds-dark-theme')"
+                                + "||el.classList.contains('dark')"
+                                + "||el.getAttribute('data-theme')==='dark');"
+                                + "if(window.DshAndroid&&window.DshAndroid.onThemeChanged)"
+                                + "window.DshAndroid.onThemeChanged(dark);})();",
+                        null);
             }
         });
 
@@ -365,24 +385,8 @@ public class MainActivity extends Activity {
         bp.gravity = Gravity.CENTER;
         root.addView(box, bp);
 
-        // 浮动退出按钮（右上角）：点击确认后退出 deepdive
-        Button exitBtn = new Button(this);
-        exitBtn.setText("退出");
-        exitBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        exitBtn.setTextColor(Color.WHITE);
-        exitBtn.setAllCaps(false);
-        exitBtn.setBackgroundColor(Color.parseColor("#66000000"));
-        exitBtn.setPadding(dp(12), dp(4), dp(12), dp(4));
-        FrameLayout.LayoutParams ebp = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
-        ebp.gravity = Gravity.TOP | Gravity.END;
-        ebp.topMargin = dp(28);
-        ebp.rightMargin = dp(12);
-        exitBtn.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { confirmExit(); }
-        });
-        root.addView(exitBtn, ebp);
-
+        // 启动页本身是深色，先跟启动页；WebView 主题就绪后再由 JsBridge 同步
+        applySystemBars(true);
         setContentView(root);
     }
 
@@ -412,6 +416,66 @@ public class MainActivity extends Activity {
     private int cSub() { return Color.parseColor(isDark() ? "#8b98a9" : "#6b7280"); }
     private int cGreen() { return Color.parseColor("#1f9d6b"); }
     private int cRed() { return Color.parseColor("#d9503f"); }
+
+    /** 去掉 Fullscreen 黑边，状态栏/手势条跟页面深浅色一致。 */
+    private void applySystemBars() {
+        applySystemBars(isDark());
+    }
+
+    private void applySystemBars(boolean dark) {
+        Window w = getWindow();
+        int bg = Color.parseColor(dark ? "#0b0f1a" : "#f7f8fb");
+        w.clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        w.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_STATUS);
+        w.clearFlags(WindowManager.LayoutParams.FLAG_TRANSLUCENT_NAVIGATION);
+        w.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+        w.setStatusBarColor(bg);
+        w.setNavigationBarColor(bg);
+        w.setBackgroundDrawable(new ColorDrawable(bg));
+        // API 29+：关掉系统给手势条加的深色对比蒙层（小米上常变成一条黑边）
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                Window.class.getMethod("setNavigationBarContrastEnforced", boolean.class)
+                        .invoke(w, Boolean.FALSE);
+                Window.class.getMethod("setStatusBarContrastEnforced", boolean.class)
+                        .invoke(w, Boolean.FALSE);
+            } catch (Exception ignored) {}
+        }
+        View decor = w.getDecorView();
+        int vis = decor.getSystemUiVisibility();
+        vis &= ~View.SYSTEM_UI_FLAG_FULLSCREEN;
+        vis &= ~View.SYSTEM_UI_FLAG_HIDE_NAVIGATION;
+        vis &= ~View.SYSTEM_UI_FLAG_IMMERSIVE;
+        vis &= ~View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY;
+        vis &= ~View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN;
+        vis &= ~View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION;
+        vis |= View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+        if (Build.VERSION.SDK_INT >= 23) {
+            if (dark) vis &= ~View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            else vis |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+        }
+        if (Build.VERSION.SDK_INT >= 26) {
+            if (dark) vis &= ~View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            else vis |= View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+        }
+        decor.setSystemUiVisibility(vis);
+        if (webView != null) webView.setBackgroundColor(bg);
+    }
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        applySystemBars();
+    }
+
+    private final class JsBridge {
+        @JavascriptInterface
+        public void onThemeChanged(final boolean dark) {
+            ui.post(new Runnable() {
+                @Override public void run() { applySystemBars(dark); }
+            });
+        }
+    }
 
     private long deleteRecursive(File f) {
         if (f == null || !f.exists()) return 0;
@@ -609,6 +673,7 @@ public class MainActivity extends Activity {
 
     private void showPermissionScreen() {
         permRows.clear();
+        applySystemBars(isDark());
 
         ScrollView scroll = new ScrollView(this);
         scroll.setBackgroundColor(cBg());
@@ -1323,6 +1388,7 @@ public class MainActivity extends Activity {
                     applyLinks(payload);
                     setExecutables(payload);
                     ensurePatchConfig(payload); // ③ 补丁启动自检：cordis.patch.yml 缺失/被改则自动补齐
+                    ensureDeepSeekV41Catalog(payload); // 官方目录未含今日上线的 deepseek-flash (V4.1)
                     if (healthOk()) { loadHome(); return; }
                     showIndeterminate("正在启动 DeepSeek Harness…");
                     spawnNode(payload);
@@ -1403,6 +1469,46 @@ public class MainActivity extends Activity {
             }
         } catch (Throwable t) {
             Log.w(TAG, "ensurePatchConfig error", t);
+        }
+    }
+
+    /** 内置 DSH 目录是写死的 V4-Flash / V4-Pro，不会去拉 /v1/models。
+     *  2026-09-10 起官方最新 Flash 是 deepseek-flash（V4.1-Flash），旧内核列表没有它。
+     *  只在 settings.yaml 还没有该 id 且没有现成 llm-deepseek 段时追加，不覆盖用户配置。 */
+    private void ensureDeepSeekV41Catalog(File payload) {
+        try {
+            File settings = new File(payload, "dshhome/settings.yaml");
+            String content = settings.exists() ? readFileText(settings) : "";
+            if (content.contains("deepseek-flash")) return;
+            if (content.contains("llm-deepseek:")) {
+                Log.i(TAG, "settings.yaml already has llm-deepseek; skip V4.1 append");
+                return;
+            }
+            String block = "\nllm-deepseek:\n"
+                    + "  models:\n"
+                    + "    - id: deepseek-flash\n"
+                    + "      name: DeepSeek-V4.1-Flash\n"
+                    + "      contextWindow: 1000000\n"
+                    + "      inputModalities: [text, image]\n"
+                    + "    - id: deepseek-v4-flash\n"
+                    + "      name: DeepSeek-V4-Flash\n"
+                    + "      contextWindow: 1000000\n"
+                    + "    - id: deepseek-v4-pro\n"
+                    + "      name: DeepSeek-V4-Pro\n"
+                    + "      contextWindow: 1000000\n"
+                    + "    - id: deepseek-v4-flash-vision-exp\n"
+                    + "      name: DeepSeek-V4-Flash-Vision-Exp\n"
+                    + "      contextWindow: 1000000\n"
+                    + "      inputModalities: [text, image]\n";
+            FileOutputStream fos = new FileOutputStream(settings, true);
+            try {
+                fos.write(block.getBytes("UTF-8"));
+            } finally {
+                fos.close();
+            }
+            Log.i(TAG, "appended DeepSeek-V4.1-Flash catalog to settings.yaml");
+        } catch (Throwable t) {
+            Log.w(TAG, "ensureDeepSeekV41Catalog error", t);
         }
     }
 

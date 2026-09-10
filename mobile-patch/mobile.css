@@ -238,7 +238,7 @@ input[type="search"] {
    flex（height:28px、文字 nowrap），窄屏下会伸出屏幕；
    改为允许换行：时间/耗时为整体单元，放不下就折到下一行。
    !important 是为了压过插件运行时注入的同名规则（注入顺序在后）。 */
-@media (max-width: 640px) {
+@media (max-width: 1200px) {
   .p-xYUq_actions {
     flex-wrap: wrap !important;
     height: auto !important;
@@ -255,7 +255,7 @@ input[type="search"] {
    聊天区顶部 header（会话标题/面包屑）默认左 padding 20px，
    会被 fixed 在左上角（8px 起、宽 36px）的三条杠按钮盖住；
    窄屏下把标题栏左内边距加大，让标题从三条杠右侧开始。 */
-@media (max-width: 640px) {
+@media (max-width: 1200px) {
   .wSkVaW_header {
     padding-left: 52px !important;
   }
@@ -266,7 +266,7 @@ input[type="search"] {
    输入框 clearance 16+inset 8 = 24px），窄屏（竖屏/手机横屏）下
    白白浪费宽度。这里把内缩收小，让正文与输入栏更宽；
    同时滚动条不预留占位（避免输入栏被压窄导致按钮重叠）。 */
-@media (max-width: 640px) {
+@media (max-width: 1200px) {
   /* 正文消息区：左右内缩 32px → 8px */
   .Md3f7G_scroll {
     padding-left: 8px !important;
@@ -295,7 +295,7 @@ input[type="search"] {
    InputBar 的 trailing 一行排开（审核模式按钮 + 模型名 + token 计量），
    窄屏下直接换行会让审核按钮掉到下一行、输入框变高；
    这里保持一行（nowrap），通过压缩模型名宽度与按钮间距避免重叠。 */
-@media (max-width: 640px) {
+@media (max-width: 1200px) {
   .uV2eYG_trailing,
   .uV2eYG_modes,
   .uV2eYG_tools {
@@ -314,7 +314,7 @@ input[type="search"] {
 /* ============ 窄屏：Bash 工具卡片防横向溢出 ============
    终端卡片里的命令文本/输出行 white-space:pre 不换行，
    窄屏下会把卡片撑出屏幕；改为可换行（pre-wrap）。 */
-@media (max-width: 640px) {
+@media (max-width: 1200px) {
   ._command_10eou_122,
   ._line_10eou_186 {
     white-space: pre-wrap !important;
@@ -382,7 +382,7 @@ input[type="search"] {
 /* ============ 窄屏：后台任务菜单不超出屏幕 ============
    后台任务下拉（.QsffPG_menu）定位 left:0，按钮在右侧时面板
    向右延伸超出屏幕（任务名被推到屏外）；改为右对齐向左展开。 */
-@media (max-width: 640px) {
+@media (max-width: 1200px) {
   .QsffPG_menu {
     left: auto !important;
     right: 0 !important;
@@ -394,7 +394,7 @@ input[type="search"] {
    设置页（.VOzbGW_panel）默认 800px 左右两栏（nav 188px + 内容），
    竖屏下内容列被挤到一百多像素、几乎不可用；
    改为上下排列：导航横排（可横向滚动）在顶部，内容区全宽在下。 */
-@media (max-width: 640px) {
+@media (max-width: 1200px) {
   .VOzbGW_panel {
     flex-direction: column !important;
     width: 100% !important;
@@ -428,5 +428,83 @@ input[type="search"] {
     flex: 1 !important;
     overflow-y: auto !important;
     min-height: 0 !important;
+  }
+}
+
+/* ============ 安卓 WebView / 小米高 DPI 竖屏（1440×3200 @600dpi） ============
+   真机问题：
+   - 顶栏「退出」原生按钮盖住标题、后台任务、设置 Tab「插件」
+   - 英文词被拆碎/空格丢失（wide viewport 缩放 + word-break:break-all）
+   - 设置页说明和右侧下拉挤在一列
+   - 输入栏模型名与发送钮重叠
+   类名带 hash，用属性选择器兜底。 */
+html.dsh-android-webview,
+html {
+  -webkit-text-size-adjust: 100% !important;
+  text-size-adjust: 100% !important;
+  max-width: 100vw !important;
+  background: #f7f8fb;
+}
+html.dsh-android-webview[data-ds-dark-theme],
+html[data-ds-dark-theme] {
+  background: #0b0f1a;
+}
+html.dsh-android-webview #root,
+#root {
+  min-width: 0 !important;
+  width: 100% !important;
+  max-width: 100vw !important;
+}
+
+html.dsh-android-webview body,
+body {
+  overflow-wrap: anywhere;
+  word-break: normal;
+  word-spacing: normal;
+  letter-spacing: normal;
+}
+
+/* 正文：禁止把英文拆成单字母，允许长串换行 */
+[class*="markdown"],
+[class*="answer"],
+[class*="content"],
+[class*="_message"],
+p, li, span, td {
+  word-break: normal !important;
+  overflow-wrap: break-word !important;
+  word-wrap: break-word !important;
+  line-break: auto !important;
+}
+
+/* 仅代码/路径允许强制断行 */
+pre, code, [class*="command"], [class*="_line_"] {
+  overflow-wrap: anywhere !important;
+  word-break: break-word !important;
+  white-space: pre-wrap !important;
+}
+
+/* 会话顶栏只给左侧三条杠留空；原生退出浮钮已去掉，用系统返回 */
+@media (max-width: 1200px) {
+  [class*="_header"]:not([class*="headerUtilities"]) {
+    padding-left: 52px !important;
+    padding-right: 12px !important;
+    box-sizing: border-box !important;
+  }
+  [class*="headerUtilities"] {
+    max-width: calc(100vw - 72px) !important;
+  }
+  /* 设置行：说明在上、控件在下，避免「模式」被拆成「模 / 式」 */
+  [class*="_row"],
+  [class*="setting"] {
+    flex-wrap: wrap !important;
+  }
+  /* 输入栏：允许换行，模型名缩短 */
+  [class*="trailing"],
+  [class*="_modes"] {
+    flex-wrap: wrap !important;
+    max-width: 100% !important;
+  }
+  [class*="_select"] {
+    max-width: 34vw !important;
   }
 }

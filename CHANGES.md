@@ -1,3 +1,14 @@
+## 未发布
+
+### 🐛 修复（社区 @Lniosy）
+- **高 DPI 竖屏 WebView**：关掉桌面宽视口再缩放（`useWideViewPort` / `loadWithOverviewMode`），避免英文空格丢失、字母重影；页面加载后写入 `viewport=device-width` 并标记 `dsh-android-webview`
+- **去掉原生「退出」浮钮**：不再盖住标题和设置；退出改用系统返回（会确认并停引擎）
+- **手机布局断点**：`mobile.css` 窄屏规则从 640px 放到 1200px，覆盖小米 15 Pro 一类 1440×3200 @600dpi 设备；正文不再 `break-all` 拆英文
+- **状态栏 / 手势条黑边**：去掉 `Theme.Black.NoTitleBar.Fullscreen`，改用 `DshAppTheme` 给状态栏和底部导航条上色（浅 `#f7f8fb` / 深 `#0b0f1a`），运行时再跟页面深浅色同步，并关掉手势条对比蒙层
+- **模型列表缺 V4.1**：内置 DSH 目录写死 V4-Flash/V4-Pro，不会请求 `/v1/models`；启动时若没有 `deepseek-flash` 则写入 `settings.yaml`（DeepSeek-V4.1-Flash，官方 API 名）
+
+---
+
 ## v1.7.5（正式版 + Lite 共存版 + 兼容版 · 2026-08-28）
 
 > 内核 DSH 0.1.1-rc.2，versionCode 21，targetSdk 28。Termux 共存修复 + 无障碍手势引擎 + 工具输出校验修复。
