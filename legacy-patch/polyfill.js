@@ -37,4 +37,30 @@
       return k < 0 || k >= l ? undefined : this.charAt(k);
     };
   }
+  // AbortSignal.any 是 Chromium 116+ 的新 API（2023 年 9 月）；老 WebView（尤其兼容版目标
+  // Chromium 51）没有它。某些依赖库（如 fetch 聚合、CancelSignal 组合）会用到，缺失会导致
+  // 工作区/文件选择器等 UI 白屏 + 控制台报 "AbortSignal.any is not a function"。
+  // 最小 polyfill：把任意个 AbortSignal 聚合成一个，任一中止则聚合也中止。
+  if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any !== 'function') {
+    AbortSignal.any = function (signals) {
+      var ctrl = new AbortController();
+      function onAbort() { ctrl.abort(); }
+      (signals || []).forEach(function (sig) {
+        if (!sig) return;
+        if (sig.aborted) { ctrl.abort(); return; }
+        sig.addEventListener('abort', onAbort, { once: true });
+      });
+      return ctrl.signal;
+    };
+  }
+  // 前置基本防护：AbortSignal 本身老 WebView 可能没有（极老内核）。
+  if (typeof AbortController === 'undefined') {
+    window.AbortController = function () {
+      var _this = this;
+      this.signal = { aborted: false, _listeners: [] };
+      this.abort = function () { _this.signal.aborted = true; _this.signal._listeners.forEach(function (f) { f(); }); };
+      this.signal.addEventListener = function (ev, fn) { _this.signal._listeners.push(fn); };
+      this.signal.removeEventListener = function () {};
+    };
+  }
 })();

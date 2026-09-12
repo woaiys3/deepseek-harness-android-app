@@ -1,5 +1,7 @@
 # Android 兼容性 patch
-# 已修复：subprocess-local（node-pty → child_process）、attachment-local（sharp → 纯JS头解析）
+# 已修复：subprocess-local（node-pty → child_process；koffi 惰性加载）、
+#        attachment-local（sharp → 纯 JS 头解析 sharp-shim.js）、
+#        bash-local（sandboxMode 覆盖）、session-persistence-jsonl（link → rename）
 # 禁用依赖无法编译原生模块的插件（Pi-AI 模型适配器、sandbox、bash-sandbox）
 # 用 bash-local（仅依赖 subprocess，已加 sandboxMode 兼容）替代 bash-sandbox 提供 ctx.shell
 - id: llm-pi-ai
@@ -17,6 +19,16 @@
 # 会话日志导出按钮（右上角 session log，下载 ZIP）：移动端用不上，禁用留出空间
 - id: session-log-download
   disabled: true
+# 遥测（OTel）：Android 端不需要上报，且它是 0.1.5 树里最大的依赖块（@opentelemetry 全套）。
+# 禁用后可以整个删掉遥测包，显著减小 payload。
+- id: session-telemetry-otel
+  disabled: true
+# ⚠ 关于 0.1.5 新增包（dsh-webhook / dsh-webhook-github / dsh-http-proxy / dsh-acp-app /
+# dsh-sdk-app / dsh-sdk-minimal / dsh-hooks-claude-code / dsh-hooks-codex）：
+# 这些包虽然存在于内核树里，但 **未被 @deepseek-ai/dsh-base 或 dsh-web-app 的插件表注册**，
+# 因此引擎根本不会加载它们，无需（也无法）用 disabled 条目禁用。
+# 早期版本曾按包名去 dsh- 前缀猜测 id 写了 8 条禁用，全部是空操作，0.1.5 升级时已删除，
+# 以免留下“以为禁用了”的假象。此处保留记录，供后续核对。
 - id: permission
   config:
     presets:
@@ -45,3 +57,6 @@
     # v1.7：无障碍屏幕助手（读屏/点击/输入/滚动/截图，需用户在系统设置开启无障碍服务）
     - id: tool-accessibility
       name: '@deepseek-ai/dsh-tool-accessibility'
+    # v1.8：虚拟屏幕（独立屏操作 App + 截图理解，需 root/Shizuku 特权 + 无障碍服务）
+    - id: tool-vscreen
+      name: '@deepseek-ai/dsh-tool-vscreen'

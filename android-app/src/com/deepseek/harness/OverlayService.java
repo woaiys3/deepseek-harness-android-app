@@ -42,6 +42,18 @@ import org.json.JSONObject;
  *  - 需要 SYSTEM_ALERT_WINDOW（悬浮窗）权限；前台服务保活
  */
 public class OverlayService extends Service {
+    /**
+     * 三版本共存的默认引擎端口，按包名区分（与 AccessibilityService 的口径一致）：
+     * 正式版 3080 / Lite 3082 / 兼容版 3084。通知端口 = 引擎端口 + 1，无障碍端口 = +101。
+     * 否则三套 App 同时安装会抢同一个 3080（表现为 EADDRINUSE、工具连到别的版本的服务）。
+     */
+    private static int defaultEnginePort(Context ctx) {
+        String p = ctx != null ? ctx.getPackageName() : "";
+        if (p.contains("beta")) return 3082;
+        if (p.contains("compat")) return 3084;
+        return 3080;
+    }
+
     private static final String PREFS = "dsh_prefs";
     private static final String KEY_PORT = "engine_port";
     private static final String CHANNEL_ID = "dsh_overlay";
@@ -64,6 +76,10 @@ public class OverlayService extends Service {
     private TextView statusText;
     private TextView aiText;
     private TextView portText;
+    // v1.9 虚拟屏预览：悬浮窗实时显示虚拟屏画面（用户可看 AI 操作）
+    private ImageView vscreenImageView = null;
+    private volatile boolean vscreenPreviewRunning = false;
+    private final Handler vscreenHandler = new Handler(Looper.getMainLooper());
     private final Handler handler = new Handler(Looper.getMainLooper());
     private int enginePort = 3080;
 
@@ -76,7 +92,7 @@ public class OverlayService extends Service {
 
     public static int enginePort(Context ctx) {
         SharedPreferences sp = ctx.getSharedPreferences(PREFS, MODE_PRIVATE);
-        return sp.getInt(KEY_PORT, 3080);
+        return sp.getInt(KEY_PORT, defaultEnginePort(ctx));
     }
 
     private final Runnable probeRunnable = new Runnable() {
@@ -137,6 +153,7 @@ public class OverlayService extends Service {
     public void onDestroy() {
         isRunning = false;
         if (instance == this) instance = null;
+        stopVscreenPreview();
         handler.removeCallbacksAndMessages(null);
         if (rootView != null && wm != null) {
             try { wm.removeView(rootView); } catch (Throwable ignored) {}
@@ -213,6 +230,19 @@ public class OverlayService extends Service {
         aiText.setTextColor(0xFF9DB4FF);
         aiText.setTextSize(12);
         panelView.addView(aiText);
+
+        // v1.9 虚拟屏预览（默认隐藏）：悬浮窗实时显示虚拟屏画面
+        vscreenImageView = new ImageView(this);
+        LinearLayout.LayoutParams vsp = new LinearLayout.LayoutParams(dp(240), dp(400));
+        vsp.topMargin = dp(6);
+        vscreenImageView.setLayoutParams(vsp);
+        vscreenImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        vscreenImageView.setVisibility(View.GONE);
+        vscreenImageView.setBackgroundColor(0x88000000);
+        vscreenImageView.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { /* 点一下无操作，可后续做全屏 */ }
+        });
+        panelView.addView(vscreenImageView);
 
         portText = new TextView(this);
         portText.setText("端口：: " + enginePort);
@@ -484,6 +514,69 @@ public class OverlayService extends Service {
                 nm.notify(NOTIF_ID, n);
             }
         } catch (Throwable ignored) {}
+    }
+
+    // ==================== v1.9 虚拟屏预览（悬浮窗实时看 AI 操作虚拟屏） ====================
+
+    /** 开始虚拟屏预览：每 ~1s 拉 server /preview（base64 JPEG）并显示到悬浮窗。 */
+    public void startVscreenPreview() {
+        if (vscreenPreviewRunning) return;
+        vscreenPreviewRunning = true;
+        vscreenHandler.post(vscreenPreviewRunnable);
+    }
+
+    /** 停止虚拟屏预览。 */
+    public void stopVscreenPreview() {
+        vscreenPreviewRunning = false;
+        vscreenHandler.removeCallbacks(vscreenPreviewRunnable);
+        if (vscreenImageView != null) {
+            vscreenHandler.post(new Runnable() {
+                @Override public void run() {
+                    vscreenImageView.setVisibility(View.GONE);
+                }
+            });
+        }
+    }
+
+    /** 预览帧拉取任务：HTTP GET 127.0.0.1:8999/vscreen/preview → base64 JPEG → ImageView。 */
+    private final Runnable vscreenPreviewRunnable = new Runnable() {
+        @Override public void run() {
+            if (!vscreenPreviewRunning || !isRunning) return;
+            try {
+                HttpURLConnection c = (HttpURLConnection) new URL("http://127.0.0.1:8999/vscreen/preview").openConnection();
+                c.setConnectTimeout(2000); c.setReadTimeout(2000);
+                String resp = readAll(c.getInputStream());
+                c.disconnect();
+                JSONObject o = new JSONObject(resp);
+                if (o.optBoolean("ok", false)) {
+                    String b64 = o.optString("previewB64");
+                    if (b64 != null && !b64.isEmpty()) {
+                        byte[] bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT);
+                        final android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.length);
+                        if (bmp != null) {
+                            vscreenHandler.post(new Runnable() {
+                                @Override public void run() {
+                                    if (vscreenImageView != null) {
+                                        vscreenImageView.setImageBitmap(bmp);
+                                        vscreenImageView.setVisibility(View.VISIBLE);
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+                // server 未跑（虚拟屏未创建）时静默，预览保持隐藏
+            }
+            vscreenHandler.postDelayed(this, 1000);
+        }
+    };
+
+    private String readAll(java.io.InputStream in) throws Exception {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        byte[] b = new byte[8192]; int n;
+        while ((n = in.read(b)) > 0) bos.write(b, 0, n);
+        return bos.toString("UTF-8");
     }
 
     private int dp(float v) {

@@ -98,15 +98,20 @@ public class AccessibilityService extends android.accessibilityservice.Accessibi
     public void onServiceConnected() {
         isRunning = true;
         Log.i(TAG, "accessibility service connected");
-        // 端口：MainActivity 启动时写入 dsh_prefs（a11y_port）；读不到时按包名推导默认引擎端口 + 101
+        // 端口必须由包名决定，不能信 dsh_prefs 里的 a11y_port：该 pref 跨版本持久化，升级后旧包
+        // 写下的 3181 仍会被读到 → 正式版与 Lite 的无障碍服务都往 3181 绑，后连的那个 bind 失败
+        // 且静默，先连的那个应答 —— 插件于是拿到“另一个包”的截图/节点（跨包路径必然 EACCES）。
         int port = 3181;
         try {
-            SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
             String pkg = getPackageName();
             int defaultEngine = pkg.contains("beta") ? 3082 : pkg.contains("compat") ? 3084 : 3080;
-            port = prefs.getInt(KEY_A11Y_PORT, defaultEngine + 101);
+            port = defaultEngine + 101;
+            SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
+            if (prefs.getInt(KEY_A11Y_PORT, port) != port) {
+                prefs.edit().putInt(KEY_A11Y_PORT, port).apply(); // 顺手纠正历史脏值
+            }
         } catch (Throwable t) {
-            Log.w(TAG, "read a11y port failed", t);
+            Log.w(TAG, "derive a11y port failed", t);
         }
         startServer(port);
     }
@@ -1177,7 +1182,29 @@ public class AccessibilityService extends android.accessibilityservice.Accessibi
         }
     }
 
-    /** /screenshot：Android 11+ 无障碍截图，存 PNG 到 filesDir/screenshots/，返回路径。
+    /** 无障碍截图输出目录：优先外部共享目录 <sdcard>/<pkgRoot>/screenshots/。
+     *  原因：截图与读取虽同属 DSH，但多套同源包（正式版/Lite/兼容版）共用同一份插件时，
+     *  一旦请求落到另一个包的实例上，路径就落在对方的 /data/user/0/<pkg>/ 私有目录里 —— 按 UID
+     *  隔离必然 EACCES，整个"看图"能力挂掉。写到外部目录后任何包都能读，这类失败从结构上消失。
+     *  外部目录不可用（未授权存储等）时回退私有 filesDir，同包内读写仍然正常。 */
+    private File screenshotDir() {
+        try {
+            File ext = android.os.Environment.getExternalStorageDirectory();
+            if (ext != null) {
+                String p = getPackageName();
+                String root = p.contains("beta") ? "DeepSeekHarnessLite"
+                        : p.contains("compat") ? "DeepSeekHarnessCompat"
+                        : "DeepSeekHarness";
+                File d = new File(new File(ext, root), "screenshots");
+                if (d.exists() || d.mkdirs()) return d;
+            }
+        } catch (Throwable ignored) {}
+        File fallback = new File(getFilesDir(), "screenshots");
+        if (!fallback.exists()) fallback.mkdirs();
+        return fallback;
+    }
+
+    /** /screenshot：Android 11+ 无障碍截图，存 PNG 到外部共享目录 <sdcard>/<pkgRoot>/screenshots/，返回路径。
      *  grid=4/8 叠加网格线（帮模型按行列定位）；返回屏幕/图片尺寸与换算系数。 */
     private String handleScreenshot(String path) {
         if (Build.VERSION.SDK_INT < 30) {
@@ -1185,6 +1212,16 @@ public class AccessibilityService extends android.accessibilityservice.Accessibi
         }
         final String gridStr = queryParam(path, "grid");
         final int grid = "8".equals(gridStr) ? 8 : ("4".equals(gridStr) || "true".equals(gridStr) ? 4 : 0);
+        // 虚拟屏支持（v1.8）：?display=N 截指定显示（overlay 虚拟屏等）；缺省截主屏
+        final String displayStr = queryParam(path, "display");
+        int displayId = Display.DEFAULT_DISPLAY;
+        if (displayStr != null && !displayStr.isEmpty()) {
+            try {
+                displayId = Integer.parseInt(displayStr.trim());
+            } catch (NumberFormatException e) {
+                displayId = Display.DEFAULT_DISPLAY;
+            }
+        }
         final CountDownLatch latch = new CountDownLatch(1);
         final String[] result = {null};
         Executor executor = new Executor() {
@@ -1194,7 +1231,7 @@ public class AccessibilityService extends android.accessibilityservice.Accessibi
             }
         };
         try {
-            takeScreenshot(Display.DEFAULT_DISPLAY, executor, new TakeScreenshotCallback() {
+            takeScreenshot(displayId, executor, new TakeScreenshotCallback() {
                 @Override
                 public void onSuccess(ScreenshotResult screenshotResult) {
                     try {
@@ -1220,8 +1257,7 @@ public class AccessibilityService extends android.accessibilityservice.Accessibi
                                     cv.drawLine(0, gy, soft.getWidth(), gy, paint);
                                 }
                             }
-                            File dir = new File(getFilesDir(), "screenshots");
-                            if (!dir.exists()) dir.mkdirs();
+                            File dir = screenshotDir();
                             File out = new File(dir, "screen-" + System.currentTimeMillis() + ".png");
                             FileOutputStream fos = new FileOutputStream(out);
                             soft.compress(Bitmap.CompressFormat.PNG, 100, fos);

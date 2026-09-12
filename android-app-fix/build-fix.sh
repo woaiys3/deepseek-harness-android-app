@@ -8,7 +8,8 @@ JAVA=$BE/lib/jvm/java-17-openjdk/bin
 export LD_LIBRARY_PATH=$BE/lib
 export PATH=$JAVA/bin:$BE/bin:$PATH
 KEY=/sdcard/github/android-app/release.jks
-KS_PASS=dsh2026
+# 签名密码不再硬编码（本文件历史上明文写过密码，该密码应视为已泄露）：从环境变量取，缺失时明确报错
+KS_PASS="${KEYSTORE_PASS:?请先 export KEYSTORE_PASS=签名密码}"
 
 cd $P
 rm -rf out gen classes.dex

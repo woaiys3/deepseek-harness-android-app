@@ -496,6 +496,15 @@ function apply(ctx) {
       when: {
         type: "string", required: true,
         description: "触发时间：纯数字=相对秒数（600=10分钟后）；'HH:mm'=今天/明天该时刻；'yyyy-MM-dd HH:mm:ss'=具体时间"
+      },
+      // App 侧本来就支持重复模式，插件不暴露的话 AI 无法设置重复任务（与 App 能力不一致）。
+      repeat: {
+        type: "string",
+        description: "重复模式：once（默认，一次性）| daily（每天同一时刻）| interval（每隔 intervalMin 分钟）"
+      },
+      intervalMin: {
+        type: "number",
+        description: "repeat=interval 时的间隔分钟数（≥ 1）"
       }
     },
     output: {
@@ -505,20 +514,28 @@ function apply(ctx) {
         properties: {
           ok: { type: "boolean", required: true },
           at: { type: "string" },
+          repeat: { type: "string" },
           hint: { type: "string" },
           error: { type: "string" }
         }
       },
       render: (_args, value) => [{
         type: "text",
-        text: value.ok ? "定时已设置（" + (value.at || "") + "）\n" + (value.hint || "") : "设置失败：" + (value.error || "未知错误")
+        text: value.ok
+          ? "定时已设置（" + (value.at || "") + (value.repeat ? "，" + value.repeat : "") + "）\n" + (value.hint || "")
+          : "设置失败：" + (value.error || "未知错误")
       }]
     },
     async execute(args) {
       try {
         const http = await import("node:http");
         const port = Number(process.env.APP_NOTIFY_PORT) || 3081;
-        const body = JSON.stringify({ text: String(args.text || ""), when: String(args.when || "") });
+        const body = JSON.stringify({
+          text: String(args.text || ""),
+          when: String(args.when || ""),
+          repeat: String(args.repeat || "once"),
+          intervalMin: args.intervalMin == null ? 0 : Math.max(1, Math.round(Number(args.intervalMin) || 0))
+        });
         const result = await new Promise((resolve) => {
           const req = http.request({
             host: "127.0.0.1", port, path: "/schedule", method: "POST",
@@ -536,7 +553,15 @@ function apply(ctx) {
           req.write(body);
           req.end();
         });
-        return result;
+        // 只返回 schema 已声明的字段：App 返回体一旦新增字段，additionalProperties:false 会让整次
+        // 调用判为 error，而校验发生在执行之后 —— 闹钟其实已经注册好了（"报错 != 没执行"，极易误导）。
+        return {
+          ok: result && result.ok === true,
+          ...(result && result.at !== undefined ? { at: String(result.at) } : {}),
+          ...(result && result.repeat !== undefined ? { repeat: String(result.repeat) } : {}),
+          ...(result && result.hint !== undefined ? { hint: String(result.hint) } : {}),
+          ...(result && result.error !== undefined ? { error: String(result.error) } : {})
+        };
       } catch (e) {
         return { ok: false, error: String(e && e.message || e) };
       }

@@ -252,9 +252,11 @@ input[type="search"] {
 }
 
 /* ============ 窄屏：会话标题栏给左上角三条杠让位 ============
-   聊天区顶部 header（会话标题/面包屑）默认左 padding 20px，
-   会被 fixed 在左上角（8px 起、宽 36px）的三条杠按钮盖住；
-   窄屏下把标题栏左内边距加大，让标题从三条杠右侧开始。 */
+   0.1.1 的布局：三条杠 fixed 在左上角（8px 起、宽 36px），会盖住会话标题栏
+   （.wSkVaW_header 默认左 padding 20px），所以窄屏把它加到 52px。
+   0.1.5 已改版：三条杠归入常驻的侧边栏窄栏（hHd-Xa_toggle 位于 x=10），
+   会话区从 x≈56 开始，不再有遮挡；且 .wSkVaW_header 这个类名在 0.1.5 里已不存在，
+   下面这条规则对 0.1.5 是空操作（保留只为兼容旧前端）。 */
 @media (max-width: 640px) {
   .wSkVaW_header {
     padding-left: 52px !important;

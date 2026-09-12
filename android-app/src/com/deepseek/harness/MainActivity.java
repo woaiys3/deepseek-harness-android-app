@@ -31,6 +31,8 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
+import android.webkit.WebChromeClient;
+import android.webkit.ValueCallback;
 import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.FrameLayout;
@@ -64,6 +66,8 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 
 import rikka.shizuku.Shizuku;
+import moe.shizuku.server.IRemoteProcess;
+import moe.shizuku.server.IShizukuService;
 
 public class MainActivity extends Activity {
     private static final String TAG = "DeepSeekHarness";
@@ -71,6 +75,21 @@ public class MainActivity extends Activity {
     // 共存版（Lite/抢先版）各用独立默认端口，靠包名隔离，不依赖动态切换。
     private int enginePort = 3080;
     private String homeUrl() { return "http://127.0.0.1:" + enginePort; }
+    /** 0.1.5 起 web 首页需要一次性 token：引擎启动时会打印带 token 的 URL，
+     *  首次必须用它访问（服务器随即下发签名 cookie，后续可回到普通地址），
+     *  否则首页返回 401 "authentication required"。这里保存解析到的带 token URL。 */
+    private volatile String engineTokenUrl = null;
+    /** WebView 与健康探测应使用的地址：拿到 token 就用带 token 的，否则退回普通地址。 */
+    private String webHomeUrl() {
+        String u = engineTokenUrl;
+        return (u != null && !u.isEmpty()) ? u : homeUrl();
+    }
+    static {
+        // 0.1.5 的浏览器认证靠 cookie：带 token 访问首页会下发 dsh-auth-* cookie。
+        // HttpURLConnection 默认不保存 cookie，装上全局 CookieManager 后，
+        // App 自身的 HTTP 调用（含健康探测）才能像浏览器一样维持会话。
+        try { java.net.CookieHandler.setDefault(new java.net.CookieManager()); } catch (Throwable ignored) {}
+    }
     // bin.js 相对 dshroot 目录的路径（dshroot 可能位于外部公共目录或内部 fallback）
     private static final String REL_BINJS = "lib/node_modules/@deepseek-ai/dsh/lib/bin.js";
     // 外部 dshroot 公共目录名（挂在 /sdcard 下，卸载不丢；node 二进制/凭证仍留内部）
@@ -80,6 +99,15 @@ public class MainActivity extends Activity {
     private static final String[] FORCE_OVERWRITE_PREFIXES = {
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tool-shizuku/",
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tool-android/",
+        // v1.9 虚拟屏插件：必须随 APK 覆盖（否则外部/旧 dshroot 里的旧版插件挡住更新 → "未知错误"）
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tool-vscreen/",
+        // 内核补丁面：以下都是本项目改过或自研的包，必须随 APK 覆盖——
+        // 同内核升级走 fast 同步（内核版本号没变）时不会补它们，旧文件会一直挡住修复。
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-attachment-local/",
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-subprocess-local/",
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-bash-local/",
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/",
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tool-accessibility/",
         // v1.3.x 核心 UI 改动（侧栏改造/插件按钮）必须随 APK 覆盖：
         // 否则旧版升级用户的外部 dshroot 保留旧 client.js → 页面仍是旧 UI（无竖屏适配）
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-client-ui-layout/lib/client.js",
@@ -97,12 +125,15 @@ public class MainActivity extends Activity {
     private static final int REQ_NOTIFICATION = 201;
     private static final int REQ_SHIZUKU = 300;
     private static final int REQ_WORKSPACE_TREE = 400;
+    private static final int REQ_FILE_CHOOSER = 500;
 
     // 悬浮窗前后台联动：App 在前台时隐藏悬浮窗（不挡界面），退后台时显示（随时可查引擎状态）。
     // 由 onStart/onStop 维护；OverlayService 启动时按此标志决定初始可见性。
     public static volatile boolean overlayForeground = true;
 
     private WebView webView;
+    // 网页 <input type="file"> 选完文件后的回调（见 onShowFileChooser）
+    private ValueCallback<Uri[]> fileChooserCallback;
     private TextView statusView;
     private ProgressBar progressBar;
     private ImageView splashLogo;
@@ -121,6 +152,10 @@ public class MainActivity extends Activity {
     // 权限界面
     private final List<PermRow> permRows = new ArrayList<>();
     private File rishDex;
+    private File vscreenDex;
+    private boolean pendingVscreenExtract;
+    private static volatile IRemoteProcess vscreenProc;
+    private long lastVscreenEnsureTs = 0;
     // AI 工作区（可选）：外部共享存储目录，传给引擎作为 bash/文件工具的工作根目录
     private TextView workspaceDescView;
 
@@ -134,6 +169,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        enginePort = defaultEnginePort(this); // 三版本各自独立端口（见 defaultEnginePort）
         installCrashHandler();
         checkAbiCompat(); // ② ABI 检测：非 arm64 设备引擎可能无法运行，弹提示
         checkBatteryOptimization(); // ④ 电池优化引导：被限制时提示（挂后台可能被杀）
@@ -164,7 +200,7 @@ public class MainActivity extends Activity {
                     errorRetries++;
                     final WebView wv = view;
                     view.postDelayed(new Runnable() {
-                        @Override public void run() { wv.loadUrl(homeUrl()); }
+                        @Override public void run() { wv.loadUrl(webHomeUrl()); }
                     }, 2500L);
                 }
             }
@@ -172,6 +208,29 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 errorRetries = 0;
+            }
+        });
+
+        // 附件/文件选择：官方前端用 <input type="file"> 选文件，Android WebView 必须实现
+        // onShowFileChooser 才会弹系统文件选择器，否则点「添加附件」没有任何反应。
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                             FileChooserParams params) {
+                if (fileChooserCallback != null) {
+                    fileChooserCallback.onReceiveValue(null);
+                }
+                fileChooserCallback = callback;
+                try {
+                    Intent intent = params.createIntent();
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    startActivityForResult(intent, REQ_FILE_CHOOSER);
+                    return true;
+                } catch (Throwable t) {
+                    Log.w(TAG, "file chooser failed", t);
+                    fileChooserCallback = null;
+                    return false;
+                }
             }
         });
 
@@ -189,6 +248,24 @@ public class MainActivity extends Activity {
 
         // 提取 rish dex（DSH 的 shizuku_shell 插件执行命令用，与 payload 解压解耦）
         rishDex = extractRishDex();
+        vscreenDex = extractVscreenDex();
+        // 虚拟屏接入桥：启动 Operit server + HTTP->binder 转发（插件走 8999）
+        try {
+            Class<?> bCls = Class.forName(getPackageName() + ".VsreenBridgeService");
+            startService(new Intent(this, bCls));
+        } catch (Throwable t) {
+            Log.w(TAG, "start VsreenBridgeService failed", t);
+        }
+        // 存储权限未授予时自动请求（写 /sdcard 提取 vscreen jar 需要；Android 10+ targetSdk28 必须运行时授权），
+        // 授权回调里重新提取外部 jar（首次启动提取会 EACCES，不弹窗用户根本不知道要授权）。
+        try {
+            if (checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") != PackageManager.PERMISSION_GRANTED) {
+                pendingVscreenExtract = true;
+                requestPermissions(new String[]{
+                        "android.permission.READ_EXTERNAL_STORAGE",
+                        "android.permission.WRITE_EXTERNAL_STORAGE"}, REQ_STORAGE);
+            }
+        } catch (Throwable ignored) {}
 
         // Shizuku API：监听 binder 与授权结果（实现授权弹窗）
         try {
@@ -364,24 +441,6 @@ public class MainActivity extends Activity {
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
         bp.gravity = Gravity.CENTER;
         root.addView(box, bp);
-
-        // 浮动退出按钮（右上角）：点击确认后退出 deepdive
-        Button exitBtn = new Button(this);
-        exitBtn.setText("退出");
-        exitBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        exitBtn.setTextColor(Color.WHITE);
-        exitBtn.setAllCaps(false);
-        exitBtn.setBackgroundColor(Color.parseColor("#66000000"));
-        exitBtn.setPadding(dp(12), dp(4), dp(12), dp(4));
-        FrameLayout.LayoutParams ebp = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
-        ebp.gravity = Gravity.TOP | Gravity.END;
-        ebp.topMargin = dp(28);
-        ebp.rightMargin = dp(12);
-        exitBtn.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { confirmExit(); }
-        });
-        root.addView(exitBtn, ebp);
 
         setContentView(root);
     }
@@ -968,6 +1027,23 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        if (requestCode == REQ_FILE_CHOOSER) {
+            if (fileChooserCallback != null) {
+                Uri[] picked = null;
+                if (resultCode == RESULT_OK && data != null) {
+                    if (data.getClipData() != null) {
+                        int count = data.getClipData().getItemCount();
+                        picked = new Uri[count];
+                        for (int i = 0; i < count; i++) picked[i] = data.getClipData().getItemAt(i).getUri();
+                    } else if (data.getData() != null) {
+                        picked = new Uri[]{data.getData()};
+                    }
+                }
+                fileChooserCallback.onReceiveValue(picked);
+                fileChooserCallback = null;
+            }
+            return;
+        }
         if (requestCode == REQ_WORKSPACE_TREE && resultCode == RESULT_OK && data != null && data.getData() != null) {
             Uri tree = data.getData();
             // 持久化 SAF 授权（重启后仍可访问该目录）
@@ -1126,9 +1202,64 @@ public class MainActivity extends Activity {
                 shizukuOk = ok;
                 // 顺带在后台探测 root（避免在主线程执行 su）
                 try { rootAvailable(); } catch (Throwable ignored) {}
+                // Shizuku 可用时确保 vscreen server 已启动（特权进程由 App 持有 → 不被命令会话清理）
+                if (ok) {
+                    // v1.10：虚拟屏服务由 App 进程内嵌启动（VsreenBridgeService → Main.start），
+                    // 不再用 Shizuku newProcess 启动旧 jar 的 VirtualScreenServer —— 双 server 抢
+                    // 8999 会导致 displayId 状态错乱（153/154）且旧 shell server SIGABRT。
+                    // Shizuku 仅保留用于 input 注入 / am start --display（vscreen 交互）。
+                    // try { ensureVscreenServer(); } catch (Throwable ignored) {}
+                }
                 ui.post(new Runnable() { @Override public void run() { refreshAllStatuses(); } });
             }
         }, "shizuku-probe").start();
+    }
+
+    /**
+     * 用 Shizuku newProcess 启动 vscreen server：
+     * 之前用 rish -c 后台 & 启动，Shizuku 命令会话结束会杀子进程（用户 Android 15 实测 server 消失）——
+     * newProcess 创建的是独立进程（App 持有 IRemoteProcess），不被会话清理，这是 Operit 验证过的存活方案。
+     */
+    private void ensureVscreenServer() {
+        try {
+            long now = System.currentTimeMillis();
+            if (now - lastVscreenEnsureTs < 5000) return;  // 5 秒频率限制
+            lastVscreenEnsureTs = now;
+            if (vscreenAlive()) return;  // server 已在监听
+            File src = vscreenDex;
+            if (src == null || !src.exists()) return;
+            if (!shizukuAvailable()) return;
+            android.os.IBinder binder = Shizuku.getBinder();
+            if (binder == null) return;
+            IShizukuService svc = IShizukuService.Stub.asInterface(binder);
+            if (svc == null) return;
+            // 1) 特权拷贝 jar 到 /data/local/tmp（App uid 写不了该目录；等待完成）
+            IRemoteProcess cp = svc.newProcess(new String[]{ "/system/bin/cp", "-f", src.getAbsolutePath(), "/data/local/tmp/vscreen_shizuku.jar" }, null, null);
+            if (cp != null) { cp.waitFor(); }
+            // 2) chmod 644（保证可读）
+            IRemoteProcess ch = svc.newProcess(new String[]{ "/system/bin/chmod", "644", "/data/local/tmp/vscreen_shizuku.jar" }, null, null);
+            if (ch != null) { ch.waitFor(); }
+            // 3) 启动 server（长驻；保存引用防 GC）—— Operit 同款启动方式：
+            //    CLASSPATH=... app_process / <Main>（cmd-dir 用 /，不用 /system/bin；Operit 实测在这类设备可用）
+            String[] env = new String[]{ "CLASSPATH=/data/local/tmp/vscreen_shizuku.jar" };
+            vscreenProc = svc.newProcess(new String[]{
+                    "/system/bin/app_process",
+                    "/",
+                    "com.deepseek.harness.vscreen.VirtualScreenServer"
+            }, env, null);
+            Log.i(TAG, "vscreen server start issued via Shizuku newProcess");
+        } catch (Throwable t) {
+            Log.w(TAG, "ensureVscreenServer failed", t);
+        }
+    }
+
+    private boolean vscreenAlive() {
+        try {
+            java.net.Socket s = new java.net.Socket();
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", 8999), 500);
+            s.close();
+            return true;
+        } catch (Throwable t) { return false; }
     }
 
     private boolean shizukuAvailable() {
@@ -1192,9 +1323,126 @@ public class MainActivity extends Activity {
         }
     }
 
+    private String pkgRoot() {
+        String p = getPackageName();
+        return p.contains("beta") ? "DeepSeekHarnessLite"
+                : p.contains("compat") ? "DeepSeekHarnessCompat" : "DeepSeekHarness";
+    }
+
+    /**
+     * 把 APK 内置 payload.zip 里的自定义引擎插件强制覆盖到内部 payload 目录。
+     * 只处理 @deepseek-ai/dsh-tool-{vscreen,android,accessibility,shizuku} 与 dsh-bash-local，
+     * 均为官方维护、必须随 APK 更新的插件，体积很小（几十 KB）。
+     */
+    private void refreshEnginePluginsFromPayload(File payloadDir) {
+        final String[] MARKS = {
+                "/dsh-tool-vscreen/",
+                "/dsh-tool-android/",
+                "/dsh-tool-accessibility/",
+                "/dsh-tool-shizuku/",
+                "/dsh-bash-local/"
+        };
+        int copied = 0;
+        java.util.zip.ZipInputStream zis = null;
+        try {
+            zis = new java.util.zip.ZipInputStream(
+                    new java.io.BufferedInputStream(getAssets().open("payload.zip")));
+            java.util.zip.ZipEntry e;
+            byte[] buf = new byte[16384];
+            while ((e = zis.getNextEntry()) != null) {
+                if (e.isDirectory()) {
+                    continue;
+                }
+                String name = e.getName();
+                boolean hit = false;
+                for (String m : MARKS) {
+                    if (name.contains(m)) { hit = true; break; }
+                }
+                if (!hit) {
+                    continue;
+                }
+                File out = new File(payloadDir, name);
+                File parent = out.getParentFile();
+                if (parent == null || (!parent.exists() && !parent.mkdirs())) {
+                    continue;
+                }
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(out);
+                int n;
+                while ((n = zis.read(buf)) > 0) {
+                    fos.write(buf, 0, n);
+                }
+                fos.close();
+                copied++;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "refreshEnginePluginsFromPayload failed: " + t.getMessage());
+        } finally {
+            if (zis != null) { try { zis.close(); } catch (Throwable ignored) {} }
+        }
+        Log.i(TAG, "engine plugins refreshed from payload.zip, files=" + copied);
+    }
+
+    private File extractVscreenDex() {
+        // 优先提取到外部共享目录（/sdcard/<EXT_DSHROOT_ROOT>/vscreen/）：
+        // shell(uid 2000) 读不到 app 私有目录（SELinux + 权限双重拦截），但能读 /sdcard ——
+        // 插件需以特权 shell 把 jar 拷到 /data/local/tmp 供 app_process 加载。
+        // 每次启动强制覆盖（旧 jar 残留会导致加载旧版崩溃：NoSuchMethodException / ClassNotFoundException）。
+        try {
+            File extDir = new File(Environment.getExternalStorageDirectory(), pkgRoot() + "/vscreen");
+            if (extDir.exists() || extDir.mkdirs()) {
+                File out = new File(extDir, "vscreen_shizuku.jar");
+                InputStream in = getAssets().open("vscreen_shizuku.jar");
+                FileOutputStream fos = new FileOutputStream(out);
+                byte[] b = new byte[8192];
+                int n;
+                while ((n = in.read(b)) > 0) fos.write(b, 0, n);
+                fos.close();
+                in.close();
+                return out;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "extract vscreen jar to external failed, fallback internal", e);
+        }
+        // 降级：私有目录（未授予存储权限时；shell 读不到，但至少 App 自身逻辑可用）
+        try {
+            File dir = new File(getFilesDir(), "vscreen");
+            if (!dir.exists()) dir.mkdirs();
+            File dex = new File(dir, "vscreen_shizuku.jar");
+            InputStream in = getAssets().open("vscreen_shizuku.jar");
+            FileOutputStream out = new FileOutputStream(dex);
+            byte[] b = new byte[8192];
+            int n;
+            while ((n = in.read(b)) > 0) out.write(b, 0, n);
+            out.close();
+            in.close();
+            return dex;
+        } catch (Exception e) {
+            Log.w(TAG, "extract vscreen jar failed", e);
+            return null;
+        }
+    }
+
     @Override
     public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
         super.onRequestPermissionsResult(code, perms, results);
+        // 存储权限授予后重新提取 vscreen jar 到外部目录（首次启动时授权在提取之后才完成）
+        if (code == REQ_STORAGE && pendingVscreenExtract) {
+            pendingVscreenExtract = false;
+            for (int i = 0; i < perms.length; i++) {
+                if ("android.permission.WRITE_EXTERNAL_STORAGE".equals(perms[i])
+                        && results[i] == PackageManager.PERMISSION_GRANTED) {
+                    try {
+                        File f = extractVscreenDex();
+                        if (f != null) {
+                            vscreenDex = f;
+                            Log.i(TAG, "vscreen jar re-extracted after permission grant: " + f);
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "vscreen re-extract failed", t);
+                    }
+                }
+            }
+        }
         refreshAllStatuses();
     }
 
@@ -1233,6 +1481,8 @@ public class MainActivity extends Activity {
         if (Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this)) {
             startOverlayService();
         }
+        // v1.10（Operit 方案）：不再请求 MediaProjection 授权（用户反感弹窗；Operit 主 App 也不用）。
+        // 虚拟屏承载外部 App 内容由 PUBLIC|PRESENTATION 建屏实现（真机 Android 15 验证）。
         new Thread(new Runnable() {
             @Override public void run() {
                 try {
@@ -1278,6 +1528,9 @@ public class MainActivity extends Activity {
                         try { extractPayload(payload, null, "internal-patch"); } catch (Throwable ignored) {}
                     }
 
+                    // 引擎插件强制刷新（见 refreshEnginePluginsFromPayload 注释）
+                    refreshEnginePluginsFromPayload(payload);
+
                     // 内部 dshroot 同步（node 从此处读内核）：
                     // REVISION 不匹配（重装）或 .complete 缺失（中断）都补。
                     // v1.5.2：REVISION 是构建时间戳每次构建都变——同内核升级走「快速同步」
@@ -1288,8 +1541,14 @@ public class MainActivity extends Activity {
                     try {
                         if (dshrootNeedsSync(internalBase)) {
                             boolean revisionChanged = dshrootRevisionChanged(internalBase);
+                            boolean layoutChanged = dshrootLayoutChanged(internalBase);
                             boolean full = dshrootNeedsFullSync(internalBase);
                             fastSyncedThisBoot = !full;
+                            // 布局变更：先整棵清掉旧 dshroot 再落地。全量覆盖只写文件不删多余项，
+                            // 旧树的嵌套副本会被 Node 优先解析到（补丁包/依赖树换过就失效）。
+                            if (layoutChanged) {
+                                try { deleteRecursive(internalDshroot); } catch (Throwable ignored) {}
+                            }
                             extractPayload(payload, null, full ? "dshroot" : "dshroot-fast");
                             writeDshrootComplete(internalBase);
                             if (revisionChanged) refreshInternalConfig(payload);
@@ -1302,7 +1561,11 @@ public class MainActivity extends Activity {
                         try { deleteRecursive(internalDshroot); } catch (Throwable ignored) {}
                         if (useExternal) {
                             if (dshrootNeedsSync(externalRoot)) {
+                                boolean layoutChanged = dshrootLayoutChanged(externalRoot);
                                 boolean full = dshrootNeedsFullSync(externalRoot);
+                                if (layoutChanged) {
+                                    try { deleteRecursive(new File(externalRoot, "dshroot")); } catch (Throwable ignored) {}
+                                }
                                 extractPayload(payload, externalRoot, full ? "dshroot" : "dshroot-fast");
                                 writeDshrootComplete(externalRoot);
                             }
@@ -1337,11 +1600,13 @@ public class MainActivity extends Activity {
         }, "engine-boot").start();
     }
 
-    /** v1.7：启动失败时把引擎日志尾部与状态写进外部目录（多位置，保证至少一处成功），用户无需 adb 即可反馈排查。 */
+    /** v1.7：启动失败时把引擎日志尾部与状态写进外部目录，用户无需 adb 即可反馈排查。 */
     private void writeStartupDiag(String errorMsg) {
         try {
             String sub = getPackageName().contains("beta") ? "DeepSeekHarnessLite"
                     : getPackageName().contains("compat") ? "DeepSeekHarnessCompat" : "DeepSeekHarness";
+            File dir = new File(android.os.Environment.getExternalStorageDirectory(), sub);
+            if (!dir.exists()) dir.mkdirs();
             StringBuilder sb = new StringBuilder();
             sb.append("时间: ").append(new java.util.Date()).append('\n');
             sb.append("错误: ").append(errorMsg).append('\n');
@@ -1358,27 +1623,11 @@ public class MainActivity extends Activity {
                 raf.close();
                 sb.append("--- dsh-web.log 尾部 ---\n").append(new String(buf, "UTF-8"));
             }
-            byte[] content = sb.toString().getBytes("UTF-8");
-            // 多位置都尝试：外部目录（需存储权限）、App 专属外部目录（无需权限）、Download（最易找）
-            String[] paths = new String[]{
-                    new File(android.os.Environment.getExternalStorageDirectory(), sub + "/startup-diag.txt").getAbsolutePath(),
-                    new File(getExternalFilesDir(null), "startup-diag.txt").getAbsolutePath(),
-                    new File(android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_DOWNLOADS), "DeepSeekHarness-startup-diag.txt").getAbsolutePath()
-            };
-            String written = "";
-            for (String p : paths) {
-                try {
-                    File f = new File(p);
-                    File parent = f.getParentFile();
-                    if (parent != null && !parent.exists()) parent.mkdirs();
-                    FileOutputStream fos = new FileOutputStream(f);
-                    fos.write(content);
-                    fos.close();
-                    written += "\n" + p;
-                } catch (Throwable ignored) {
-                }
-            }
-            Log.i(TAG, "启动诊断已写入:" + written);
+            File out = new File(dir, "startup-diag.txt");
+            FileOutputStream fos = new FileOutputStream(out);
+            fos.write(sb.toString().getBytes("UTF-8"));
+            fos.close();
+            Log.i(TAG, "启动诊断已写入 " + out.getAbsolutePath());
         } catch (Throwable ignored) {
         }
     }
@@ -1414,11 +1663,20 @@ public class MainActivity extends Activity {
     private boolean isDshEngine(int port) {
         HttpURLConnection c = null;
         try {
-            c = (HttpURLConnection) new URL("http://127.0.0.1:" + port + "/").openConnection();
+            // 0.1.5：首页需要 token（否则 401 authentication required）。带上引擎打印的 token URL
+            // 探测，服务器会下发 cookie 并重定向到干净首页，正文才含 <title>。
+            String probe = (engineTokenUrl != null) ? engineTokenUrl : ("http://127.0.0.1:" + port + "/");
+            c = (HttpURLConnection) new URL(probe).openConnection();
             c.setConnectTimeout(1200);
             c.setReadTimeout(1500);
             c.setRequestProperty("User-Agent", "dsh-probe");
+            // 0.1.5：带 token 访问首页会返回 303 + Set-Cookie（浏览器会话 cookie），
+            // 而 HttpURLConnection 默认不保存 cookie → 跟随重定向后又变 401 → 探测永远失败
+            // （旧实现表现为干等 90 秒超时才进兜底）。这里不跟随重定向，把 303/302
+            // 直接当作“引擎已就绪且 token 有效”，正文标题校验只在普通 200 路径上做。
+            c.setInstanceFollowRedirects(false);
             int code = c.getResponseCode();
+            if (code == 303 || code == 302) return true;
             if (code < 200 || code >= 500) return false;
             InputStream in = c.getInputStream();
             // v1.5.5 修复：首页实际约 14KB（13KB 内联脚本在前，<title> 位于页面末尾第 13.4KB 处），
@@ -1469,6 +1727,18 @@ public class MainActivity extends Activity {
     private static final String NOTIFY_CHANNEL_ID = "dsh_ai_notify";
     private static final String NOTIFY_CHANNEL_NAME = "AI 通知";
     // 通知端口动态跟随引擎端口（enginePort+1），保证两个 App 共存时不冲突
+    /**
+     * 三版本共存的默认引擎端口，按包名区分（与 AccessibilityService 的口径一致）：
+     * 正式版 3080 / Lite 3082 / 兼容版 3084。通知端口 = 引擎端口 + 1，无障碍端口 = +101。
+     * 否则三套 App 同时安装会抢同一个 3080（表现为 EADDRINUSE、工具连到别的版本的服务）。
+     */
+    private static int defaultEnginePort(Context ctx) {
+        String p = ctx != null ? ctx.getPackageName() : "";
+        if (p.contains("beta")) return 3082;
+        if (p.contains("compat")) return 3084;
+        return 3080;
+    }
+
     private int notifyPort() { return enginePort + 1; }
 
     /** 启动本地通知监听：AI 通过插件请求 http://127.0.0.1:<notifyPort> 发通知（仅需通知权限）。 */
@@ -2109,7 +2379,32 @@ public class MainActivity extends Activity {
     private boolean dshrootNeedsFullSync(File dshrootBase) {
         File complete = new File(dshrootBase, "dshroot/" + DSHROOT_COMPLETE);
         if (!complete.exists()) return true;
-        return dshKernelChanged(dshrootBase);
+        if (dshKernelChanged(dshrootBase)) return true;
+        return dshrootLayoutChanged(dshrootBase);
+    }
+
+    // 内核树布局标记（build.sh 写入 assets/dshroot_layout.txt）：布局变更时必须全量重推，
+    // 否则 fast 同步只覆盖白名单文件，整棵树留着旧结构（补丁包/依赖树换过就再也更新不到）。
+    private String builtinDshrootLayout() {
+        try {
+            return readAssetText("dshroot_layout.txt").trim();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private boolean dshrootLayoutChanged(File dshrootBase) {
+        String builtin = builtinDshrootLayout();
+        if (builtin.isEmpty()) return false; // 旧 APK 无标记 → 不额外触发
+        File complete = new File(dshrootBase, "dshroot/" + DSHROOT_COMPLETE);
+        try {
+            String stored = readFileText(complete).trim();
+            int bar = stored.lastIndexOf('|');
+            String storedLayout = bar < 0 ? "" : stored.substring(bar + 1);
+            return !builtin.equals(storedLayout);
+        } catch (Throwable t) {
+            return true;
+        }
     }
 
     // 对比 dshroot 的 DSH 内核版本与 APK 内置版本（build.sh 写入 dshroot_kernel_version.txt）。
@@ -2130,7 +2425,10 @@ public class MainActivity extends Activity {
         File complete = new File(dshrootBase, "dshroot/" + DSHROOT_COMPLETE);
         try {
             FileOutputStream fos = new FileOutputStream(complete);
-            fos.write(builtinDshrootRevision().getBytes("UTF-8"));
+            // 记录 <构建时间戳>|<布局标记>：布局标记用于判断是否需要全量重推（见 dshrootLayoutChanged）。
+            String layout = builtinDshrootLayout();
+            String marker = layout.isEmpty() ? builtinDshrootRevision() : builtinDshrootRevision() + "|" + layout;
+            fos.write(marker.getBytes("UTF-8"));
             fos.close();
         } catch (Throwable t) {
             Log.w(TAG, "write dshroot complete marker failed", t);
@@ -2368,7 +2666,9 @@ public class MainActivity extends Activity {
         env.put("TMPDIR", tmp.getAbsolutePath());
         env.put("TERM", "xterm");
         env.put("SHIZUKU_DEX", rishDex != null ? rishDex.getAbsolutePath() : "");
-        env.put("SHIZUKU_APP_ID", "com.deepseek.harness");
+        // v1.9 虚拟屏 server dex：app_process 特权加载 VirtualScreenServer
+        env.put("VS_DEX", vscreenDex != null ? vscreenDex.getAbsolutePath() : "");
+        env.put("SHIZUKU_APP_ID", "com.deepseek.harness.beta");
         // 特权通道可用性：root(su) 或 Shizuku。两者都未授予时，DSH 插件不注册特权工具，
         // AI 不会反复尝试系统操作；文件读写仍可用 DSH 自带的 fs/bash 工具（只需存储权限）。
         env.put("SHIZUKU_AVAILABLE", shizukuAvailable() ? "1" : "0");
@@ -2418,6 +2718,17 @@ public class MainActivity extends Activity {
                         for (String line : s.split("\n")) {
                             String t = line.trim();
                             if (!t.isEmpty()) Log.i(TAG, "node: " + t);
+                            // 0.1.5 认证：引擎打印 "dsh web: http://127.0.0.1:3080/?token=..."，
+                            // 解析出来供健康探测与 WebView 首次加载使用。
+                            int at = t.indexOf("http://127.0.0.1");
+                            int tk = t.indexOf("?token=");
+                            if (at >= 0 && tk > at) {
+                                String u = t.substring(at);
+                                int sp = u.indexOf(' ');
+                                if (sp > 0) u = u.substring(0, sp);
+                                engineTokenUrl = u;
+                                Log.i(TAG, "engine token url captured");
+                            }
                         }
                     }
                 } catch (IOException e) {
@@ -2575,7 +2886,7 @@ public class MainActivity extends Activity {
                             spawnNode(new File(getFilesDir(), "payload"));
                             final WebView wv = webView;
                             ui.post(new Runnable() {
-                                @Override public void run() { wv.loadUrl(homeUrl()); }
+                                @Override public void run() { wv.loadUrl(webHomeUrl()); }
                             });
                         }
                     } catch (Throwable t) {
@@ -2597,7 +2908,7 @@ public class MainActivity extends Activity {
                     progressBar.setIndeterminate(false);
                     progressBar.setVisibility(View.GONE);
                 }
-                webView.loadUrl(homeUrl());
+                webView.loadUrl(webHomeUrl());
             }
         });
     }

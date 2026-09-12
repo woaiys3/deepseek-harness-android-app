@@ -76,7 +76,14 @@ function parseResult(raw, hint) {
   }
 }
 
+/** DSH 个别路径可能以缺失 value 调用 render（历史回放/旧参数）；兜底避免整次工具调用失败，并把入参暴露出来便于定位。 */
+const renderValue = (value, args) => (value && typeof value === "object" ? value : {
+  ok: false,
+  error: "工具未返回结果（render 收到空值；入参 " + JSON.stringify(args === void 0 ? null : args) + "）"
+});
+
 function renderResult(value) {
+  value = renderValue(value);
   return [{
     type: "text",
     text: value.ok ? "操作成功。" : "执行失败：" + (value.error || "未知错误")
@@ -85,6 +92,7 @@ function renderResult(value) {
 
 /** 屏幕节点树渲染成 AI 可读文本列表（带索引，方便 android_tap 引用坐标）。 */
 function renderScreen(_args, value) {
+  value = renderValue(value, _args);
   if (!value.ok) return renderResult(value);
   const lines = [];
   lines.push("当前前台应用: " + (value.package || "未知"));
@@ -296,7 +304,10 @@ function apply(ctx) {
       render: (_a, v) => renderResult(v)
     },
     async execute(args, exec) {
-      if (!args.text) return { ok: false, error: "android_type 需要 text 参数" };
+      // 空字符串是合法入参（语义 = 清空输入框），只拦真正缺参；用真值判断会把 "" 误判成没传。
+      if (args.text === undefined || args.text === null) {
+        return { ok: false, error: "android_type 需要 text 参数" };
+      }
       const params = { text: String(args.text) };
       if (args.paste === true) params.mode = "paste";
       const raw = await a11yRequest("/input", params, 8000);
@@ -421,6 +432,7 @@ function apply(ctx) {
           }
         },
         render: (_args, value) => {
+          value = renderValue(value, _args);
           if (!value.ok) return renderResult(value);
           const meta = [
             `${value.image.mediaType} 屏幕截图, ${value.image.width}x${value.image.height} px, ${value.image.bytes} bytes`,
@@ -458,7 +470,14 @@ function apply(ctx) {
         try {
           data = await readFile(v.path);
         } catch (e) {
-          return { ok: false, error: "读取截图失败: " + String(e && e.message || e) };
+          const code = e && e.code ? String(e.code) : "";
+          // EACCES 的成因是「截图落在另一个同源包的私有目录」（/data/user/0/<pkg>/ 按 UID 隔离，
+          // 跨包必失败）。服务端已改为写入共享目录；这里保留可操作的提示便于在旧包上定位。
+          const hint = code === "EACCES"
+            ? "\n该截图位于另一个安装包的私有目录（/data/user/0/<包名>/...），跨包按 UID 隔离无法读取。" +
+              "请确认无障碍服务与引擎是同一个包。\n临时替代：android_screenshot(save_path=\"/sdcard/DeepSeekHarness/screenshots/x.png\") + read_image。"
+            : "";
+          return { ok: false, error: "读取截图失败: " + (code ? code + " " : "") + String(e && e.message || e) + hint };
         }
         try {
           const ref = await attachments.saveImage({
@@ -498,6 +517,8 @@ function apply(ctx) {
   // 一套原语覆盖所有触摸操作（点击/滑动/长按/按住拖动/多指同时），不绑定任何具体 App/游戏。
   // 坐标统一支持 x/y（屏幕绝对像素）或 fx/fy（0~1 分数，推荐——截图会被查看器缩放）。
 
+  // 必须与无障碍服务实际返回的字段一致：additionalProperties:false 下漏声明任何一个字段，
+  // 整个调用都会被判为 error（数据其实是对的）。服务端会返回 elapsedMs（已按住时长）。
   const heldSchema = {
     type: "object",
     additionalProperties: false,
@@ -506,7 +527,8 @@ function apply(ctx) {
       x: { type: "number" },
       y: { type: "number" },
       fx: { type: "number" },
-      fy: { type: "number" }
+      fy: { type: "number" },
+      elapsedMs: { type: "number" }
     }
   };
   const touchOutput = {

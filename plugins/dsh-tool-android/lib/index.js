@@ -15,7 +15,7 @@
  */
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { spawn } from "node:child_process";
-import { get as httpGet } from "node:http";
+import { get as httpGet, request as httpRequest } from "node:http";
 import { chmodSync, existsSync } from "node:fs";
 
 const name = "tool-android";
@@ -56,6 +56,12 @@ function safe(s) {
   return String(s ?? "").replace(/[^a-zA-Z0-9._\/:=-]/g, "");
 }
 
+/** 单引号包裹的 shell 字面量：保留任意字符（中文路径、空格、标点）。
+ *  用户提供的路径/文本绝不能用 safe() —— 它会把非 ASCII 字符直接删掉（静默改坏入参）。 */
+function shq(s) {
+  return "'" + String(s ?? "").replace(/'/g, "'\\''") + "'";
+}
+
 /** App 本地 HTTP 服务端口（MainActivity 注入环境变量 APP_NOTIFY_PORT，默认 3081）。 */
 const appPort = () => parseInt(process.env.APP_NOTIFY_PORT || "3081", 10);
 
@@ -82,6 +88,42 @@ function appRequest(path, params) {
     });
     req.on("error", () => resolve({ ok: false, error: "App 本地服务不可用（请先启动 DeepSeek Harness）" }));
     req.on("timeout", () => { req.destroy(); resolve({ ok: false, error: "App 本地服务超时" }); });
+    req.end();
+  });
+}
+
+/** 调 App 本地 HTTP 端点（POST + JSON body）。
+ *  /clipboard 与 /schedule 必须用 POST：App 侧会把请求行的 query 丢掉（path.substring(0,'?')），
+ *  只把 body 交给处理器，所以 GET?action=write 会被当成 action=read 静默返回读结果。 */
+function appPost(path, obj, timeoutMs) {
+  return new Promise((resolve) => {
+    const payload = JSON.stringify(obj ?? {});
+    const req = httpRequest({
+      host: "127.0.0.1",
+      port: appPort(),
+      path,
+      method: "POST",
+      timeout: timeoutMs || 8000,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload)
+      }
+    }, (res) => {
+      let data = "";
+      res.setEncoding("utf8");
+      res.on("data", (c) => { data += c; if (data.length > 65536) req.destroy(); });
+      res.on("end", () => {
+        if (!data) return resolve({ ok: false, error: "empty response" });
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          resolve({ ok: false, error: "App 响应解析失败: " + String(data).slice(0, 120) });
+        }
+      });
+    });
+    req.on("error", () => resolve({ ok: false, error: "App 本地服务不可用（请先启动 DeepSeek Harness）" }));
+    req.on("timeout", () => { req.destroy(); resolve({ ok: false, error: "App 本地服务超时" }); });
+    req.write(payload);
     req.end();
   });
 }
@@ -182,6 +224,61 @@ function privCmd(command, timeoutMs) {
     return suCmd(command, timeoutMs);
   }
   return shizukuCmd(command, process.env.SHIZUKU_DEX, process.env.SHIZUKU_APP_ID, timeoutMs);
+}
+
+/** 会话式安装 APK。必须绕开两个坑：
+ *  ① system_server 无权读 FUSE 挂载的 /storage/emulated/0，pm 直接报 "Can't open file"；
+ *  ② ColorOS 上单发 `pm install -r` 会卡死无输出。
+ *  所以先由特权 shell 把 APK 拷到 /data/local/tmp，再走 install-create/write/commit，
+ *  并校验输出确实含 Success，否则如实报错（旧实现不看输出，失败也返回 exit_code:0）。 */
+async function installApk(apkPath, expectPkg) {
+  const tmp = "/data/local/tmp/dsh-install-" + Date.now() + ".apk";
+  const before = "/data/local/tmp/dsh-pkgs-before.txt";
+  const script = [
+    `APK=${shq(apkPath)}`,
+    `TMP=${shq(tmp)}`,
+    `BEFORE=${shq(before)}`,
+    'if [ ! -f "$APK" ]; then echo "找不到 APK: $APK" >&2; exit 21; fi',
+    'cp -f "$APK" "$TMP" || { echo "复制到 /data/local/tmp 失败" >&2; exit 22; }',
+    'pm list packages | sort > "$BEFORE"',
+    "SID=$(pm install-create -r -t 2>&1 | grep -oE '[0-9]+' | head -1)",
+    'if [ -z "$SID" ]; then echo "install-create 未返回 session id" >&2; rm -f "$TMP"; exit 23; fi',
+    'pm install-write "$SID" base.apk "$TMP" 2>&1 || { echo "install-write 失败" >&2; rm -f "$TMP"; exit 24; }',
+    'OUT=$(pm install-commit "$SID" 2>&1); RC=$?',
+    'rm -f "$TMP"',
+    'echo "$OUT"',
+    '[ "$RC" -eq 0 ] || exit 25',
+    'case "$OUT" in *Success*) ;; *) echo "install-commit 未返回 Success" >&2; exit 26;; esac',
+    'pm list packages | sort > "$BEFORE.after"',
+    'echo "本次新增包:"',
+    'grep -vxFf "$BEFORE" "$BEFORE.after" || true',
+    'rm -f "$BEFORE" "$BEFORE.after"'
+  ].join("\n");
+  const r = await privCmd(script, 120000);
+  const stdout = String(r.stdout || "");
+  const stderr = String(r.stderr || "");
+  if (!r.ok || !/Success/.test(stdout)) {
+    return {
+      ok: false,
+      exit_code: r.exit_code,
+      stdout,
+      stderr,
+      error: r.error || "安装未成功（pm 未返回 Success）"
+    };
+  }
+  if (expectPkg) {
+    // 二次校验：commit 报 Success 也可能没真正生效，以 pm path 能否查到为准
+    const v = await privCmd("pm path " + shq(expectPkg), 15000);
+    const p = String(v.stdout || "");
+    if (!/package:/.test(p)) {
+      return {
+        ok: false, exit_code: r.exit_code, stdout, stderr,
+        error: "pm 返回 Success，但 pm path 查不到 " + expectPkg + "，安装未真正生效"
+      };
+    }
+    return { ok: true, exit_code: 0, stdout: stdout + "\npm path: " + p.trim(), stderr };
+  }
+  return { ok: true, exit_code: 0, stdout, stderr };
 }
 
 /** 通用结果 schema（所有工具共用，避免 exit_code/exitCode 不匹配的坑）。 */
@@ -341,7 +438,10 @@ function apply(ctx) {
     name: "android_package",
     description:
       "Android 包管理：列出已安装应用、安装 APK、卸载应用、清除应用数据、授予/撤销运行时权限。" +
-      "底层走 pm 命令（root su 或 Shizuku 特权通道）。安装 APK 在部分 ColorOS 机型可能报 binder 限制，失败时提示用户手动安装。",
+      "底层走 pm 命令（root su 或 Shizuku 特权通道）。" +
+      "install 会自动把 APK 拷到 /data/local/tmp 并用 install-create/install-write/install-commit 会话式安装" +
+      "（单发 pm install 在 ColorOS 上会卡死，且 system_server 读不了 /storage/emulated/0），" +
+      "并校验 pm 输出确实含 Success，失败会如实报错而不是静默假成功。",
     parameters: {
       action: {
         type: "string", required: true,
@@ -359,7 +459,8 @@ function apply(ctx) {
       await maybeApprove(ctx, exec, "android_package", args.action, args.package || args.apk_path || "");
       const a = safe(args.action);
       const pkg = safe(args.package);
-      const apk = safe(args.apk_path);
+      // 路径不能过 safe()：它会把中文目录名（如 "APK安装包"）整段删掉
+      const apk = String(args.apk_path ?? "").trim();
       const perm = safe(args.permission);
       let cmd = "";
       switch (a) {
@@ -367,7 +468,9 @@ function apply(ctx) {
           cmd = "pm list packages" + (args.third_party_only ? " -3" : "") +
                 (args.filter ? " | grep " + safe(args.filter) : "");
           break;
-        case "install": cmd = "pm install -r " + apk; break;
+        case "install":
+          if (!apk) throw new Error("install 需要 apk_path 参数");
+          return await installApk(apk, pkg);
         case "uninstall": cmd = "pm uninstall " + pkg; break;
         case "clear": cmd = "pm clear " + pkg; break;
         case "grant": cmd = "pm grant " + pkg + " " + perm; break;
@@ -467,7 +570,9 @@ function apply(ctx) {
   // 5) 模拟输入
   ctx.tools.register(defineTool({
     name: "android_input",
-    description: "模拟用户输入（需特权通道 root/Shizuku）：点击坐标、滑动、输入文本、发送按键事件。用于自动化操作当前屏幕。坐标以屏幕像素为单位。",
+    description: "模拟用户输入（需特权通道 root/Shizuku）：点击坐标、滑动、输入文本、发送按键事件。用于自动化操作当前屏幕。坐标以屏幕像素为单位。" +
+      "text 动作：纯 ASCII 走系统 input text；含中文/emoji 等非 ASCII 字符时自动改为「写剪贴板 + 粘贴」——" +
+      "input text 通道会静默丢弃非 ASCII 字符且不报错，绝不能用它输入中文。中文也可直接用无障碍版 android_type。",
     parameters: {
       action: { type: "string", required: true, enum: ["tap", "swipe", "text", "keyevent"], description: "tap=点击；swipe=滑动；text=输入文本；keyevent=按键" },
       x: { type: "number", description: "tap 的 x 坐标 / swipe 起点 x" },
@@ -475,7 +580,7 @@ function apply(ctx) {
       x2: { type: "number", description: "swipe 终点 x" },
       y2: { type: "number", description: "swipe 终点 y" },
       duration: { type: "number", description: "swipe 持续时间(毫秒，默认 300)" },
-      text: { type: "string", description: "text 动作要输入的文本" },
+      text: { type: "string", description: "text 动作要输入的文本（支持中文：非 ASCII 会自动走剪贴板粘贴）" },
       keycode: { type: "number", description: "keyevent 的按键码，如 3=HOME, 4=BACK, 26=POWER" }
     },
     output: { schema: resultSchema(), render: (_a, v) => renderResult(v) },
@@ -490,7 +595,30 @@ function apply(ctx) {
                 Math.round(Number(args.x2) || 0) + " " + Math.round(Number(args.y2) || 0) + " " +
                 Math.round(Number(args.duration) || 300);
           break;
-        case "text": cmd = "input text " + safe(args.text); break;
+        case "text": {
+          const text = String(args.text ?? "");
+          if (!/^[\x20-\x7e]*$/.test(text)) {
+            // 非 ASCII（中文/emoji 等）：input text 会静默丢弃这些字符且 exit_code 仍为 0，
+            // 所以改走「剪贴板 + 粘贴」；写剪贴板走 App 本地 HTTP POST（GET 会被当成 read，见 appPost）。
+            const wrote = await appPost("/clipboard", { action: "write", content: text });
+            if (!wrote || wrote.ok !== true) {
+              return {
+                ok: false, exit_code: -1, stdout: "", stderr: "",
+                error: "文本含非 ASCII 字符，需经剪贴板粘贴，但写入剪贴板失败：" +
+                  ((wrote && wrote.error) || "未知错误")
+              };
+            }
+            const pasted = await privCmd("input keyevent 279", 15000); // 279 = KEYCODE_PASTE
+            if (!pasted.ok) return pasted;
+            return {
+              ok: true, exit_code: 0, stderr: "",
+              stdout: "已通过剪贴板粘贴输入（" + text.length + " 字符，含非 ASCII）"
+            };
+          }
+          // ASCII：空格必须转成 %s，否则会被命令解析当成参数分隔符吃掉
+          cmd = "input text " + shq(text.replace(/ /g, "%s"));
+          break;
+        }
         case "keyevent": cmd = "input keyevent " + Math.round(Number(args.keycode) || 0); break;
         default: throw new Error("未知 action: " + a);
       }

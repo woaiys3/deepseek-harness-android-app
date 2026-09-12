@@ -108,7 +108,13 @@ done < LINKS.txt
 cd - >/dev/null
 
 mkdir -p "$P/staging/dshroot/lib"
-( cd "$H/dshroot/lib" && tar cf - --exclude='./node_modules/@deepseek-ai/dsh/node_modules/.bin' . ) \
+# 两个排除项：
+#   1) dsh 的 node_modules/.bin（原脚本即排除）
+#   2) dsh/node_modules/@deepseek-ai/dsh —— 开发树里被误造的「dsh 自我递归嵌套」
+#      （实测 632 层、路径约 19000 字符）。tar 的 --exclude 会在深入前跳过它，
+#      构建产物不需要它，复制耗时也从「卡死」降到数分钟。
+# ⚠ 不要在这里改用 robocopy：它遇到这棵病态目录会不返回（实测挂住）或报错 16。
+( cd "$H/dshroot/lib" && tar cf - --exclude='./node_modules/@deepseek-ai/dsh/node_modules/.bin' --exclude='./node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh' . ) \
   | ( cd "$P/staging/dshroot/lib" && tar xf - )
 
 # dshroot 版本标记：App 用它判断「外部 /sdcard/DeepSeekHarness/dshroot」是否需要补齐。
@@ -116,6 +122,11 @@ mkdir -p "$P/staging/dshroot/lib"
 DSHROOT_REV="$(date +%Y%m%d%H%M%S)"
 echo "$DSHROOT_REV" > "$P/staging/dshroot/REVISION"
 echo "$DSHROOT_REV" > "$P/assets/dshroot_revision.txt"
+
+# 内核树布局标记：布局本身变了（如依赖树结构换了）必须全量重推 dshroot。
+# 否则同内核升级走 fast 同步（只补白名单文件），整棵树仍是旧结构，修好的补丁包不生效。
+DSHROOT_LAYOUT="hoisted-1"
+echo "$DSHROOT_LAYOUT" > "$P/assets/dshroot_layout.txt"
 
 # 内核版本标记（v1.5.2 慢启动修复）：REVISION 是构建时间戳，每次构建都变；
 # App 用它区分「同内核升级（内容几乎不变，快速同步即可）」与「内核升级（新增文件，需全量补齐）」。
@@ -139,6 +150,30 @@ cp "$H/rish/rish_shizuku.dex" "$P/assets/rish_shizuku.dex"
 mkdir -p "$P/staging/rish"
 cp "$H/rish/rish_shizuku.dex" "$P/staging/rish/rish_shizuku.dex"
 chmod 644 "$P/staging/rish/rish_shizuku.dex"
+
+# v1.9 虚拟屏服务 jar（VirtualScreenServer）：独立于 App classes，供 app_process 特权加载。
+# app_process -Djava.class.path 必须指向含 *.dex 的 jar（裸 dex 会报 Unsupported class loader）。
+# 单独 javac 编译 src/.../vscreen/ 源码 → d8 成 classes.dex → jar 打包 → 放 assets（App 提取后传给引擎）
+echo "== vscreen jar =="
+VSC_SRC="$P/src/com/deepseek/harness/vscreen"
+mkdir -p "$P/out/vsc-classes" "$P/out/vsc-dex"
+if ls "$VSC_SRC"/*.java >/dev/null 2>&1; then
+  if "$JAVA/javac" -source 1.8 -target 1.8 -bootclasspath "$AJ" -d "$P/out/vsc-classes" "$VSC_SRC"/*.java >"$P/out/vsc-javac.log" 2>&1; then
+    ( cd "$P/out/vsc-classes" && "$D8" --release --lib "$AJ" --min-api 24 --output "$P/out/vsc-dex" $(find . -name '*.class' | sed 's|^\./||') ) 2>/tmp/vsc-d8.log || ( echo "  d8 retry"; cd "$P/out/vsc-classes" && find . -name '*.class' > "$P/out/vsc.rsp" && "$D8" --release --lib "$AJ" --min-api 24 --output "$P/out/vsc-dex" @"$P/out/vsc.rsp" 2>/tmp/vsc-d8b.log )
+    if [ -f "$P/out/vsc-dex/classes.dex" ]; then
+      # 用 jar 把 classes.dex 打成 jar（app_process 认含 dex 的 jar）
+      ( cd "$P/out/vsc-dex" && "$JAVA/jar" cf "$P/assets/vscreen_shizuku.jar" classes.dex )
+      echo "  vscreen_shizuku.jar: $(stat -c%s "$P/assets/vscreen_shizuku.jar") bytes"
+    else
+      echo "  !! vscreen dex 生成失败（d8）"
+    fi
+  else
+    echo "  !! vscreen javac 失败，日志：$P/out/vsc-javac.log"
+    tail -10 "$P/out/vsc-javac.log"
+  fi
+else
+  echo "  (无 vscreen 源码，跳过)"
+fi
 
 # 移动端适配资源：随 APK 打包，MainActivity 注入 WebView（不依赖服务器 dist）
 cp "$P/../mobile-patch/mobile.css" "$P/assets/mobile.css"
@@ -187,9 +222,13 @@ if [ "$CP_SEP" = ";" ] && command -v cygpath >/dev/null 2>&1; then
   SHIZUKU_JARS="$(cygpath -w "$P/out/shizuku-api/classes.jar")${CP_SEP}$(cygpath -w "$P/out/shizuku-provider/classes.jar")${CP_SEP}$(cygpath -w "$P/out/shizuku-aidl/classes.jar")"
 fi
 # javac 必须成功：失败立即中止（曾因 javac 找不到而产出无 MainActivity 的坏 APK，安装即闪退）
+# v48：vscreen 全量源码编入 APK（App 进程内嵌 Operit server，不再单独 jar 部署）
+VSC_SRC="$P/src/com/deepseek/harness/vscreen"
 if ! "$JAVA/javac" -source 1.8 -target 1.8 -bootclasspath "$AJ" \
   -classpath "$GEN_CP${CP_SEP}$SHIZUKU_JARS" -d "$P/out/classes" \
-  "$P/src/com/deepseek/harness/MainActivity.java" "$P/src/com/deepseek/harness/EngineService.java" "$P/src/com/deepseek/harness/AlarmReceiver.java" "$P/src/com/deepseek/harness/ScheduleExecutor.java" "$P/src/com/deepseek/harness/OverlayService.java" "$P/src/com/deepseek/harness/UsageStatsHelper.java" "$P/src/com/deepseek/harness/AccessibilityService.java" "$P/out/gen/com/deepseek/harness/R.java" \
+  "$P/src/com/deepseek/harness/MainActivity.java" "$P/src/com/deepseek/harness/EngineService.java" "$P/src/com/deepseek/harness/AlarmReceiver.java" "$P/src/com/deepseek/harness/ScheduleExecutor.java" "$P/src/com/deepseek/harness/OverlayService.java" "$P/src/com/deepseek/harness/UsageStatsHelper.java" "$P/src/com/deepseek/harness/AccessibilityService.java" "$P/src/com/deepseek/harness/VsreenBridgeService.java" \
+  "$VSC_SRC"/*.java \
+  "$P/out/gen/com/deepseek/harness/R.java" \
   >"$P/out/javac.log" 2>&1; then
   echo "!! javac 编译失败，日志：$P/out/javac.log"
   tail -20 "$P/out/javac.log"

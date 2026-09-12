@@ -1,3 +1,108 @@
+## v1.11（正式版 + Lite 共存版 + 兼容版 · 2026-09-12）
+
+> 内核升级 **DSH 0.1.5-rc.1**（原 0.1.1-rc.2）+ **6 个 android 插件缺陷修复** + **虚拟屏比例归一化**。
+> versionCode 25。**这是 v1.7.5 之后最大的一次更新**（跨 v1.8 → v1.11，共 4 个小版本）。
+
+### ⬆️ 内核升级到 DSH 0.1.5-rc.1（用「旧法」重建依赖树）
+- 上一轮曾用 `npm install --install-strategy=nested` 重装整个依赖闭包 → 内核树 **1214 MB**、486 包 **1691 个副本**、APK **343~526 MB**，并且丢了 `dsh` 包内的 `config/agent-presets/`（npm tarball 只含 lib）。
+- 本轮回到项目既有的「旧法」：以既有可工作内核树为基线 → 用 npm 解析出 0.1.5 的 **hoisted** 闭包 → 按旧树布局组装 → 重放补丁面 → 剥离原生模块 → 重建 APK。
+- 结果：内核树 **214 MB**、树内 **0 个原生 `.node/.so/.dll`**、APK **123 MB**，结构完整。
+
+### 🐛 修复 6 个 android_* 插件缺陷（均已真机逐条验证）
+
+| 工具 | 问题 | 修复 |
+|---|---|---|
+| `android_see` | 截图落在 **App 私有目录**，跨包读必 EACCES（“看图”能力彻底失效） | 无障碍截图改写到**共享目录** `<sdcard>/<pkgRoot>/screenshots/`；并修掉真因——**无障碍端口串台**（见下） |
+| `android_touch_status` | `held[]` 实际返回 `elapsedMs`，schema 未声明 → `additionalProperties:false` 判 invalid output | schema 补 `elapsedMs` |
+| `android_schedule` | App 返回体带 `repeat`，schema 未声明 → 整个调用报 error，**而闹钟其实已注册**（“报错 ≠ 没执行”） | schema 补 `repeat`；返回值改为**只带已声明字段**；另暴露 `repeat`/`intervalMin` 参数 |
+| `android_input text` | **中文全部丢失、exit_code 仍是 0**（插件 `safe()` 会删掉非 ASCII，`input text` 也只认 ASCII） | 文本不再过 `safe()`；ASCII 走 `input text`（空格转 `%s`）；**非 ASCII 自动改走「剪贴板 + 粘贴」** |
+| `android_type` | 空字符串（＝清空输入框）被真值判断误判为“没传参” | 改为只判 `undefined/null`，放行 `""` |
+| `android_package install` | **静默假成功**：单发 `pm install` 不解析输出，失败也返回 `exit_code:0`；且 `apk_path` 过 `safe()` 会把中文目录名删掉 | 先拷到 `/data/local/tmp`，再走 `install-create/install-write/install-commit`，**校验输出含 `Success`**，失败如实报错；给了 `package` 再用 `pm path` 二次校验 |
+
+### 🖥️ 虚拟屏比例：真正做到“一律 9:16 / 16:9”
+- **核心侧归一化**：`createDisplay()` 新增 `toPhoneSize()/normalizeShortEdge()`，短边取 144 的倍数 → 比例精确 9:16/16:9 且 16 像素对齐（如 `1520×720` → **1280×720**）。
+- **插件侧默认竖屏**：不传 `orientation` 时插件显式发 `1008×1792`（此前**什么都不发**，尺寸完全由服务端默认值决定——旧核心默认 `720×1520` 并非 9:16）。
+- **核心指纹升版**：`BUILD` / `EXPECTED_CORE_BUILD` → `vs112-20260912`。
+  **教训**：虚拟屏核心是独立特权进程、**比 App 活得久**（实测跨 4 次装包存活），只改核心代码不升指纹 → App 判不出“跑的是旧 core” → 改动**静默失效**。
+
+### 🔧 其他修复
+- **附件按钮点了没反应**：官方前端用 `<input type="file">`，而 App 从未实现 `WebChromeClient.onShowFileChooser` → 已补（含单选/多选）。
+- **读图三件套全挂**（`android_see` / `android_vscreen_see` / `read_image` 报 `EACCES: open '/data/user/0'`）：attachment-local 的 Android 补丁在 0.1.5 上漏移植两处 → 补 `syncDirectory` 的 EACCES/EPERM 容错 + `link()` 失败退化 `copyFile`。
+- **“修了但手机上没生效”**：`FORCE_OVERWRITE_PREFIXES`（fast 同步白名单）补齐补丁面；并新增**内核树布局标记**（`assets/dshroot_layout.txt` = `hoisted-1`），布局变化时整棵重推。
+- **三版本端口撞车**：引擎端口三套全写死 3080（注释却写“各用独立端口”）→ 同时装会 `EADDRINUSE`，插件的 3081/3181 会打到**另一个版本**的 App 上。现统一按包名派生：**3080 / 3082 / 3084**，通知端口 +1，无障碍端口 +101。
+- **无障碍端口串台（`android_see` 报 EACCES 的真因）**：无障碍服务读的是**跨版本持久化**的 `dsh_prefs:a11y_port`，旧包写下的 3181 在升级后仍被读到 → 正式版和 Lite 都往 3181 绑，**后连的那个静默失败、先连的那个应答**，于是正式版拿到的是 **Lite** 的截图路径。现改为**按包名推导**并纠正脏值。
+- **新增 `appPost()`**：App 本地服务会把请求行的 query 丢掉、只把 body 交给 `/clipboard`、`/schedule` → 这两个端点**必须 POST + JSON**；用 `GET?action=write` 会被当成 `read`（写入静默无效，随后粘贴的是剪贴板里的旧内容）。
+- **移除右上角浮动「退出」按钮**（系统返回键的确认退出保留）。
+- **🔐 移除硬编码的签名密码**：`android-app-fix/build-fix.sh` 里曾**明文写有签名密钥密码**（该文件在此前版本中已经公开，**该密码应视为已泄露**），现改为从 `KEYSTORE_PASS` 环境变量读取、缺失即报错——与其两个兄弟脚本（`android-app/build.sh`、`android-app-fix/build.sh`）保持一致。密钥文件 `release.jks` 始终未入库（`.gitignore` 已排除）。
+
+### 🙏 开源致谢
+- 虚拟屏（vscreen）实现**移植/对齐 [Operit](https://github.com/AAswordman/Operit)**（LGPL-3.0）→ 本仓库虚拟屏相关文件同样按 LGPL-3.0 分发，全文与说明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
+---
+
+## v1.10（正式版 + Lite 共存版 + 兼容版 · 2026-09-11）
+
+> versionCode 24。**虚拟屏修复版**：解决「`android_vscreen_create` 每次都失败（`displayId=-1`）」+「物理屏看不到虚拟屏」两个问题。
+> 预览方案对齐 [Operit](https://github.com/AAswordman/Operit)：**H.264 视频流实时解码渲染到悬浮窗**（不是轮询截图）。
+
+### ✨ 虚拟屏架构重做
+- **服务改为 App 进程内嵌启动**：不再依赖 Shizuku/root 拉起 `app_process` shell 进程——shell 域在 Android 15 enforcing 下 `createVirtualDisplay` 会被 Binder 拒（`Bad file descriptor`）。
+- **建屏即自动弹出独立预览悬浮窗**：实时显示虚拟屏画面（画中画），**不依赖 App 前后台**，一直显示到虚拟屏关闭。
+- **预览窗可拖动、可双指缩放**（对齐 Operit 交互），默认右上角留边距。
+- **预览 = H.264 视频流**：服务端 MediaCodec 编码器 → `setVideoSink` 推给 App 内本地 sink → `H264PreviewRenderer` 解码 → 渲染到 SurfaceView。含 **SPS/PPS（csd-0/csd-1）缓存重放**（编码器在建屏瞬间就发配置帧，后挂的 sink 拿不到）。
+- **截图**改走 PixelCopy（公开 API，从虚拟屏 Surface 读帧）；**输入**走 Shizuku `input -d` / `am start --display`。
+- **不再请求 MediaProjection 授权**（用户反感弹窗，且主 App 也用不到）。
+
+### 🐛 修复
+- 预览窗 `updateViewLayout` 崩溃（SurfaceView → 容器）＋ 触摸穿透（去 `FLAG_NOT_TOUCH_MODAL`，改用 FrameLayout 容器接收触摸）。
+- `dsh-tool-vscreen` 的 `readFile` 从 `node:fs` 误用为 Promise → AI 的 see 报「读取截图失败」；改从 `node:fs/promises` 导入。
+- `AbortSignal.any` polyfill（内置 node 版本 < 20.3 无此 API）。
+
+### ⚠️ 已知边界
+- 需要 **Android 11+**；无悬浮窗权限时预览窗不显示；无 Shizuku 时可“看”不可“点”。
+- 正式版与 Lite 共存版**同时启动**时 **8999 端口互斥** → 虚拟屏实际二选一。
+
+---
+
+## v1.9（正式版 + Lite 共存版 + 兼容版 · 2026-08-29）
+
+> 内核 DSH 0.1.1-rc.2，versionCode 23，targetSdk 28。虚拟屏（vscreen）能力 + 存储权限自动请求修复（“未知错误”根因）。
+
+### 🔧 v1.9 二次修复（对齐 Operit 成熟方案，Android 15 实测问题解决）
+- **存活方案（关键）**：真机（Android 15 + Shizuku）实测 server 启动后被杀（日志停在 HTTP listening，进程消失）——根因是 rish `-c` 命令会话结束会清理子进程（setsid/nohup/double-fork 均无效）。**对齐 Operit（Android 最成熟同类）**：改为 App 在 Shizuku 授权后通过 `IShizukuService.newProcess()` 启动 server（独立进程，App 持有 IRemoteProcess，不受命令会话清理）——项目 libs 已内置 shizuku-aidl.aar（13.1.5，IShizukuService.newProcess 直接可用）。MainActivity `ensureVscreenServer()` 实现：newProcess cp jar → chmod → newProcess 启动 app_process server；启动时自动探测 8999（已活则跳过）。
+- **Android 10+ 安全模型（实测）**：App 进程内建虚拟屏被拒（Requires CAPTURE_VIDEO_OUTPUT or MediaProjection）——确认虚拟屏必须由特权进程创建（shell uid 有 CAPTURE_VIDEO_OUTPUT）；曾尝试 App 内公开 API 建屏（Operit VirtualDisplayManager 思路）实测被权限拒绝，已回退特权 server 方案。
+- **注入改为特权短命令**：tap/swipe/key 由插件执行 `input -d <displayId> tap/swipe/keyevent`（一次性命令，无需长驻特权进程；`-d` 语法已实测正确）。
+- **插件 ensureServer 重构**：Shizuku 场景只探测 8999（App 已自动启动 server）不再自行 rish 启动；root 场景保留 su 路径。
+
+### ✨ 新增（虚拟屏 vscreen）
+- **真·虚拟屏服务（VirtualScreenServer）**：app_process 特权进程（root 或 Shizuku shell 通道），反射 `DisplayManager.createVirtualDisplay()` 创建独立虚拟显示器；MediaCodec H.264 编码器 surface（无编码器环境回退 ImageReader）；`ActivityOptions.setLaunchDisplayId` 启动 App 到虚拟屏；`InputManager` 反射 + `setDisplayId` 定向注入触摸/按键；FakeContext（60+ 抽象方法的最小 Context 实现）供 DisplayManager 构造时传入，解决 app_process 无 Context 的 NPE。
+- **插件 `dsh-tool-vscreen`（8 工具）**：android_vscreen_create / status / launch / see / tap / swipe / key / close。see 通过 attachments 注入注册（截图作为图片发送给视觉模型），返回 screenW/H、imageW/H、scaleX/Y 供坐标换算。
+- **部署链路**：server jar 随 APK assets 打包（vscreen_shizuku.jar），App 启动提取到外部共享目录（/sdcard/DeepSeekHarness*/vscreen/，App 可写、shell 可读），插件以特权通道拷贝到 /data/local/tmp 后 app_process 加载；每次启动强制覆盖（防旧 jar 残留）。
+- **可观测性**：server 日志写 /data/local/tmp/vscreen.log（shell 可读）；插件启动失败自动带出日志末尾；cp 失败报真实 stderr（不再“未知错误”）。
+
+### 🐛 修复（“未知错误”根因）
+- **首次启动存储权限**：Android 10+ 上 targetSdk28 的 App 写 /sdcard 必须先运行时授权；之前不弹窗，提取 jar 到外部目录 EACCES 后静默 fallback 私有目录 → 特权通道（shell）读不到 → vscreen 永远起不来，AI 只看到“未知错误”。现 onCreate 自动请求存储权限，授权回调里重新提取 jar 到外部目录（日志：vscreen jar re-extracted after permission grant），模拟器全流程验证通过。
+- **manifest 加 requestLegacyExternalStorage="true"**（Android 10/11 legacy 访问保险，三版本）。
+- **vscreen 工具无屏时明确报错**：launch/tap/swipe/key/see 在未 create 时返回“虚拟屏未创建，请先调用 /vscreen/create”，不再假成功（之前 launch 会启动到主屏 displayId 0、tap 静默失败）。
+- **android_vscreen_see 返回尺寸字段**：server 截图响应补齐 screenW/H、imageW/H、scaleX/Y（之前插件拿默认 0/1，坐标换算失效）。
+- **正式版/Lite/兼容版 MainActivity 统一**：FORCE_OVERWRITE_PREFIXES 增加 dsh-tool-vscreen（随 APK 覆盖旧插件，避免旧版插件挡住更新）。
+
+### ⚠️ 说明
+- 虚拟屏需要 **Android 11+** 且 root 或 Shizuku 授权；模拟器无 H.264 编码器/软渲染限制，请以真机验证为准。
+- 已验证（模拟器）：jar 部署链路、app_process 启动（shell uid）、FakeContext 修复 NPE、插件 8 工具注册、无屏操作明确报错、see 尺寸字段、存储权限自动请求全流程。
+- 未验证（需真机）：createVirtualDisplay 成功建屏（模拟器无 H.264 编码器 + ImageReader Binder fd 限制；真机有硬件编码器，为 Operit/scrcpy 同款标准路径）。
+
+
+# DeepSeek Harness Android · 移动端优化改动清单
+
+## v1.8（2026-08-29 凌晨 · **未单独发布**）
+
+> versionCode 22。**中间构建**：虚拟屏插件（`dsh-tool-vscreen`）首次随包进入 payload，但**服务端尚未落地**
+> （包内没有 `assets/vscreen_shizuku.dex`，App 内也没有任何 vscreen 代码）——该版本的虚拟屏必然不可用。
+> 约 1 小时后被 **v1.9** 完整取代，未单独发布；此条仅作版本沿革记录。
+
+---
+
 ## v1.7.5（正式版 + Lite 共存版 + 兼容版 · 2026-08-28）
 
 > 内核 DSH 0.1.1-rc.2，versionCode 21，targetSdk 28。Termux 共存修复 + 无障碍手势引擎 + 工具输出校验修复。
