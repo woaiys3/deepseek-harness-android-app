@@ -106,8 +106,10 @@ function privShell(command, timeoutMs) {
 async function ensureServer() {
   if (await serverAlive()) return { ok: true };
 
-  // v1.10：虚拟屏 server 由 App 进程内嵌启动（打开 App 即自动运行，监听 8999，
-  // 无需 root/Shizuku 拉特权进程）。这里只需等待 App 已启动的 server 就绪。
+  // v1.10：插件自己不拉起服务端——App 打开的桥（VsreenBridgeService，监听 8999）会负责拉起。
+  // 注意：这里“插件无需特权”≠“功能无需特权”。桥要用 Shizuku/root 把**核心**（8998）
+  // 以 shell 身份拉起来，所以虚拟屏整体仍需 Shizuku 或 root；无它时核心起不来、全功能不可用。
+  // （但**不需要无障碍**：点击走 shell 的 `input -d <displayId>`，截图走 ImageReader 直接从虚拟屏取帧。）
   for (let i = 0; i < 15; i++) {
     await sleep(1000);
     if (await serverAlive()) return { ok: true };
