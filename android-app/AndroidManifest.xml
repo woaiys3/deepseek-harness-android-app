@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.deepseek.harness"
-    android:versionCode="25"
-    android:versionName="1.11">
+    android:versionCode="33"
+    android:versionName="1.13.6">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
 
@@ -90,5 +90,13 @@
             android:enabled="true"
             android:exported="true"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- v1.13：「分享日志」以**文件**形式发出（targetSdk 28 不允许直传 file:// URI，
+             本项目无 androidx，故自实现最小只读 ContentProvider，只暴露 cache/share 下的文件） -->
+        <provider
+            android:name=".LogShareProvider"
+            android:authorities="com.deepseek.harness.logshare"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>
