@@ -93,7 +93,9 @@ public class MainActivity extends Activity {
     // bin.js 相对 dshroot 目录的路径（dshroot 可能位于外部公共目录或内部 fallback）
     private static final String REL_BINJS = "lib/node_modules/@deepseek-ai/dsh/lib/bin.js";
     // 外部 dshroot 公共目录名（挂在 /sdcard 下，卸载不丢；node 二进制/凭证仍留内部）
-    private static final String EXT_DSHROOT_ROOT = "DeepSeekHarness";
+    // 外部公共根目录不要用常量：它必须按包名派生（正式版 / Lite / 兼容版共存时互不干扰）。
+    // 曾硬编码为 "DeepSeekHarness" → Lite/兼容版会写到正式版的外部目录（vscreen jar、外部回退 dshroot
+    // 都会串到别的版本上）。统一用 pkgRoot()（见下）。
     // 官方维护、需随 APK 更新的路径前缀：即使外部 dshroot 已有同名文件也强制覆盖
     // （避免"保留 AI 修改"策略挡住官方修复，例如 shizuku 插件的三层补丁）。
     private static final String[] FORCE_OVERWRITE_PREFIXES = {
@@ -124,6 +126,8 @@ public class MainActivity extends Activity {
     private static final int REQ_STORAGE = 200;
     private static final int REQ_NOTIFICATION = 201;
     private static final int REQ_SHIZUKU = 300;
+    /** v1.13：已发出 Shizuku 授权请求、等待结果（用于超时傅底判断）。 */
+    private volatile boolean pendingShizukuReq = false;
     private static final int REQ_WORKSPACE_TREE = 400;
     private static final int REQ_FILE_CHOOSER = 500;
 
@@ -132,6 +136,33 @@ public class MainActivity extends Activity {
     public static volatile boolean overlayForeground = true;
 
     private WebView webView;
+
+    // ---- v1.12 控制台（冷启动首页，原生界面）----
+    private FrameLayout engineRoot;                // WebView + 启动浮层 + 控制台的共同根容器
+    private ScrollView consoleLayer;               // 控制台覆盖层
+    private LinearLayout consoleBody;              // 当前页内容容器
+    private int consolePage = 0;                   // 0 控制台 / 1 权限 / 2 插件 / 3 日志
+    private boolean consoleVisible = false;
+    private boolean consoleDetailOpen = false;      //「已解压」那一行是否展开
+    private boolean extracting = false;            // 正在解压（控制台进度）
+    private boolean extractOnlyMode = false;       // true：本次只解压，不起引擎
+    private boolean filesPreparedThisBoot = false; // 本进程内文件已就绪 → 跳过重复解压
+    private volatile boolean starting = false;      // 引擎启动中（跨线程读写：启动流程在后台线程、刷新在主线程）
+    private long engineStartTs = 0L;
+    private String conExtractMsg = null;
+    private String conFilesSummary = null;         //「24,806 个文件 · 214 MB」后台算一次
+    private Handler conTick;
+    private TextView conExState, conExMeta, conEnState, conEnMeta, conFoot;
+    private View conBar, conFill, conSpacer;
+    private Button conExBtn, conEnBtn, conEnRestart, conEnStop;
+    private View conDetailBox;
+    private final Runnable consoleTick = new Runnable() {
+        @Override public void run() {
+            if (!consoleVisible) return;
+            refreshConsole();
+            if (conTick != null) conTick.postDelayed(this, 1000);
+        }
+    };
     // 网页 <input type="file"> 选完文件后的回调（见 onShowFileChooser）
     private ValueCallback<Uri[]> fileChooserCallback;
     private TextView statusView;
@@ -143,6 +174,15 @@ public class MainActivity extends Activity {
     private File dshrootDir = null;
     private boolean watchdogStarted = false;
     private long lastRespawnAt = 0L;
+    private volatile boolean engineStartAborted = false;   // v1.13：「停止」打断在飞的启动等待（否则状态栏一直计时到 90s 超时）
+    private volatile boolean engineStoppedByUser = false;  // v1.13：用户主动停止 → 看门狗不得再自动拉起引擎
+    // v1.13：引擎存活探测结果缓存。控制台的每秒刷新在主线程跑，一旦直接做 HTTP 探测就会抛
+    // NetworkOnMainThreadException（被 catch 吞掉）→ 引擎明明在跑也永远判“未启动”
+    // → 用户再点一次「启动引擎」就又拉起一个 node → EADDRINUSE（用户实测的“启动一会又变回去”）。
+    private volatile boolean engineAliveCached = false;
+    private volatile long engineProbeAt = 0L;
+    private volatile boolean engineProbeBusy = false;
+    private volatile boolean notifyServerStarted = false;  // v1.13：通知通道幂等启动标记
     // 引擎 node 进程
     private Process nodeProcess = null;
     // v1.5.2 慢启动修复：本次启动走了「快速同步」（同内核升级，只补白名单+REVISION）。
@@ -173,7 +213,7 @@ public class MainActivity extends Activity {
         installCrashHandler();
         checkAbiCompat(); // ② ABI 检测：非 arm64 设备引擎可能无法运行，弹提示
         checkBatteryOptimization(); // ④ 电池优化引导：被限制时提示（挂后台可能被杀）
-        checkForUpdate(); // ⑧ 更新提示：GitHub 有新版时提示（后台线程，不阻塞启动）
+        // v1.12：不再在启动时自动检查更新（用户要求）；改为控制台底部的「检查更新」手动触发。
 
         webView = new WebView(this);
         WebSettings ws = webView.getSettings();
@@ -277,9 +317,9 @@ public class MainActivity extends Activity {
             });
             Shizuku.addRequestPermissionResultListener(new Shizuku.OnRequestPermissionResultListener() {
                 @Override public void onRequestPermissionResult(int requestCode, int grantResult) {
-                    if (grantResult == PackageManager.PERMISSION_GRANTED) {
-                        shizukuOk = true;
-                    }
+                    pendingShizukuReq = false;   // v1.13：无论结果都结束“等待授权”状态
+                    shizukuOk = grantResult == PackageManager.PERMISSION_GRANTED;
+                    Log.i(TAG, "shizuku permission result: " + grantResult);
                     refreshAllStatuses();
                 }
             });
@@ -296,7 +336,12 @@ public class MainActivity extends Activity {
                 if (task != null && !task.isEmpty()) pendingScheduledTask = task;
             }
             showEngineScreen();
-            startEngine();
+            // v1.12：冷启动先停在控制台；切屏回来/任务恢复（savedInstanceState != null）直接进主界面。
+            if (savedInstanceState == null) {
+                showConsole();
+            } else {
+                startEngine();
+            }
         } else {
             showPermissionScreen();
         }
@@ -390,7 +435,8 @@ public class MainActivity extends Activity {
     }
 
     private void showEngineScreen() {
-        FrameLayout root = new FrameLayout(this);
+        if (engineRoot == null) engineRoot = new FrameLayout(this);
+        FrameLayout root = engineRoot;
         root.setBackgroundColor(Color.parseColor("#0b0f1a"));
         // 成员视图（webView/statusView/progressBar）可能已挂在旧容器上，先全部摘下，避免重复挂载崩溃。
         detachView(webView);
@@ -447,17 +493,12 @@ public class MainActivity extends Activity {
 
     /** 退出确认对话框（浮动按钮与系统返回键共用） */
     private void confirmExit() {
-        new AlertDialog.Builder(this)
-                .setTitle("退出 deepdive")
-                .setMessage("确定要退出吗？服务器将停止运行。")
-                .setPositiveButton("退出", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface d, int w) {
-                        stopKeepAliveService(); // 用户主动退出：停止保活服务
-                        finish();
-                    }
-                })
-                .setNegativeButton("取消", null)
-                .show();
+        conDialog("退出 DeepSeek Harness", "确定要退出吗？服务器将停止运行。", "退出", new Runnable() {
+            @Override public void run() {
+                stopKeepAliveService(); // 用户主动退出：停止保活服务
+                finish();
+            }
+        }, "取消");
     }
 
     // ============ 界面主题色（跟随系统深/浅色，权限页与加载页共用）============
@@ -524,16 +565,11 @@ public class MainActivity extends Activity {
             ui.post(new Runnable() {
                 @Override public void run() {
                     try {
-                        new AlertDialog.Builder(MainActivity.this)
-                                .setTitle("建议：允许后台运行")
-                                .setMessage("当前应用被系统限制后台活动，AI 执行任务时挂后台可能被系统杀掉。\n\n建议将本应用设为「不限制」电池优化，确保任务持续运行。")
-                                .setPositiveButton("去设置", new DialogInterface.OnClickListener() {
-                                    @Override public void onClick(DialogInterface d, int w) {
-                                        openSystemSetting(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                                    }
-                                })
-                                .setNegativeButton("暂不", null)
-                                .show();
+                        conDialog("建议：允许后台运行",
+                                "当前应用被系统限制后台活动，AI 执行任务时挂后台可能被系统杀掉。\n\n建议把本应用设为「不限制」电池优化，确保任务持续运行。",
+                                "去设置", new Runnable() { @Override public void run() {
+                                    openSystemSetting(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+                                }}, "暂不");
                     } catch (Throwable ignored) {}
                 }
             });
@@ -543,7 +579,7 @@ public class MainActivity extends Activity {
     }
 
     // ⑧ 更新提示：后台查 GitHub Releases 最新 tag，与本地 versionName 比对，有新版弹提示
-    private void checkForUpdate() {
+    private void checkForUpdate(final boolean manual) {
         new Thread(new Runnable() {
             @Override public void run() {
                 try {
@@ -553,7 +589,7 @@ public class MainActivity extends Activity {
                     c.setReadTimeout(5000);
                     c.setRequestProperty("User-Agent", "dsh-android");
                     int code = c.getResponseCode();
-                    if (code != 200) { c.disconnect(); return; }
+                    if (code != 200) { c.disconnect(); if (manual) ui.post(new Runnable() { @Override public void run() { conToast("检查更新失败（网络）"); } }); return; }
                     InputStream in = c.getInputStream();
                     ByteArrayOutputStream out = new ByteArrayOutputStream();
                     byte[] b = new byte[4096];
@@ -570,7 +606,10 @@ public class MainActivity extends Activity {
                         int q2 = q1 >= 0 ? json.indexOf('"', q1 + 1) : -1;
                         if (q1 >= 0 && q2 > q1) tag = json.substring(q1 + 1, q2);
                     }
-                    if (tag == null || tag.isEmpty()) return;
+                    if (tag == null || tag.isEmpty()) {
+                        if (manual) ui.post(new Runnable() { @Override public void run() { conToast("检查更新失败（响应异常）"); } });
+                        return;
+                    }
                     String latest = tag.replace("v", "").replace("-lite", "").replace("-beta", "");
                     String local = "";
                     try { local = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Throwable ignored) {}
@@ -581,25 +620,23 @@ public class MainActivity extends Activity {
                         ui.post(new Runnable() {
                             @Override public void run() {
                                 try {
-                                    new AlertDialog.Builder(MainActivity.this)
-                                            .setTitle("发现新版本 " + ftag)
-                                            .setMessage("当前版本 " + fLocal + "，最新 " + ftag + "。\n\n前往 GitHub Releases 下载更新（正式版 / Lite 共存版可选）。")
-                                            .setPositiveButton("去下载", new DialogInterface.OnClickListener() {
-                                                @Override public void onClick(DialogInterface d, int w) {
-                                                    try {
-                                                        startActivity(new Intent(Intent.ACTION_VIEW,
-                                                                Uri.parse("https://github.com/woaiys3/deepseek-harness-android-app/releases")));
-                                                    } catch (Throwable ignored) {}
-                                                }
-                                            })
-                                            .setNegativeButton("稍后", null)
-                                            .show();
+                                    conDialog("发现新版本 " + ftag,
+                                            "当前版本 " + fLocal + "，最新 " + ftag + "。\n\n前往 GitHub Releases 下载更新（正式版 / Lite 共存版可选）。",
+                                            "去下载", new Runnable() { @Override public void run() {
+                                                try {
+                                                    startActivity(new Intent(Intent.ACTION_VIEW,
+                                                            Uri.parse("https://github.com/woaiys3/deepseek-harness-android-app/releases")));
+                                                } catch (Throwable ignored) {}
+                                            }}, "稍后");
                                 } catch (Throwable ignored) {}
                             }
                         });
+                    } else if (manual) {
+                        ui.post(new Runnable() { @Override public void run() { conToast("已是最新版本（" + fLocal + "）"); } });
                     }
-                } catch (Throwable t) {
-                    // 网络失败/离线时静默跳过（不打扰用户）
+                } catch (final Throwable t) {
+                    // 网络失败/离线：启动时的自动检查静默跳过；手动检查给反馈
+                    if (manual) ui.post(new Runnable() { @Override public void run() { conToast("检查更新失败：" + t.getMessage()); } });
                 }
             }
         }, "update-check").start();
@@ -637,7 +674,7 @@ public class MainActivity extends Activity {
         Thread.setDefaultUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
             @Override public void uncaughtException(Thread t, Throwable e) {
                 try {
-                    File dir = new File(Environment.getExternalStorageDirectory(), EXT_DSHROOT_ROOT);
+                    File dir = new File(Environment.getExternalStorageDirectory(), pkgRoot());
                     if (!dir.exists()) dir.mkdirs();
                     File f = new File(dir, "crash.log");
                     FileOutputStream fos = new FileOutputStream(f, true);
@@ -1149,25 +1186,139 @@ public class MainActivity extends Activity {
         try { binderOk = Shizuku.pingBinder(); } catch (Throwable ignored) {}
         boolean rootOkNow = rootOk != null && rootOk;
 
-        if (rootOkNow || (shizukuOk != null && shizukuOk)) {
+        // v1.13：**实时探测**，不信 shizukuOk 缓存。
+        // 缓存由 probeShizuku() 异步刷新，而用户“在 Shizuku 里撤销授权 → 回来马上点授权”时缓存
+        // 往往还是旧的 true → 会走“已授权”分支而不调 requestPermission → 表现为“点了没任何弹窗”。
+        boolean shizukuNow = false;
+        int selfPerm = -1, apiVer = -1;
+        boolean rationale = false;
+        try {
+            if (binderOk) {
+                selfPerm = Shizuku.checkSelfPermission();
+                shizukuNow = selfPerm == PackageManager.PERMISSION_GRANTED;
+                try { apiVer = Shizuku.getVersion(); } catch (Throwable ignored) {}
+                try { rationale = Shizuku.shouldShowRequestPermissionRationale(); } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) { Log.w(TAG, "Shizuku state probe failed", t); }
+        if (binderOk) shizukuOk = shizukuNow;   // 用实时值刷新缓存
+        Log.i(TAG, "shizuku state: binder=" + binderOk + " selfPerm=" + selfPerm
+                + " apiVer=" + apiVer + " rationale=" + rationale);
+
+        if (rootOkNow || shizukuNow) {
             AlertDialog.Builder b = new AlertDialog.Builder(this);
             b.setTitle("系统特权（可选）");
             b.setMessage((rootOkNow ? "已检测到 Root（su）可用，AI 可以执行系统级操作。\n" : "") +
-                    ((shizukuOk != null && shizukuOk) ? "Shizuku 已授权，AI 可以执行系统级操作。\n" : "") +
+                    (shizukuNow ? "Shizuku 已授权，AI 可以执行系统级操作。\n" : "") +
                     "\n不授予特权也能正常使用：文件读写、预览、编辑只需「所有文件访问」权限。");
             b.setNegativeButton("关闭", null);
             b.show();
         } else if (binderOk) {
-            // 服务在运行但未授权 → 直接弹 Shizuku 授权对话框
-            try {
-                Shizuku.requestPermission(REQ_SHIZUKU);
-            } catch (Throwable t) {
-                Log.w(TAG, "Shizuku requestPermission failed", t);
-                fallbackShizukuDialog(installed);
-            }
+            // 服务在运行但未授权 → 请求 Shizuku 弹授权框；若系统/ROM 没弹出来，8 秒后引导手动授权
+            requestShizukuPermission(installed);
         } else {
             fallbackShizukuDialog(installed);
         }
+    }
+
+    /**
+     * 请求 Shizuku 授权 + **超时傅底**。
+     * v1.13：授权框由 Shizuku 应用弹出；在部分 ROM（ColorOS 等）上它可能被拦截/不弹，
+     * 而 requestPermission 本身不报错也不回调 —— 用户看到的就是“点了没任何反应”。
+     * 这里过 8 秒仍未拿到结果，就弹一个“怎么手动授权”的引导框（附当前状态供排查）。
+     */
+    private void requestShizukuPermission(final boolean installed) {
+        pendingShizukuReq = true;
+        try {
+            Shizuku.requestPermission(REQ_SHIZUKU);
+        } catch (Throwable t) {
+            Log.w(TAG, "Shizuku requestPermission failed", t);
+        }
+        // v1.13.3：真机实测本机（Shizuku 13.6.0 + ColorOS 15）上 requestPermission() 不弹框，
+        // 而“引擎里 AI 调 rish”能弹 —— 因为 Shizuku 的授权框是 Shizuku 应用在收到**真实请求**时才弹。
+        // 所以这里补两条与引擎同款的真实触发；授权框弹出后用户点允许，3 秒后回探一次即可反映到界面。
+        triggerShizukuPrompt();
+        ui.postDelayed(new Runnable() {
+            @Override public void run() { probeShizuku(); }
+        }, 3000L);
+        ui.postDelayed(new Runnable() {
+            @Override public void run() {
+                if (!pendingShizukuReq) return;   // 已经回调过（用户处理了）
+                pendingShizukuReq = false;
+                showShizukuGuideDialog(installed);
+            }
+        }, 12000L);
+    }
+
+    /**
+     * 发两条**真实请求**逼 Shizuku 弹授权框（requestPermission 在本机不弹）：
+     *   ① 向 Shizuku 应用要 binder（client provider 路径）；
+     *   ② 用 App 自己 spawn 一个 rish（与引擎里 rish 完全同款：同样的 dex、同样的 env 清理、同样的广播）。
+     * ② 会超时（5 秒广播预算）也没关系——我们要的是它在 Shizuku 应用侧触发的授权框。
+     */
+    private void triggerShizukuPrompt() {
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try { Shizuku.getBinder(); } catch (Throwable ignored) {}
+            }
+        }, "shizuku-binder-warm").start();
+        new Thread(new Runnable() {
+            @Override public void run() {
+                Process p = null;
+                try {
+                    File dex = (rishDex != null && rishDex.exists()) ? rishDex : extractRishDex();
+                    if (dex == null || !dex.exists()) {
+                        Log.w(TAG, "triggerShizukuPrompt: rish dex 不可用");
+                        return;
+                    }
+                    try { android.system.Os.chmod(dex.getAbsolutePath(), 0444); } catch (Throwable ignored) {}
+                    ProcessBuilder pb = new ProcessBuilder(
+                            "/system/bin/app_process",
+                            "-Djava.class.path=" + dex.getAbsolutePath(),
+                            "/system/bin",
+                            "--nice-name=rish",
+                            "rikka.shizuku.shell.ShizukuShellLoader",
+                            "-c", "id");
+                    java.util.Map<String, String> env = pb.environment();
+                    env.remove("LD_LIBRARY_PATH");
+                    env.remove("LD_PRELOAD");
+                    env.remove("LD_DEBUG");
+                    env.put("RISH_APPLICATION_ID", getPackageName());
+                    pb.redirectErrorStream(true);
+                    p = pb.start();
+                    try { p.waitFor(9, java.util.concurrent.TimeUnit.SECONDS); } catch (Throwable ignored) {}
+                } catch (Throwable t) {
+                    Log.w(TAG, "triggerShizukuPrompt(rish) failed", t);
+                } finally {
+                    try { if (p != null) p.destroy(); } catch (Throwable ignored) {}
+                }
+            }
+        }, "shizuku-prompt-rish").start();
+    }
+
+    /** 授权框没弹出来时的引导（去 Shizuku 里手动授权），并带上当前状态便于定位。 */
+    private void showShizukuGuideDialog(boolean installed) {
+        String label = getPackageName();
+        try {
+            CharSequence l = getApplicationInfo().loadLabel(getPackageManager());
+            if (l != null && l.length() > 0) label = l + "（" + getPackageName() + "）";
+        } catch (Throwable ignored) {}
+        String msg = "Shizuku 的授权框没有出现（常见于 ColorOS/OPPO 等系统拦截了它的弹窗）。"
+                + "\n\n请手动授权：\n"
+                + "1. 打开 Shizuku 应用\n"
+                + "2. 进入「已授权的应用」（或首页的「授权应用」）\n"
+                + "3. 找到 " + label + " → 打开开关\n\n"
+                + "授权后回到本页会自动刷新。";
+        AlertDialog.Builder b = new AlertDialog.Builder(this);
+        b.setTitle("Shizuku 授权（需手动）");
+        b.setMessage(msg);
+        b.setPositiveButton("打开 Shizuku", new DialogInterface.OnClickListener() {
+            @Override public void onClick(DialogInterface d, int w) { openShizukuApp(); }
+        });
+        b.setNeutralButton("重新检测", new DialogInterface.OnClickListener() {
+            @Override public void onClick(DialogInterface d, int w) { probeShizuku(); conToast("已重新检测"); }
+        });
+        b.setNegativeButton("关闭", null);
+        b.show();
     }
 
     private void fallbackShizukuDialog(boolean installed) {
@@ -1308,7 +1459,12 @@ public class MainActivity extends Activity {
             File dir = new File(getFilesDir(), "rish");
             if (!dir.exists()) dir.mkdirs();
             File dex = new File(dir, "rish_shizuku.dex");
-            if (dex.exists() && dex.length() > 0) return dex;
+            if (dex.exists() && dex.length() > 0) {
+                // v1.13.6：升级用户走的就是这一支（旧文件不会被重写），而旧版留下的副本可能是 0666
+                // → 同样会被 ART 拒绝加载（静默 SIGABRT），所以“已存在”分支也要收权。
+                secureDexPermissions(dex);
+                return dex;
+            }
             InputStream in = getAssets().open("rish_shizuku.dex");
             FileOutputStream out = new FileOutputStream(dex);
             byte[] b = new byte[8192];
@@ -1316,6 +1472,9 @@ public class MainActivity extends Activity {
             while ((n = in.read(b)) > 0) out.write(b, 0, n);
             out.close();
             in.close();
+            // v1.13.5：刚写出来的是 rw-rw-rw-，而 Android 14+ 拒绝加载可写 dex（SIGABRT）——
+            // 插件侧每次调用会 chmod，但“App 自己刚提取、插件还没跑”的窗口期同样会中招，所以这里就收权。
+            secureDexPermissions(dex);
             return dex;
         } catch (Exception e) {
             Log.w(TAG, "extract rish dex failed", e);
@@ -1472,6 +1631,8 @@ public class MainActivity extends Activity {
 
     // ============ 引擎启动（原逻辑）============
     private void startEngine() {
+        engineStartAborted = false;    // v1.13：重新启动 → 清掉「停止」留下的中止/抑制标记
+        engineStoppedByUser = false;
         startKeepAliveService();   // 前台保活：挂后台不被杀（引擎持续运行）
         // 引擎端口持久化（供 OverlayService/其他组件读取）；已授权悬浮窗时自动拉起小鲸鱼
         try {
@@ -1491,8 +1652,11 @@ public class MainActivity extends Activity {
                     // 通知通道在后台线程启动（端口 = enginePort+1）。
                     startNotifyServer();
 
-                    File files = getFilesDir();
-                    File payload = new File(files, "payload");
+                    File payload = payloadDir();
+                    // v1.12：解压与启动拆开。「解压文件」把 extractOnlyMode 置 true，跑到下面
+                    // ensurePatchConfig 为止就返回；「启动引擎」复用同一入口，但 filesPreparedThisBoot
+                    // 已置位 → 整段文件准备被跳过。
+                    if (!filesPreparedThisBoot) {
                     File done = new File(payload, ".extracted");
 
                     // v1.5.3 慢启动根因修复：内核目录改为【内部存储优先】。
@@ -1501,7 +1665,7 @@ public class MainActivity extends Activity {
                     // require() 解析时海量 stat/read 过 FUSE 极慢（真机如此，模拟器宿主机磁盘快测不出）。
                     // 修复：node 恒从内部存储（files/payload/dshroot）读内核（快、可靠）；
                     // 外部目录仅作【内部空间不足】时的回退，以及保留 .nomedia/相册保护等兼容逻辑。
-                    File externalRoot = new File(Environment.getExternalStorageDirectory(), EXT_DSHROOT_ROOT);
+                    File externalRoot = new File(Environment.getExternalStorageDirectory(), pkgRoot());
                     boolean useExternal = externalDshrootWritable(externalRoot);
 
                     // 后台清理上次「清空」遗留的 .trash-* 目录（rename 后后台删除未完成），不阻塞启动。
@@ -1585,16 +1749,33 @@ public class MainActivity extends Activity {
 
                     applyLinks(payload);
                     setExecutables(payload);
+                    secureDexFiles(payload); // v1.13.5：兜底把旧树里已有的 dex 也收成 0444（覆盖升级不会被重写）
                     ensurePatchConfig(payload); // ③ 补丁启动自检：cordis.patch.yml 缺失/被改则自动补齐
-                    if (healthOk()) { loadHome(); return; }
-                    showIndeterminate("正在启动 DeepSeek Harness…");
-                    spawnNode(payload);
-                    waitForServer();
+                    filesPreparedThisBoot = true;
+                    conMarkPayloadDone();   // 记录“内部这棵树是本次安装解压的”（供控制台/校验判定）
+                    } // end if (!filesPreparedThisBoot)
+                    if (extractOnlyMode) {
+                        // 控制台「解压文件」：到此为止，不碰引擎
+                        extractOnlyMode = false;
+                        extracting = false;
+                        ui.post(new Runnable() { @Override public void run() { conExtractDone(); } });
+                        return;
+                    }
+                    launchEngine(payload);
                 } catch (Throwable t) {
                     Log.e(TAG, "engine error", t);
                     String msg = String.valueOf(t.getMessage());
+                    filesPreparedThisBoot = false;
+                    final boolean wasExtract = extractOnlyMode;
+                    extractOnlyMode = false;
+                    extracting = false;
+                    starting = false;
                     setStatus("引擎启动失败：" + msg);
                     writeStartupDiag(msg);
+                    final String m = msg;
+                    ui.post(new Runnable() { @Override public void run() {
+                        if (wasExtract) conExtractFailed(m); else conEngineFailed(m);
+                    } });
                 }
             }
         }, "engine-boot").start();
@@ -1633,22 +1814,29 @@ public class MainActivity extends Activity {
     }
 
     // ============ ③ 补丁启动自检 ============
-    /** 检查内部 dshhome/cordis.patch.yml 是否完整（含禁用的三个插件），
-     *  缺失/被外部改动破坏则从 payload.zip 重新提取官方配置（幂等）。
-     *  背景：补丁配置被改/删会导致 llm-pi-ai/sandbox/bash-sandbox 启用失败 → 启动崩溃。 */
+    /** 检查内部 dshhome/cordis.patch.yml 是否完整（含 marker 与禁用的插件），
+     *  缺失/被外部改动破坏/版本落后则从 payload.zip 重新提取官方配置（幂等）。
+     *  背景：补丁配置被改/删会导致 sandbox/bash-sandbox 启用失败 → 启动崩溃。
+     *  v1.12：改用顶部 marker 判定版本。旧实现靠“内容里必须有 llm-pi-ai”判定，
+     *        而 v1.12 起 llm-pi-ai 已取消禁用 → 升级用户会被判为“不完整”并自动落地新配置
+     *        （正是我们想要的迁移效果）。 */
+    private static final String PATCH_CONFIG_MARKER = "dsh-android-patch: v2";
+
     private void ensurePatchConfig(File payload) {
         try {
             File patch = new File(payload, "dshhome/cordis.patch.yml");
             boolean need = !patch.exists();
             if (!need) {
                 String content = readFileText(patch);
-                // 关键禁用项缺任一 → 视为损坏，重新提取
-                need = !(content.contains("llm-pi-ai") && content.contains("sandbox")
+                // marker 缺失/落后，或关键禁用项缺失 → 视为需重新落地
+                need = !(content.contains(PATCH_CONFIG_MARKER) && content.contains("sandbox")
                         && content.contains("bash-sandbox") && content.contains("disabled: true"));
             }
             if (need) {
                 Log.w(TAG, "cordis.patch.yml missing or incomplete, restoring from payload.zip");
                 refreshInternalConfig(payload); // 重新覆盖 dshhome 官方配置（凭证/会话保留）
+            } else {
+                conHealPatchConfig();   // v1.13：结构自愈（控制台旧实现关插件会写坏它，见 conHealPatchConfig）
             }
         } catch (Throwable t) {
             Log.w(TAG, "ensurePatchConfig error", t);
@@ -1663,9 +1851,11 @@ public class MainActivity extends Activity {
     private boolean isDshEngine(int port) {
         HttpURLConnection c = null;
         try {
-            // 0.1.5：首页需要 token（否则 401 authentication required）。带上引擎打印的 token URL
-            // 探测，服务器会下发 cookie 并重定向到干净首页，正文才含 <title>。
-            String probe = (engineTokenUrl != null) ? engineTokenUrl : ("http://127.0.0.1:" + port + "/");
+            // 0.1.5：首页需要 token（否则 401 authentication required）。
+            // ⚠ 探测**绝不能带 token**：token 是一次性的（用过即废），若被探测吃掉，
+            // 随后 WebView 拿同一个 token 加载就会 401（用户看到的白屏/黑字就是这个）。
+            // 探测只用不带 token 的 /：401 + DSH 专属正文 也足以证明“是本引擎且在跑”。
+            String probe = "http://127.0.0.1:" + port + "/";
             c = (HttpURLConnection) new URL(probe).openConnection();
             c.setConnectTimeout(1200);
             c.setReadTimeout(1500);
@@ -1677,6 +1867,13 @@ public class MainActivity extends Activity {
             c.setInstanceFollowRedirects(false);
             int code = c.getResponseCode();
             if (code == 303 || code == 302) return true;
+            if (code == 401) {
+                // v1.12：0.1.5 引擎未带 token 时返回 401 + DSH 专属正文。
+                // 旧实现直接当“不是引擎” → 引擎明明在跑，控制台与健康探测却永远判未就绪
+                // （用户实测：点完「启动引擎」界面又退回「启动引擎」）。
+                String b401 = conReadBody(c, 4096);
+                return b401 != null && b401.indexOf("dsh web authentication required") >= 0;
+            }
             if (code < 200 || code >= 500) return false;
             InputStream in = c.getInputStream();
             // v1.5.5 修复：首页实际约 14KB（13KB 内联脚本在前，<title> 位于页面末尾第 13.4KB 处），
@@ -1743,6 +1940,10 @@ public class MainActivity extends Activity {
 
     /** 启动本地通知监听：AI 通过插件请求 http://127.0.0.1:<notifyPort> 发通知（仅需通知权限）。 */
     private void startNotifyServer() {
+        // v1.13：幂等 —— 重复调用（用户连点「启动引擎」、看门狗重试）会对同一端口二次 bind，
+        // 真机日志里表现为“notify server stopped + EADDRINUSE”，期间通知通道短暂不可用。
+        if (notifyServerStarted) return;
+        notifyServerStarted = true;
         final int port = notifyPort();
         new Thread(new Runnable() {
             @Override public void run() {
@@ -1763,8 +1964,10 @@ public class MainActivity extends Activity {
                     }
                 } catch (Throwable t) {
                     Log.w(TAG, "notify server stopped", t);
+                    notifyServerStarted = false;   // v1.13：bind 失败（端口被占）时允许下次重试
                 } finally {
                     try { if (ss != null) ss.close(); } catch (Throwable ignored) {}
+                    notifyServerStarted = false;
                 }
             }
         }, "notify-server").start();
@@ -1820,7 +2023,10 @@ public class MainActivity extends Activity {
                     }
                     // 3) 分发处理
                     String respBody;
-                    if (path.startsWith("/setting")) {
+                    if (path.startsWith("/shell")) {
+                        // v1.13.1：App 进程内的特权执行（Shizuku API 通道）——见 handleShellRequest
+                        respBody = handleShellRequest(body.toString());
+                    } else if (path.startsWith("/setting")) {
                         respBody = handleSettingRequest(body.toString());
                     } else if (path.startsWith("/clipboard")) {
                         respBody = handleClipboardRequest(body.toString());
@@ -1874,6 +2080,150 @@ public class MainActivity extends Activity {
         sb.append(",\"overlayGranted\":").append(Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(this));
         sb.append('}');
         return sb.toString();
+    }
+
+    /**
+     * POST /shell {"command":"…","timeout_ms":N,"token":"…"} —— 在 **App 进程内**经 Shizuku API
+     * 以 shell 身份执行命令并回收 stdout/stderr/退出码。
+     *
+     * 为什么不继续用引擎里的 rish：Shizuku 服务端校验「某个包是否被授权」时要回头问 Shizuku 应用本体，
+     * 而 ColorOS 会冻结/查杀 Shizuku 应用（真机日志实锤：`OplusHansManager … F exit()`、
+     * `NativeFreezeManager … mFgAppPkgname moe.shizuku.privileged.api`、
+     * `reason=EXCESSIVE CPU USAGE … excessive binder traffic during cached state`），
+     * 于是引擎内 spawn 出来的 rish 子进程等不到响应 → Shizuku 客户端库报 “Request timeout…”。
+     * App 进程内的 Shizuku API 通道实测稳定（虚拟屏核心就是用它拉起的），因此特权执行改走这里。
+     */
+    private String handleShellRequest(String raw) {
+        try {
+            String token = jsonField(raw, "token");
+            String mine = localToken();
+            if (mine.isEmpty() || !mine.equals(token)) {
+                return "{\"ok\":false,\"error\":\"token 校验失败（该接口仅限本应用引擎调用）\"}";
+            }
+            String command = jsonField(raw, "command");
+            if (command == null || command.isEmpty()) {
+                return "{\"ok\":false,\"error\":\"缺少 command 参数\"}";
+            }
+            int timeoutMs = 30000;
+            String tm = jsonField(raw, "timeout_ms");
+            if (!tm.isEmpty()) {
+                try { timeoutMs = Math.max(1000, Math.min(Integer.parseInt(tm.trim()), 120000)); }
+                catch (Exception ignored) {}
+            }
+            return shellViaShizuku(command, timeoutMs);
+        } catch (Throwable t) {
+            return "{\"ok\":false,\"error\":\"shell 路由异常：" + jesc(String.valueOf(t.getMessage())) + "\"}";
+        }
+    }
+
+    /** 经 Shizuku（App 进程内）以 shell uid 执行一条命令，回收输出，带超时兜底。 */
+    private String shellViaShizuku(String command, final int timeoutMs) {
+        if (!shizukuAvailable()) {
+            return "{\"ok\":false,\"error\":\"Shizuku 未授权或服务未运行（App 内 pingBinder/checkSelfPermission 失败）\"}";
+        }
+        final StringBuilder out = new StringBuilder();
+        final StringBuilder err = new StringBuilder();
+        try {
+            IShizukuService svc = IShizukuService.Stub.asInterface(Shizuku.getBinder());
+            if (svc == null) return "{\"ok\":false,\"error\":\"Shizuku binder 为空\"}";
+            final IRemoteProcess p = svc.newProcess(new String[]{"/system/bin/sh", "-c", command}, null, null);
+            if (p == null) return "{\"ok\":false,\"error\":\"Shizuku newProcess 返回空\"}";
+            Thread to = pumpStream(new android.os.ParcelFileDescriptor.AutoCloseInputStream(p.getInputStream()), out, "priv-out");
+            Thread te = pumpStream(new android.os.ParcelFileDescriptor.AutoCloseInputStream(p.getErrorStream()), err, "priv-err");
+            final int[] code = new int[]{-1};
+            Thread waiter = new Thread(new Runnable() {
+                @Override public void run() {
+                    try { code[0] = p.waitFor(); } catch (Throwable ignored) {}
+                }
+            }, "priv-wait");
+            waiter.start();
+            waiter.join(timeoutMs);
+            if (waiter.isAlive()) {
+                try { p.destroy(); } catch (Throwable ignored) {}
+                waiter.join(1500);
+                joinQuietly(to); joinQuietly(te);
+                return "{\"ok\":false,\"exit_code\":-1,\"stdout\":\"" + jesc(clip(out))
+                        + "\",\"stderr\":\"" + jesc(clip(err))
+                        + "\",\"error\":\"命令超时（" + timeoutMs + "ms）已终止\"}";
+            }
+            joinQuietly(to); joinQuietly(te);
+            return "{\"ok\":" + (code[0] == 0) + ",\"exit_code\":" + code[0]
+                    + ",\"stdout\":\"" + jesc(clip(out)) + "\",\"stderr\":\"" + jesc(clip(err)) + "\"}";
+        } catch (Throwable t) {
+            return "{\"ok\":false,\"exit_code\":-1,\"stdout\":\"" + jesc(clip(out))
+                    + "\",\"stderr\":\"" + jesc(clip(err))
+                    + "\",\"error\":\"Shizuku 执行失败：" + jesc(String.valueOf(t.getMessage())) + "\"}";
+        }
+    }
+
+    /** 后台把一条流读到 EOF。 */
+    private Thread pumpStream(final InputStream in, final StringBuilder sb, String name) {
+        Thread t = new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    byte[] buf = new byte[4096];
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        if (sb.length() < 65536) sb.append(new String(buf, 0, n, "UTF-8"));
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    try { in.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }, name);
+        t.setDaemon(true);
+        t.start();
+        return t;
+    }
+
+    private static void joinQuietly(Thread t) {
+        try { if (t != null) t.join(800); } catch (Throwable ignored) {}
+    }
+
+    private static String clip(StringBuilder sb) {
+        String s = sb.toString();
+        return s.length() > 8000 ? s.substring(0, 8000) : s;
+    }
+
+    /** 最小 JSON 字符串转义。 */
+    private static String jesc(String s) {
+        if (s == null) return "";
+        StringBuilder b = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"': b.append("\\\""); break;
+                case '\\': b.append("\\\\"); break;
+                case '\n': b.append("\\n"); break;
+                case '\r': b.append("\\r"); break;
+                case '\t': b.append("\\t"); break;
+                default: b.append(c < 0x20 ? ' ' : c);
+            }
+        }
+        return b.toString();
+    }
+
+    /**
+     * 本地特权路由的鉴权令牌：持久化在 dsh_prefs（App 私有），随 env 交给引擎。
+     * 用 prefs 而不是内存字段，是为了「App 重启但引擎还活着」时令牌不变、插件调用不失效。
+     */
+    private String localToken() {
+        try {
+            SharedPreferences p = getSharedPreferences("dsh_prefs", MODE_PRIVATE);
+            String t = p.getString("local_token", "");
+            if (t == null || t.length() < 16) {
+                byte[] b = new byte[16];
+                new java.security.SecureRandom().nextBytes(b);
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < b.length; i++) sb.append(String.format("%02x", b[i]));
+                t = sb.toString();
+                p.edit().putString("local_token", t).apply();
+            }
+            return t;
+        } catch (Throwable t) {
+            return "";
+        }
     }
 
     /** 处理 /overlay：控制小鲸鱼悬浮窗。action=show|hide|toggle|status。 */
@@ -2238,7 +2588,14 @@ public class MainActivity extends Activity {
         } catch (Throwable ignored) {}
     }
 
-    /** 从 JSON 里取字符串字段值（简易解析，不引第三方库）。 */
+    /**
+     * 从请求体里取一个字符串字段。
+     *
+     * v1.13.4：改成**认识转义**的解析。旧实现是“取第一个引号到下一个引号”，不认 `\"` `\\` `\n` 等，
+     * 于是命令里带引号/换行会被截断：例如 shizuku_shell 传
+     * `pm install -r "/sdcard/Download/my app.apk"` 会被解析成 `pm install -r \`，后半段全丢，
+     * 而工具还会“照跑”——表现为莫名其妙的失败。
+     */
     private String jsonField(String json, String key) {
         try {
             String k = "\"" + key + "\"";
@@ -2248,9 +2605,33 @@ public class MainActivity extends Activity {
             if (c < 0) return "";
             int q1 = json.indexOf('"', c + 1);
             if (q1 < 0) return "";
-            int q2 = json.indexOf('"', q1 + 1);
-            if (q2 < 0) return "";
-            return json.substring(q1 + 1, q2).replace("\\\"", "\"");
+            StringBuilder sb = new StringBuilder();
+            for (int p = q1 + 1; p < json.length(); p++) {
+                char ch = json.charAt(p);
+                if (ch == '\\') {
+                    if (p + 1 >= json.length()) break;
+                    char n = json.charAt(p + 1);
+                    if (n == 'n') sb.append('\n');
+                    else if (n == 'r') sb.append('\r');
+                    else if (n == 't') sb.append('\t');
+                    else if (n == 'b') sb.append('\b');
+                    else if (n == 'f') sb.append('\f');
+                    else if (n == 'u') {
+                        if (p + 5 >= json.length()) break;
+                        try {
+                            sb.append((char) Integer.parseInt(json.substring(p + 2, p + 6), 16));
+                            p += 4;
+                        } catch (Exception ignored) {}
+                    } else {
+                        sb.append(n);      // \" \\ \/ 等：取字符本身
+                    }
+                    p++;
+                    continue;
+                }
+                if (ch == '"') break;
+                sb.append(ch);
+            }
+            return sb.toString();
         } catch (Throwable t) {
             return "";
         }
@@ -2453,6 +2834,8 @@ public class MainActivity extends Activity {
         ZipEntry e;
         int processed = 0;
         int written = 0;
+        int failed = 0;
+        String firstFail = null;
         while ((e = zis.getNextEntry()) != null) {
             String name = e.getName();
             if (e.isDirectory() || name.startsWith("__MACOSX/") || name.startsWith("META-INF/")) { zis.closeEntry(); continue; }
@@ -2493,16 +2876,61 @@ public class MainActivity extends Activity {
 
             File parent = target.getParentFile();
             if (parent != null && !parent.exists() && !parent.mkdirs()) throw new IOException("mkdir failed: " + parent);
-            FileOutputStream fos = new FileOutputStream(target);
-            int n;
-            while ((n = zis.read(buf)) > 0) fos.write(buf, 0, n);
-            fos.close();
+            prepareTarget(target);
+            try {
+                FileOutputStream fos = new FileOutputStream(target);
+                int n;
+                while ((n = zis.read(buf)) > 0) fos.write(buf, 0, n);
+                fos.close();
+                // v1.13.5：dex 必须**不可写**——Android 14+ 的 ART 拒绝加载可写 dex
+                // （logcat: SecurityException: Writable dex file '…' is not allowed → 进程直接
+                //  SIGABRT/exit 134，终端上只看到一个 "Aborted"）。payload.zip 内所有条目都不带
+                // unix 权限（external_attr=0），文件权限完全由本函数决定，所以这里对 *.dex 收成 0444。
+                if (name.endsWith(".dex")) secureDexPermissions(target);
+                written++;
+            } catch (IOException ioe) {
+                // 单个条目失败不中断整体（否则一次 EACCES 就能让整轮解压白干），最后汇总报错
+                failed++;
+                if (firstFail == null) firstFail = name + "（" + ioe.getMessage() + "）";
+                Log.w(TAG, "extract entry failed: " + name, ioe);
+            }
             zis.closeEntry();
-            written++;
             updateProgress(processed, total, written);
         }
         zis.close();
         Log.i(TAG, "extracted " + written + " entries (external=" + (externalRoot != null) + ", mode=" + mode + ")");
+        if (failed > 0) throw new IOException("有 " + failed + " 个文件写不进去，首个：" + firstFail);
+    }
+
+    /**
+     * 写入前把目标清干净。覆盖安装时旧版本（v1.10 那棵老树）可能留下**只读文件 / 扭结软链 /
+     * 同名目录**，直接 FileOutputStream 会报 EACCES（用户实测：payload/rish/rish_shizuku.dex）；
+     * 父目录不可写也要先提权，否则同样是 EACCES。
+     */
+    private void prepareTarget(File target) {
+        try {
+            File parent = target.getParentFile();
+            if (parent != null && parent.exists() && !parent.canWrite()) parent.setWritable(true, true);
+            if (target.isDirectory()) { deleteRecursive(target); return; }
+            if (target.exists()) {
+                if (target.canWrite()) return;
+                // 注意：这里用 owner-only（true）——setWritable(true, false) 会把 group/other 的写位也加上，
+                // 0444 的 dex 会因此变成 0666（真机实测的 “Writable dex” 就是这么来的）。
+                target.setWritable(true, true);
+                if (target.canWrite()) return;
+                if (!target.delete()) {
+                    // 删不掉就改名避让（改名只需父目录写权限），旧文件内容不再被引用
+                    File bak = new File(target.getParentFile(),
+                            target.getName() + ".old-" + System.currentTimeMillis());
+                    if (target.renameTo(bak)) deleteRecursive(bak);
+                }
+            } else {
+                // File.exists() 对悬空符号链接返回 false，但创建仍会失败 → 用 lstat 判一下再删
+                try { if (Os.lstat(target.getAbsolutePath()) != null) target.delete(); } catch (Throwable ignored) {}
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "prepareTarget failed: " + target, t);
+        }
     }
 
     // 判断某条目是否属于官方强制覆盖白名单（外部 dshroot 也随 APK 更新）。
@@ -2632,6 +3060,33 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * 把 payload 里已知的 dex 统一收成 0444（读取不报错，但任何 uid 都写不了）。
+     * 用于兜底：覆盖升级时旧树里的文件不会被重写，只能在解压后扫一遍。
+     */
+    private void secureDexFiles(File payload) {
+        String[] dexs = {"rish/rish_shizuku.dex", "vscreen/vscreen_shizuku.dex"};
+        for (String p : dexs) {
+            File f = new File(payload, p);
+            if (f.exists()) secureDexPermissions(f);
+        }
+    }
+
+    /**
+     * dex 文件强制不可写（0444）。
+     *
+     * 为什么必须这么做：Android 14+ 的 ART **拒绝加载可写 dex**，报
+     * `java.lang.SecurityException: Writable dex file '<path>' is not allowed`，
+     * 进程直接 SIGABRT（exit=134）——而终端上只看得到一句 “Aborted”，
+     * 极易被误判成 “Shizuku 没运行 / 未授权”，把排查方向带偏。
+     * payload.zip 内所有条目的 unix 权限都是 0（external_attr=0），权限完全由解压时决定，
+     * 而 Java 写文件在本机 umask 下默认就是 rw-rw-rw-（0666）→ 所以必须显式收权。
+     */
+    private void secureDexPermissions(File f) {
+        try { android.system.Os.chmod(f.getAbsolutePath(), 0444); } catch (Throwable ignored) {}
+        try { f.setWritable(false, false); } catch (Throwable ignored) {}   // chmod 失败（如 FUSE）时的兜底
+    }
+
     private void spawnNode(File payload) throws IOException {
         File node = new File(payload, "runtime/bin/node");
         File binjs = new File(dshrootDir, REL_BINJS);
@@ -2644,6 +3099,10 @@ public class MainActivity extends Activity {
         if (!node.exists()) throw new IOException("node binary missing");
         if (!binjs.exists()) throw new IOException("dsh bin.js missing");
         if (!node.canExecute()) node.setExecutable(true, false);
+
+        // v1.13：起引擎前先自愈 cordis.patch.yml —— 旧版控制台关插件会把它写成非法 YAML，
+        // 引擎每次启动都崩在解析、App 反复重拉（表现：界面一直闪、一直计时）。
+        conHealPatchConfig();
 
         // 注意：Android 兼容补丁（禁用 llm-pi-ai/sandbox/bash-sandbox 的 cordis.patch.yml）
         // 位于 $DSH_HOME/cordis.patch.yml，由 dsh profile-boot 的 homePatches 自动加载，
@@ -2668,11 +3127,23 @@ public class MainActivity extends Activity {
         env.put("SHIZUKU_DEX", rishDex != null ? rishDex.getAbsolutePath() : "");
         // v1.9 虚拟屏 server dex：app_process 特权加载 VirtualScreenServer
         env.put("VS_DEX", vscreenDex != null ? vscreenDex.getAbsolutePath() : "");
-        env.put("SHIZUKU_APP_ID", "com.deepseek.harness.beta");
+        // v1.13 修正：这里原来**硬编码** "com.deepseek.harness.beta"，而三版共用同一份源码 —— 正式版跑起来
+        // 也在自称 beta，而 rish 要拿这个 appId 去 Shizuku 要授权，Shizuku 比对实际调用者的包名/uid
+        // （正式版 uid ≠ beta uid）→ 门卫不认（用户回报：“SHIZUKU_APP_ID=…beta，但真正在跑的是 com.deepseek.harness”）。
+        // 按实际包名派生，与 ScheduleExecutor 的 ctx.getPackageName() 一致；
+        // 并写回 dsh_prefs，供无障碍服务/调度器等其它组件复用（同样不能信旧值）。
+        final String selfAppId = getPackageName();
+        env.put("SHIZUKU_APP_ID", selfAppId);
+        try {
+            getSharedPreferences("dsh_prefs", MODE_PRIVATE).edit().putString("shizuku_app_id", selfAppId).apply();
+        } catch (Throwable ignored) {}
         // 特权通道可用性：root(su) 或 Shizuku。两者都未授予时，DSH 插件不注册特权工具，
         // AI 不会反复尝试系统操作；文件读写仍可用 DSH 自带的 fs/bash 工具（只需存储权限）。
         env.put("SHIZUKU_AVAILABLE", shizukuAvailable() ? "1" : "0");
         env.put("ROOT_AVAILABLE", rootAvailable() ? "1" : "0");
+        // v1.13.1：本地特权路由 /shell 的鉴权令牌——只经 env 交给本应用自己的引擎，本机其它应用猜不到，
+        // 避免任意应用通过 127.0.0.1:<notifyPort>/shell 拿到 shell 权限。
+        env.put("APP_LOCAL_TOKEN", localToken());
         env.put("APP_NOTIFY_PORT", String.valueOf(notifyPort()));
         // v1.7 无障碍服务端口（通知端口 + 100，三版本共存不冲突）：插件 dsh-tool-accessibility 经此端口
         // 调用 App 的无障碍服务（读屏/点击/输入/截图）。端口同时写入 dsh_prefs，供无障碍服务读取。
@@ -2708,14 +3179,19 @@ public class MainActivity extends Activity {
                     InputStream is = proc.getInputStream();
                     byte[] b = new byte[4096];
                     int n;
+                    String carry = "";
                     while ((n = is.read(b)) > 0) {
                         fos.write(b, 0, n);
                         fos.flush();
                         if (extFos != null) {
                             try { extFos.write(b, 0, n); extFos.flush(); } catch (Throwable ignored) {}
                         }
-                        String s = new String(b, 0, n, "UTF-8");
-                        for (String line : s.split("\n")) {
+                        // v1.12：一次 read 可能在行中间断开，token URL 会被截成两半 → 拼接后再切行
+                        String s = carry + new String(b, 0, n, "UTF-8");
+                        int cut = s.lastIndexOf('\n');
+                        carry = cut >= 0 ? s.substring(cut + 1) : s;
+                        String parse = cut >= 0 ? s.substring(0, cut) : "";
+                        for (String line : parse.split("\n")) {
                             String t = line.trim();
                             if (!t.isEmpty()) Log.i(TAG, "node: " + t);
                             // 0.1.5 认证：引擎打印 "dsh web: http://127.0.0.1:3080/?token=..."，
@@ -2745,15 +3221,35 @@ public class MainActivity extends Activity {
         return isDshEngine(enginePort);
     }
 
+    /** 读 HTTP 正文（容忍错误流；仅供探测用，上限 max 字节）。 */
+    private String conReadBody(HttpURLConnection c, int max) {
+        try {
+            InputStream in = null;
+            try { in = c.getInputStream(); } catch (Throwable t) { in = c.getErrorStream(); }
+            if (in == null) return null;
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] chunk = new byte[4096];
+            int total = 0;
+            int r;
+            while ((r = in.read(chunk)) > 0 && total < max) { out.write(chunk, 0, r); total += r; }
+            try { in.close(); } catch (Throwable ignored) {}
+            return out.toString("UTF-8");
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     private void waitForServer() {
         long start = System.currentTimeMillis();
         long deadline = start + 90000;
         while (System.currentTimeMillis() < deadline) {
+            if (engineStartAborted) return;   // v1.13：用户点了「停止」→ 立即收手，别再刷“已等待 N 秒”
             if (healthOk()) { loadHome(); executePendingScheduledTask(); return; }
             long waited = (System.currentTimeMillis() - start) / 1000;
             setStatus("正在启动 DeepSeek Harness…（已等待 " + waited + " 秒）");
             try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
         }
+        if (engineStartAborted) return;   // v1.13：停止后不再走超时兜底（否则会重新 spawn + 重新加载页面）
         // 超时：带端口提示便于排查（node 日志已写入 files/dsh-web.log）
         Log.e(TAG, "engine start timeout on port " + enginePort + ", check dsh-web.log");
         // v1.5.2 慢启动修复兜底：本次走了「快速同步」（同内核升级），若引擎仍起不来，
@@ -2763,7 +3259,7 @@ public class MainActivity extends Activity {
             Log.w(TAG, "fast sync may have missed files, forcing full dshroot repair");
             setStatus("引擎启动超时，正在补齐引擎文件后重试…");
             try {
-                File externalRoot = new File(Environment.getExternalStorageDirectory(), EXT_DSHROOT_ROOT);
+                File externalRoot = new File(Environment.getExternalStorageDirectory(), pkgRoot());
                 extractPayload(new File(getFilesDir(), "payload"), externalRoot, "dshroot");
                 writeDshrootComplete(externalRoot);
             } catch (Throwable t) {
@@ -2876,6 +3372,7 @@ public class MainActivity extends Activity {
                     try { Thread.sleep(5000); } catch (InterruptedException e) { return; }
                     try {
                         if (nodeProcess == null) continue;
+                        if (engineStoppedByUser) continue;   // v1.13：用户点了「停止」→ 不自动拉起
                         boolean serverUp = healthOk();
                         boolean nodeAlive = nodeProcess.isAlive();
                         if (!serverUp && !nodeAlive) {
@@ -2898,6 +3395,8 @@ public class MainActivity extends Activity {
     }
 
     private void loadHome() {
+        // v1.12：控制台还开着时不抢界面（引擎就绪后由用户点「打开主界面」进来）
+        if (consoleVisible) return;
         startWatchdog();
         ui.post(new Runnable() {
             @Override public void run() {
@@ -2915,7 +3414,10 @@ public class MainActivity extends Activity {
 
     private void setStatus(final String s) {
         ui.post(new Runnable() {
-            @Override public void run() { statusView.setText(s); }
+            @Override public void run() {
+                statusView.setText(s);
+                if (consoleVisible) conSay(s);
+            }
         });
     }
 
@@ -2928,6 +3430,11 @@ public class MainActivity extends Activity {
                     progressBar.setProgress(percent);
                 }
                 if (s != null) statusView.setText(s);
+                if (consoleVisible) {
+                    if (conBar != null) conBar.setVisibility(View.VISIBLE);
+                    conSetProgress(percent);
+                    conSay(s);
+                }
             }
         });
     }
@@ -2940,6 +3447,7 @@ public class MainActivity extends Activity {
                     progressBar.setVisibility(View.VISIBLE);
                 }
                 if (s != null) statusView.setText(s);
+                if (consoleVisible) conSay(s);
             }
         });
     }
@@ -2967,8 +3475,1483 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
+    // ==================== v1.12 控制台（冷启动首页 · 原生界面） ====================
+    // 控制台是盖在 WebView 之上的一层原生视图（同一个 FrameLayout 根），冷启动时显示；
+    // 切屏回来 / 任务恢复（savedInstanceState != null）不进它，直接回 DSH 主界面。
+    // 四块：解压文件（完成后收起成一行）、启动引擎、授予权限（含 root）、插件开关、日志。
+
+    private volatile boolean conRootOk = false;
+    private long conRootProbeTs = 0L;
+
+    private int cLine() { return Color.parseColor(isDark() ? "#232a38" : "#e5e7eb"); }
+    private int cAccent() { return Color.parseColor("#4d6bfe"); }
+
+    private File payloadDir() { return new File(getFilesDir(), "payload"); }
+
+    /** 当前安装包的 versionCode（用于判断“内部那棵树是不是本次安装解压的”）。 */
+    private int conBuildCode() {
+        try { return (int) getPackageManager().getPackageInfo(getPackageName(), 0).getLongVersionCode(); }
+        catch (Throwable t) { return 0; }
+    }
+
+    /** 关键文件缺失检查（只查标记文件不够：解压中途失败、文件被杀都不算就绪）。 */
+    private String conMissingKey() {
+        File p = payloadDir();
+        String[] keys = {".extracted", "dshroot/REVISION",
+                "dshroot/lib/node_modules/@deepseek-ai/dsh/lib/bin.js",
+                "runtime/bin/node", "rish/rish_shizuku.dex"};
+        for (int i = 0; i < keys.length; i++) if (!new File(p, keys[i]).exists()) return keys[i];
+        return null;
+    }
+
+    /**
+     * 运行时与内核树是否已就绪。
+     * v1.12：加两道判定 —— ① 关键文件必须在；② 内部那棵树必须是**当前这次安装**解压出来的
+     * （payload_build_code == 当前 versionCode）。否则升级安装后拿着旧树（例：v1.10 留下的）
+     * 会显示“已解压”、校验也“通过”（用户实测就是这个问题）。
+     */
+    private boolean conFilesReady() {
+        if (conMissingKey() != null) return false;
+        int done = 0;
+        try { done = getSharedPreferences("dsh_prefs", MODE_PRIVATE).getInt("payload_build_code", 0); } catch (Throwable ignored) {}
+        return done != 0 && done == conBuildCode();
+    }
+
+    private void conMarkPayloadDone() {
+        try {
+            getSharedPreferences("dsh_prefs", MODE_PRIVATE).edit()
+                    .putInt("payload_build_code", conBuildCode()).apply();
+        } catch (Throwable ignored) {}
+    }
+
+    private String conKernelVer() {
+        try {
+            String s = readFileText(new File(payloadDir(), "dshroot_kernel_version.txt"));
+            if (s != null && s.trim().length() > 0) return s.trim();
+        } catch (Throwable ignored) {}
+        return null;
+    }
+
+    private String conVersionLabel() {
+        String v = "";
+        try { v = getPackageManager().getPackageInfo(getPackageName(), 0).versionName; } catch (Throwable ignored) {}
+        String k = conKernelVer();
+        return v + (k != null ? " · 内核 " + k : "");
+    }
+
+    /**
+     * 控制台用的“引擎就绪”判定：**只认真实端口探测**，不再回退看进程句柄。
+     * v1.13 修正：真机实测 node 从拉起→开始监听要 17~25 秒，若把“进程活着”当成“已就绪”，
+     * 控制台会过早点亮「打开主界面」，用户点进去时 3080 还没监听 → WebView 连不上，
+     * 看起来就是“点了没反应”；同时底部还在刷“正在启动…（已等待 N 秒）” → 两套文案交替闪。
+     * 现在：就绪=探测通过；进程活着但未就绪 → 由 conEngineBooting() 归入“启动中”。
+     */
+    private boolean conEngineRunning() {
+        long now = System.currentTimeMillis();
+        if (now - engineProbeAt > 1500L && !engineProbeBusy) {
+            engineProbeBusy = true;
+            new Thread(new Runnable() {
+                @Override public void run() {
+                    conProbeEngineNow();
+                    engineProbeBusy = false;
+                    if (consoleVisible) ui.post(new Runnable() { @Override public void run() { refreshConsole(); } });
+                }
+            }, "engine-probe").start();
+        }
+        return engineAliveCached;
+    }
+
+    /** 已拉起但还没监听端口（node 启动中）；控制台据此显示“启动中…”并禁用入口。 */
+    private boolean conEngineBooting() {
+        if (engineAliveCached) return false;
+        Process p = nodeProcess;
+        return starting || (p != null && p.isAlive());
+    }
+
+    /** 端口是否已被监听（TCP 连接得通即算；**后台线程调用**）。
+     *  比 healthOk() 更早为真：node 还在启动时端口已经 listen，用它避免重复拉起引擎。 */
+    private boolean portListening(int port) {
+        java.net.Socket s = null;
+        try {
+            s = new java.net.Socket();
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", port), 400);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        } finally {
+            try { if (s != null) s.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /** 真探一次引擎端口（**必须在后台线程调用**：主线程做网络 IO 会被系统直接抛异常）。 */
+    private boolean conProbeEngineNow() {
+        boolean up = false;
+        try { up = healthOk(); } catch (Throwable ignored) {}
+        engineAliveCached = up;
+        engineProbeAt = System.currentTimeMillis();
+        return up;
+    }
+
+    /**
+     * 从引擎日志尾部把最新一条 token URL 捞回来。
+     * 适用：引擎已经在跑、但本次 App 进程没抓到那条启动输出（例：App 被杀后重开、
+     * 引擎此前已被拉起）。不捞的话 WebView 只能不带 token 加载 → 401 认证页。
+     */
+    private String conTokenFromLog() {
+        try {
+            File f = conLogFile();
+            if (!f.exists()) return null;
+            String tail = conTailOf(f, 300);
+            int at = tail.lastIndexOf("http://127.0.0.1");
+            if (at < 0) return null;
+            int tk = tail.indexOf("?token=", at);
+            if (tk < 0) return null;
+            int end = tk + 7;
+            while (end < tail.length() && !" \r\n\t".contains(String.valueOf(tail.charAt(end)))) end++;
+            return tail.substring(at, end);
+        } catch (Throwable t) { return null; }
+    }
+
+    private void showConsole() {
+        if (consoleLayer == null) buildConsoleLayer();
+        if (consoleLayer == null) { startEngine(); return; } // 兜底：控制台建不出来就走老路
+        consoleVisible = true;
+        consoleLayer.setVisibility(View.VISIBLE);
+        if (engineRoot != null) engineRoot.bringChildToFront(consoleLayer);
+        renderConsole();
+        startConsoleTick();
+        computeFilesSummaryAsync();
+    }
+
+    private void buildConsoleLayer() {
+        if (engineRoot == null) return;
+        ScrollView sc = new ScrollView(this);
+        sc.setBackgroundColor(cBg());
+        sc.setFillViewport(true);
+        LinearLayout col = new LinearLayout(this);
+        col.setOrientation(LinearLayout.VERTICAL);
+        col.setPadding(dp(18), dp(24), dp(18), dp(24));
+        sc.addView(col, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        consoleBody = col;
+        consoleLayer = sc;
+        engineRoot.addView(sc, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+    }
+
+    private void startConsoleTick() {
+        if (conTick == null) conTick = new Handler(Looper.getMainLooper());
+        conTick.removeCallbacks(consoleTick);
+        conTick.postDelayed(consoleTick, 900);
+    }
+
+    /** 控制台里显示一句状态：解压阶段进解压块，否则进引擎块。 */
+    private void conSay(String s) {
+        if (s == null) return;
+        if (extracting) { conExtractMsg = s; if (conExMeta != null) conExMeta.setText(s); }
+        else if (conEnMeta != null) conEnMeta.setText(s);
+    }
+
+    // ---------- 通用控件 ----------
+    private TextView cText(String s, float sp, int color, boolean bold) {
+        TextView t = new TextView(this);
+        t.setText(s);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
+        t.setTextColor(color);
+        if (bold) t.setTypeface(null, android.graphics.Typeface.BOLD);
+        return t;
+    }
+
+    /** 圆角形状（替代系统 Button/ProgressBar 自带背景，避免 ColorOS 上灰底、裁字、颜色不对）。 */
+    private android.graphics.drawable.GradientDrawable cShape(int fill, int stroke, int strokeW, int radius) {
+        android.graphics.drawable.GradientDrawable g = new android.graphics.drawable.GradientDrawable();
+        g.setShape(android.graphics.drawable.GradientDrawable.RECTANGLE);
+        g.setColor(fill);
+        g.setCornerRadius(dp(radius));
+        if (strokeW > 0) g.setStroke(dp(strokeW), stroke);
+        return g;
+    }
+
+    private int cTrack() { return Color.parseColor(isDark() ? "#141b2b" : "#eef1f6"); }
+
+    /** 自绘按钮：内边距固定、单行、超长省略号，不再出现“文字超出按钮”的情况。 */
+    private Button cButton(String label, boolean primary) {
+        Button b = new Button(this);
+        b.setAllCaps(false);
+        b.setText(label);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, primary ? 13.5f : 12.5f);
+        b.setSingleLine(true);
+        b.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        b.setMinWidth(dp(primary ? 96 : 68));
+        b.setMinimumWidth(dp(primary ? 96 : 68));
+        b.setPadding(dp(16), dp(9), dp(16), dp(9));
+        b.setIncludeFontPadding(false);
+        if (primary) {
+            b.setTextColor(Color.WHITE);
+            b.setBackground(cShape(cAccent(), cAccent(), 0, 8));
+        } else {
+            // 次按钮：强调色描边 + 强调色文字（之前用灰底，看着像“禁用”）
+            b.setTextColor(cAccent());
+            b.setBackground(cShape(isDark() ? 0x1A4D6BFE : 0x144D6BFE, cAccent(), 1, 8));
+        }
+        return b;
+    }
+
+    /** 统一“禁用”外观：自绘背景下系统不会自动变灰，必须手动降透明度。 */
+    private void cSetEnabled(Button b, boolean on) {
+        if (b == null) return;
+        b.setEnabled(on);
+        b.setAlpha(on ? 1f : 0.38f);
+    }
+
+    /** 进度条（自绘：轨道 + 强调色填充，风格与页面一致）。 */
+    private void conSetProgress(int pct) {
+        if (conFill == null || conSpacer == null) return;
+        int p = Math.max(0, Math.min(100, pct));
+        LinearLayout.LayoutParams f = (LinearLayout.LayoutParams) conFill.getLayoutParams();
+        LinearLayout.LayoutParams s = (LinearLayout.LayoutParams) conSpacer.getLayoutParams();
+        f.weight = Math.max(p, 0.01f);
+        s.weight = Math.max(100 - p, 0.01f);
+        conFill.setLayoutParams(f);
+        conSpacer.setLayoutParams(s);
+    }
+
+    /** 插件开关（自绘小胶囊，比系统 Switch 更可控且与页面同风格）。 */
+    private TextView cToggle(final String id, boolean on) {
+        final TextView t = new TextView(this);
+        t.setTag(Boolean.valueOf(on));
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        t.setPadding(dp(12), dp(6), dp(12), dp(6));
+        t.setSingleLine(true);
+        t.setGravity(Gravity.CENTER);
+        conTogglePaint(t);
+        t.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                boolean now = !((Boolean) t.getTag()).booleanValue();
+                t.setTag(Boolean.valueOf(now));
+                conTogglePaint(t);
+                conSetPluginDisabled(id, !now);
+                conToast("dsh-" + id + (now ? " 已启用" : " 已关闭") + "（重启引擎生效）");
+            }
+        });
+        return t;
+    }
+
+    private void conTogglePaint(TextView t) {
+        boolean on = ((Boolean) t.getTag()).booleanValue();
+        t.setText(on ? "已启用" : "已关闭");
+        t.setTextColor(on ? cGreen() : cSub());
+        t.setBackground(cShape(on ? (isDark() ? 0x241F9D6B : 0x1A1F9D6B) : 0x00000000,
+                on ? cGreen() : cLine(), 1, 12));
+    }
+
+    private LinearLayout.LayoutParams cTop(int topMargin) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.topMargin = topMargin;
+        return lp;
+    }
+
+    private View cSep(int topMargin) {
+        View v = new View(this);
+        v.setBackgroundColor(cLine());
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, Math.max(1, dp(1)));
+        lp.topMargin = topMargin;
+        v.setLayoutParams(lp);
+        return v;
+    }
+
+    private View cNavRow(String title, String sub, String value, final int page) {
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+        left.addView(cText(title, 14f, cText(), false));
+        if (sub != null && sub.length() > 0) left.addView(cText(sub, 11f, cSub(), false));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(15), 0, dp(15));
+        row.addView(left, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        if (value != null && value.length() > 0) row.addView(cText(value, 11f, cSub(), false));
+        row.addView(cText("›", 14f, cSub(), false));
+        row.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { consolePage = page; renderConsole(); }
+        });
+        return row;
+    }
+
+    private View conBackRow(String title) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        Button back = cButton("‹ 控制台", false);
+        back.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
+        back.setPadding(0, dp(4), dp(8), dp(4));
+        back.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { consolePage = 0; renderConsole(); }
+        });
+        row.addView(back);
+        row.addView(cText(title, 12.5f, cSub(), false));
+        return row;
+    }
+
+    private void conToast(final String s) {
+        ui.post(new Runnable() { @Override public void run() {
+            try { android.widget.Toast.makeText(MainActivity.this, s, android.widget.Toast.LENGTH_SHORT).show(); } catch (Throwable ignored) {}
+        }});
+    }
+
+    // ---------- 页面渲染 ----------
+    private void renderConsole() {
+        if (consoleBody == null) return;
+        consoleBody.removeAllViews();
+        if (consolePage == 1) { renderConsolePerm(); return; }
+        if (consolePage == 2) { renderConsolePlug(); return; }
+        if (consolePage == 3) { renderConsoleLog(); return; }
+        renderConsoleMain();
+    }
+
+    private void renderConsoleMain() {
+        LinearLayout col = consoleBody;
+        LinearLayout top = new LinearLayout(this);
+        top.setOrientation(LinearLayout.HORIZONTAL);
+        top.setGravity(Gravity.BOTTOM);
+        top.addView(cText("DEEPSEEK HARNESS", 10f, cSub(), false),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        top.addView(cText(conVersionLabel(), 10f, cSub(), false));
+        col.addView(top);
+
+        // ① 解压文件
+        col.addView(cSep(dp(16)));
+        conExState = cText("", 15f, cText(), false);
+        col.addView(conExState, cTop(dp(16)));
+        conExMeta = cText("", 11f, cSub(), false);
+        conExMeta.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                if (!conFilesReady()) return;
+                consoleDetailOpen = !consoleDetailOpen;
+                refreshConsole();
+            }
+        });
+        col.addView(conExMeta, cTop(dp(7)));
+        LinearLayout bar = new LinearLayout(this);
+        bar.setOrientation(LinearLayout.HORIZONTAL);
+        bar.setBackground(cShape(cTrack(), 0, 0, 2));
+        conFill = new View(this);
+        conFill.setBackgroundColor(cAccent());
+        conSpacer = new View(this);
+        bar.addView(conFill, new LinearLayout.LayoutParams(0, dp(4), 1f));
+        bar.addView(conSpacer, new LinearLayout.LayoutParams(0, dp(4), 0f));
+        bar.setVisibility(View.GONE);
+        conBar = bar;
+        col.addView(bar, cTop(dp(10)));
+        conDetailBox = conExtractDetail();
+        col.addView(conDetailBox);
+        conExBtn = cButton("解压文件", true);
+        conExBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conExtractClick(); }
+        });
+        col.addView(conExBtn, cTop(dp(12)));
+
+        // ② 启动引擎
+        col.addView(cSep(dp(18)));
+        conEnState = cText("", 15f, cText(), false);
+        col.addView(conEnState, cTop(dp(16)));
+        conEnMeta = cText("", 11f, cSub(), false);
+        col.addView(conEnMeta, cTop(dp(7)));
+        LinearLayout enActs = new LinearLayout(this);
+        enActs.setOrientation(LinearLayout.HORIZONTAL);
+        conEnBtn = cButton("启动引擎", true);
+        conEnBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conEngineClick(); }
+        });
+        enActs.addView(conEnBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        conEnRestart = cButton("重启", false);
+        conEnRestart.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conRestartEngine(); }
+        });
+        LinearLayout.LayoutParams rlp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        rlp.leftMargin = dp(8);
+        enActs.addView(conEnRestart, rlp);
+        conEnStop = cButton("停止", false);
+        conEnStop.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conStopEngine(); }
+        });
+        LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        slp.leftMargin = dp(8);
+        enActs.addView(conEnStop, slp);
+        col.addView(enActs, cTop(dp(12)));
+
+        // ③ 三个入口
+        col.addView(cSep(dp(20)));
+        col.addView(cNavRow("授予权限", "存储 · 通知 · 悬浮窗 · 电池 · root · Shizuku · 无障碍", conPermSummary(), 1));
+        col.addView(cSep(0));
+        col.addView(cNavRow("插件", "关掉用不到的，省上下文", conPlugSummary(), 2));
+        col.addView(cSep(0));
+        LinearLayout logActs = new LinearLayout(this);
+        logActs.setOrientation(LinearLayout.HORIZONTAL);
+        Button lv = cButton("查看", false);
+        lv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        lv.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conViewLog(); }
+        });
+        Button le = cButton("分享", false);
+        le.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        le.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conShareLog(); }
+        });
+        logActs.addView(lv);
+        logActs.addView(le);
+        LinearLayout logLeft = new LinearLayout(this);
+        logLeft.setOrientation(LinearLayout.VERTICAL);
+        logLeft.addView(cText("日志", 14f, cText(), false));
+        logLeft.addView(cText(conLogSummary(), 11f, cSub(), false));
+        LinearLayout logRow = new LinearLayout(this);
+        logRow.setOrientation(LinearLayout.HORIZONTAL);
+        logRow.setGravity(Gravity.CENTER_VERTICAL);
+        logRow.setPadding(0, dp(12), 0, dp(12));
+        logRow.addView(logLeft, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        logRow.addView(logActs);
+        col.addView(logRow);
+        col.addView(cSep(0));
+
+        conFoot = cText("就绪", 11f, cSub(), false);
+        col.addView(conFoot, cTop(dp(14)));
+        col.addView(cText("换内核版本 / 覆盖安装后需要重新解压；平时只用到「启动引擎」。", 11f, cSub(), false), cTop(dp(6)));
+        // 检查更新（v1.12：不再启动时自动检查，改这里手动触发）
+        LinearLayout upd = new LinearLayout(this);
+        upd.setOrientation(LinearLayout.HORIZONTAL);
+        upd.setGravity(Gravity.CENTER_VERTICAL);
+        TextView updLink = cText("检查更新", 12f, cSub(), false);
+        updLink.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conToast("正在检查…"); checkForUpdate(true); }
+        });
+        upd.addView(updLink, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        upd.addView(cText("当前 " + conVersionLabel(), 11f, cSub(), false));
+        col.addView(upd, cTop(dp(16)));
+        refreshConsole();
+    }
+
+    /** 与控制台同一套视觉的弹窗（平色底、同字体、同按钮样式，跟随系统深浅色）。 */
+    private void conDialog(String title, String body, String positive, final Runnable onPositive, String negative) {
+        TextView t = null;
+        if (body != null && body.length() > 0) t = cText(body, 12.5f, cSub(), false);
+        conDialogView(title, t, positive, onPositive, negative);
+    }
+
+    /** 同风格弹窗的通用版：内容自定（例如带滚动的日志正文）。 */
+    private void conDialogView(String title, View content, String positive, final Runnable onPositive, String negative) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        // v1.13：卡片自己画圆角背景（原来用直角色块，系统对话框面板的圆角/描边会露在外面，
+        // 看上去就是“弹窗外面还套了一层小白边/小黑边”）。
+        box.setBackground(cShape(cBg(), 0, 0, 16));
+        box.setPadding(dp(22), dp(22), dp(22), dp(14));
+        if (title != null && title.length() > 0) box.addView(cText(title, 16f, cText(), true));
+        if (content != null) box.addView(content, cTop(dp(12)));
+
+        final AlertDialog dlg = new AlertDialog.Builder(this).create();
+        LinearLayout acts = new LinearLayout(this);
+        acts.setOrientation(LinearLayout.HORIZONTAL);
+        acts.setGravity(Gravity.RIGHT);
+        if (negative != null) {
+            Button nb = cButton(negative, false);
+            nb.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) { dlg.dismiss(); }
+            });
+            acts.addView(nb);
+        }
+        if (positive != null) {
+            Button pb = cButton(positive, true);
+            pb.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    dlg.dismiss();
+                    if (onPositive != null) onPositive.run();
+                }
+            });
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.leftMargin = dp(8);
+            acts.addView(pb, lp);
+        }
+        box.addView(acts, cTop(dp(18)));
+
+        dlg.setView(box);
+        dlg.show();
+        try {
+            if (dlg.getWindow() != null) {
+                // 关键：窗口背景**全透明**，让卡片自己的圆角成为唯一轮廓；
+                // 再清掉系统对话框默认的内边距/最小宽度，否则那层“外框”又回来了。
+                dlg.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+                android.view.View decor = dlg.getWindow().getDecorView();
+                if (decor instanceof android.view.ViewGroup) {
+                    ((android.view.ViewGroup) decor).setPadding(0, 0, 0, 0);
+                }
+                dlg.getWindow().setLayout(
+                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            }
+        } catch (Throwable ignored) {}
+        // 外层留出与屏幕边缘的呼吸距离（真正的对话框边距，不是面板边框）
+        try {
+            android.view.ViewGroup.LayoutParams lp = box.getLayoutParams();
+            if (lp instanceof LinearLayout.LayoutParams) {
+                ((LinearLayout.LayoutParams) lp).setMargins(dp(20), 0, dp(20), 0);
+                box.setLayoutParams(lp);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    private View conExtractDetail() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setVisibility(View.GONE);
+        box.addView(cText("布局标记 hoisted-1 · 插件与补丁面已验证", 11f, cSub(), false), cTop(dp(8)));
+        LinearLayout acts = new LinearLayout(this);
+        acts.setOrientation(LinearLayout.HORIZONTAL);
+        Button re = cButton("重新解压", false);
+        re.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conReExtract(); }
+        });
+        Button vf = cButton("校验", false);
+        vf.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conVerifyFiles(); }
+        });
+        acts.addView(re);
+        acts.addView(vf);
+        box.addView(acts, cTop(dp(10)));
+        return box;
+    }
+
+    private void refreshConsole() {
+        if (!consoleVisible || consoleBody == null || consolePage != 0) return;
+        boolean ready = conFilesReady();
+        if (conExState != null) conExState.setText(extracting ? "正在解压…" : (ready ? "已解压" : "未解压"));
+        if (conExMeta != null) conExMeta.setText(conExtractMetaText(ready));
+        if (conDetailBox != null) conDetailBox.setVisibility(ready && consoleDetailOpen ? View.VISIBLE : View.GONE);
+        if (conBar != null) conBar.setVisibility(extracting ? View.VISIBLE : View.GONE);
+        if (!extracting) conSetProgress(ready ? 100 : 0);
+        if (conExBtn != null) {
+            conExBtn.setText(extracting ? "解压中…" : (ready ? "重新解压" : "解压文件"));
+            cSetEnabled(conExBtn, !extracting && !starting);
+        }
+        boolean run = conEngineRunning();          // 真就绪（端口探测通过）
+        boolean booting = conEngineBooting();      // 已拉起、还在监听前的空窗期
+        if (run && engineStartTs == 0L) engineStartTs = System.currentTimeMillis();
+        // v1.13：只在“真就绪”时结束启动中；并且启动中不得点亮入口。
+        // （反面教训：把“node 进程活着”当就绪 → 按钮提前亮、点进去 3080 未监听 → “点了没反应”）
+        if (run) starting = false;
+        else if (starting && engineStartTs > 0
+                && System.currentTimeMillis() - engineStartTs > 150000L) starting = false;   // 超时兜底
+        boolean busy = !run && (booting || starting);
+        if (conEnState != null) conEnState.setText(run ? "引擎运行中" : (busy ? "启动中…" : "未启动"));
+        if (conEnMeta != null) conEnMeta.setText(conEngineMetaText(run, ready, busy));
+        if (conEnBtn != null) {
+            conEnBtn.setText(run ? "打开主界面" : (busy ? "启动中…" : "启动引擎"));
+            cSetEnabled(conEnBtn, !busy && (run || ready));
+        }
+        cSetEnabled(conEnRestart, run || busy);
+        cSetEnabled(conEnStop, run || busy);
+        if (conFoot != null) conFoot.setText(run ? "本地服务已就绪" : (busy ? "正在启动引擎…" : "就绪"));
+    }
+
+    private String conExtractMetaText(boolean ready) {
+        if (extracting) return conExtractMsg != null ? conExtractMsg : "正在解压运行时与内核树…";
+        if (ready) {
+            String s = conFilesSummary != null ? conFilesSummary : "运行环境与内核树已就绪";
+            return s + (consoleDetailOpen ? "" : " · 点这一行看详情");
+        }
+        return "需要解压运行环境与内核（约 2.5 万个文件 / 约 220 MB）；解压完成后才能启动引擎。";
+    }
+
+    private String conEngineMetaText(boolean run, boolean ready, boolean busy) {
+        if (run) {
+            long mins = engineStartTs > 0 ? Math.max(0, (System.currentTimeMillis() - engineStartTs) / 60000) : 0;
+            return "端口 " + enginePort + " · 已运行 " + mins + " 分 · 通知 " + notifyPort();
+        }
+        // v1.13：启动中显示统一的倒计时文案（真机 node 预熟要 17~25 秒，必须给用户一个“在动”的反馈）
+        if (busy) {
+            long sec = engineStartTs > 0 ? Math.max(0, (System.currentTimeMillis() - engineStartTs) / 1000) : 0;
+            return "端口 " + enginePort + " · 启动中… 已等待 " + sec + " 秒";
+        }
+        // v1.13：原来无论文件是否已解压都写“解压完成后可启动”，已解压时这句误导人。
+        return (ready ? "点「启动引擎」开始 · 端口 " : "解压完成后可启动 · 端口 ") + enginePort;
+    }
+
+    // ---------- 动作：解压 / 启动 ----------
+    private void conExtractClick() {
+        if (extracting || starting) return;
+        if (conFilesReady()) { conReExtract(); return; }
+        conStartExtract();
+    }
+
+    private void conStartExtract() {
+        if (extracting) return;
+        if (!conFilesReady()) {
+            // 本次安装还没解压过（升级安装最常见）：清掉旧标记 → 走一次**完整内部解压**
+            // （runtime/node/so/dshhome/rish 全部重写），避免“拿着上一版的树”看着像已解压。
+            try { new File(payloadDir(), ".extracted").delete(); } catch (Throwable ignored) {}
+        }
+        extracting = true;
+        conExtractMsg = null;
+        extractOnlyMode = true;
+        filesPreparedThisBoot = false;
+        refreshConsole();
+        startEngine();   // 复用同一条链路；extractOnlyMode 会在文件准备完后提前返回
+    }
+
+    private void conReExtract() {
+        if (extracting || starting) { conToast("正在忙，稍后"); return; }
+        filesPreparedThisBoot = false;
+        extracting = true;
+        conExtractMsg = null;
+        extractOnlyMode = true;
+        refreshConsole();
+        new Thread(new Runnable() { @Override public void run() {
+            try { new File(payloadDir(), ".extracted").delete(); } catch (Throwable ignored) {}
+            try { new File(payloadDir(), "dshroot/.complete").delete(); } catch (Throwable ignored) {}
+            ui.post(new Runnable() { @Override public void run() { extracting = false; conStartExtract(); } });
+        }}, "extract-reset").start();
+    }
+
+    private void conEngineClick() {
+        if (starting) return;
+        // v1.13：判定“引擎是否已在跑”必须先真正探一次端口，而探测**只能在后台线程做**
+        // （主线程做网络 IO → NetworkOnMainThreadException 被吞 → 误判未启动 → 又拉起第二个 node）。
+        new Thread(new Runnable() {
+            @Override public void run() {
+                final boolean running = conProbeEngineNow();
+                ui.post(new Runnable() { @Override public void run() { conEngineClickAfterProbe(running); } });
+            }
+        }, "engine-click-probe").start();
+    }
+
+    private void conEngineClickAfterProbe(boolean running) {
+        if (starting) return;
+        if (running) {
+            engineStartAborted = false;
+            engineStoppedByUser = false;
+            enterMainUi();
+            return;
+        }
+        if (!conFilesReady()) { conToast("先解压文件"); return; }
+        extracting = false;
+        extractOnlyMode = false;
+        starting = true;
+        engineStartTs = System.currentTimeMillis();
+        refreshConsole();
+        startEngine();   // 文件已就绪 → 只起引擎
+    }
+
+    private void conRestartEngine() {
+        if (starting) return;
+        conToast("正在重启引擎…");
+        new Thread(new Runnable() { @Override public void run() {
+            try {
+                if (nodeProcess != null && nodeProcess.isAlive()) nodeProcess.destroy();
+                Thread.sleep(1500);
+            } catch (Throwable ignored) {}
+            ui.post(new Runnable() { @Override public void run() { conEngineClick(); } });
+        }}, "engine-restart").start();
+    }
+
+    private void conStopEngine() {
+        // v1.13：旧实现只 destroy 进程，两个后果 —— ① 在飞的 waitForServer 仍每秒刷“已等待 N 秒”（界面一直计时）；
+        // ② 看门狗 5 秒后看到 nodeProcess 非空却已死 → 又把引擎拉起来（用户看到的“停不掉”）。
+        engineStoppedByUser = true;
+        engineStartAborted = true;
+        try { if (nodeProcess != null && nodeProcess.isAlive()) nodeProcess.destroy(); } catch (Throwable ignored) {}
+        nodeProcess = null;
+        starting = false;
+        engineStartTs = 0L;
+        setStatus("引擎已停止");
+        refreshConsole();
+        conToast("引擎已停止");
+    }
+
+    private void enterMainUi() {
+        consoleVisible = false;
+        if (consoleLayer != null) consoleLayer.setVisibility(View.GONE);
+        if (conTick != null) conTick.removeCallbacks(consoleTick);
+        // 没有 token 时先从日志里捞回来（否则 WebView 只能 401 认证页 → 白屏）
+        if (engineTokenUrl == null) {
+            String u = conTokenFromLog();
+            if (u != null) engineTokenUrl = u;
+        }
+        loadHome();
+    }
+
+    private void conExtractDone() {
+        extracting = false;
+        consoleDetailOpen = false;
+        computeFilesSummaryAsync();
+        refreshConsole();
+        conToast("解压完成，可以启动引擎了");
+    }
+
+    private void conExtractFailed(String msg) {
+        extracting = false;
+        refreshConsole();
+        conToast("解压失败：" + msg);
+    }
+
+    private void conEngineFailed(String msg) {
+        starting = false;
+        refreshConsole();
+        conToast("引擎启动失败：" + msg);
+    }
+
+    /** 只负责起引擎（文件已就绪）：健康探测 → spawnNode → 等就绪。v1.12 从 startEngine 拆出。 */
+    private void launchEngine(File payload) {
+        if (healthOk()) {
+            starting = false;
+            engineAliveCached = true;                        // v1.13：写回缓存 → 控制台立刻显示“引擎运行中”
+            engineProbeAt = System.currentTimeMillis();
+            if (engineStartTs == 0L) engineStartTs = System.currentTimeMillis();
+            ui.post(new Runnable() { @Override public void run() { refreshConsole(); } });
+            if (!consoleVisible) loadHome();
+            return;
+        }
+        showIndeterminate("正在启动 DeepSeek Harness…");
+        starting = true;
+        if (engineStartTs == 0L) engineStartTs = System.currentTimeMillis();
+        // v1.13：已有一个 node 进程在跑（可能只是还没开始监听端口）→ **绝不再 spawn 第二个**。
+        // 旧实现只看 healthOk()：node 启动中的那几秒会被误判为“没在跑”→ 重复 spawn。
+        // 真机日志实证：同一时刻两个 node 抢 3080，第二次流程的 notify 端口 3081 直接 EADDRINUSE。
+        Process alive = nodeProcess;
+        if (alive != null && alive.isAlive()) {
+            Log.w(TAG, "engine process already alive, wait instead of respawning");
+            waitForServer();
+            starting = false;
+            ui.post(new Runnable() { @Override public void run() { refreshConsole(); } });
+            return;
+        }
+        // v1.13 第二道防线：句柄丢了（App 重启/被系统回收）也不凭 healthOk() 就重建 ——
+        // node 启动中虽然不响应 HTTP，但**端口已经 listen**；只要端口被占就不该再拉一个。
+        // （引擎日志里 EADDRINUSE 高达 72 次 vs 成功启动 38 次，重复拉起是最高频的浪费。）
+        if (portListening(enginePort)) {
+            Log.w(TAG, "port " + enginePort + " already listening, wait instead of respawning");
+            waitForServer();
+            starting = false;
+            ui.post(new Runnable() { @Override public void run() { refreshConsole(); } });
+            return;
+        }
+        try {
+            spawnNode(payload);
+        } catch (Throwable t) {
+            starting = false;
+            Log.e(TAG, "spawnNode failed", t);
+            final String msg = String.valueOf(t.getMessage());
+            setStatus("引擎启动失败：" + msg);
+            writeStartupDiag(msg);
+            ui.post(new Runnable() { @Override public void run() { conEngineFailed(msg); } });
+            return;
+        }
+        waitForServer();
+        starting = false;
+        ui.post(new Runnable() { @Override public void run() { refreshConsole(); } });
+    }
+
+    // ---------- 文件摘要 / 校验 ----------
+    private void computeFilesSummaryAsync() {
+        if (!conFilesReady()) { conFilesSummary = null; return; }
+        new Thread(new Runnable() { @Override public void run() {
+            final String s = conComputeFilesSummary();
+            ui.post(new Runnable() { @Override public void run() { conFilesSummary = s; refreshConsole(); } });
+        }}, "files-summary").start();
+    }
+
+    private String conComputeFilesSummary() {
+        try {
+            java.util.ArrayDeque<File> q = new java.util.ArrayDeque<File>();
+            q.add(new File(payloadDir(), "dshroot"));
+            long n = 0;
+            long bytes = 0;
+            while (!q.isEmpty()) {
+                File f = q.poll();
+                File[] cs = f.listFiles();
+                if (cs == null) continue;
+                for (int i = 0; i < cs.length; i++) {
+                    if (cs[i].isDirectory()) q.add(cs[i]);
+                    else { n++; bytes += cs[i].length(); }
+                }
+            }
+            return String.format(java.util.Locale.US, "%,d 个文件 · %d MB", Long.valueOf(n), Long.valueOf(bytes / 1048576L));
+        } catch (Throwable t) { return null; }
+    }
+
+    private void conVerifyFiles() {
+        conToast("校验中…");
+        new Thread(new Runnable() { @Override public void run() {
+            final String miss = conMissingKey();
+            int done = 0;
+            try { done = getSharedPreferences("dsh_prefs", MODE_PRIVATE).getInt("payload_build_code", 0); } catch (Throwable ignored) {}
+            final int fdone = done;
+            final int cur = conBuildCode();
+            final String s = conComputeFilesSummary();
+            ui.post(new Runnable() { @Override public void run() {
+                if (miss != null) conToast("校验失败：缺 " + miss + "，请点「重新解压」");
+                else if (fdone != cur) conToast("校验失败：内部文件是旧版本解压的（记录 " + fdone + " / 当前 " + cur + "），请重新解压");
+                else conToast("校验通过，" + (s == null ? "文件齐全" : s) + " · 已对应当前安装版本");
+            }});
+        }}, "files-verify").start();
+    }
+
+    // ---------- 权限页 ----------
+    private String conPermSummary() {
+        String[] ids = {"storage", "notify", "overlay", "battery", "root", "shizuku", "a11y", "install"};
+        int ok = 0;
+        for (int i = 0; i < ids.length; i++) if (conPermOk(ids[i])) ok++;
+        return "已授权 " + ok + " / " + ids.length;
+    }
+
+    private boolean conPermOk(String id) {
+        try {
+            if ("storage".equals(id)) {
+                if (Build.VERSION.SDK_INT >= 30) return Environment.isExternalStorageManager();
+                return checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") == PackageManager.PERMISSION_GRANTED;
+            }
+            if ("notify".equals(id)) {
+                android.app.NotificationManager nm = (android.app.NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                return nm != null && nm.areNotificationsEnabled();
+            }
+            if ("overlay".equals(id)) return Settings.canDrawOverlays(this);
+            if ("battery".equals(id)) {
+                PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                return pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
+            }
+            if ("root".equals(id)) return conRootOk;
+            if ("shizuku".equals(id)) return shizukuOk != null && shizukuOk.booleanValue();
+            if ("a11y".equals(id)) return conA11yEnabled();
+            if ("install".equals(id)) return Build.VERSION.SDK_INT < 26 || getPackageManager().canRequestPackageInstalls();
+        } catch (Throwable t) { return false; }
+        return false;
+    }
+
+    private boolean conA11yEnabled() {
+        try {
+            String s = Settings.Secure.getString(getContentResolver(), Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES);
+            if (s == null) return false;
+            return s.toLowerCase().contains(getPackageName().toLowerCase());
+        } catch (Throwable t) { return false; }
+    }
+
+    private void conRefreshRootAsync() {
+        if (System.currentTimeMillis() - conRootProbeTs < 5000) return;
+        conRootProbeTs = System.currentTimeMillis();
+        new Thread(new Runnable() { @Override public void run() {
+            boolean ok = false;
+            try { ok = rootAvailable(); } catch (Throwable ignored) {}
+            conRootOk = ok;
+            ui.post(new Runnable() { @Override public void run() { refreshConsole(); } });
+        }}, "root-probe").start();
+    }
+
+    private void renderConsolePerm() {
+        LinearLayout col = consoleBody;
+        col.addView(conBackRow("授予权限"));
+        col.addView(cSep(dp(12)));
+        addPermRow(col, "所有文件访问", "读写 /sdcard，AI 才能碰你的文件", "storage");
+        addPermRow(col, "通知", "AI 发通知、定时任务提醒", "notify");
+        addPermRow(col, "悬浮窗", "黑鲸鱼悬浮窗 / 虚拟屏预览", "overlay");
+        addPermRow(col, "电池优化", "设为「不限制」，否则切后台引擎会被杀", "battery");
+        addPermRow(col, "root（超级用户）", "替代 Shizuku 跑特权命令：装应用 / 改设置 / 虚拟屏点击 / 任意 shell", "root");
+        addPermRow(col, "Shizuku（免 root 特权通道）", "有 root 时用 root；没 root 时装 Shizuku 走同一套能力", "shizuku");
+        addPermRow(col, "无障碍服务（读屏 / 点屏）", "android_screen / tap / type / see（不需要 root 或 Shizuku）", "a11y");
+        addPermRow(col, "安装未知应用", "android_package 装 APK 用", "install");
+        col.addView(cText("root / Shizuku 二选一即可（root 优先）。root 只能由你在 root 管理器（Magisk / KernelSU）里授予本应用；设备没 root 时这一项显示「本机无 root」。",
+                11f, cSub(), false), cTop(dp(14)));
+        conRefreshRootAsync();
+    }
+
+    private void addPermRow(LinearLayout col, String title, String desc, final String id) {
+        boolean ok = conPermOk(id);
+        boolean noRoot = "root".equals(id) && !conRootOk;
+        String state = ok ? "已授权" : (noRoot ? "本机无 root" : "未授权");
+        int color = ok ? cGreen() : (noRoot ? cSub() : cRed());
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+        left.addView(cText(title, 13.5f, cText(), false));
+        left.addView(cText(desc, 11f, cSub(), false));
+        Button act = cButton(ok ? "管理" : "去授权", false);
+        act.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        if (noRoot) cSetEnabled(act, false);
+        act.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conPermAction(id); }
+        });
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(13), 0, dp(13));
+        row.addView(left, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        row.addView(cText(state, 11f, color, false));
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        alp.leftMargin = dp(8);
+        row.addView(act, alp);
+        col.addView(row);
+        col.addView(cSep(0));
+    }
+
+    private void conPermAction(String id) {
+        try {
+            if ("storage".equals(id)) {
+                if (Build.VERSION.SDK_INT >= 30) {
+                    Intent i = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                    i.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(i);
+                } else {
+                    requestPermissions(new String[]{"android.permission.WRITE_EXTERNAL_STORAGE"}, REQ_STORAGE);
+                }
+                return;
+            }
+            if ("notify".equals(id)) {
+                Intent i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+                i.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+                startActivity(i);
+                return;
+            }
+            if ("overlay".equals(id)) {
+                startActivity(new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:" + getPackageName())));
+                return;
+            }
+            if ("battery".equals(id)) {
+                startActivity(new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:" + getPackageName())));
+                return;
+            }
+            if ("root".equals(id)) {
+                conToast("请在 root 管理器（Magisk / KernelSU）里给本应用授予 root");
+                return;
+            }
+            if ("shizuku".equals(id)) {
+                // v1.13.3：这里原来只调 probeShizuku()（纯探测）——用户点「管理」永远不会弹授权框。
+                // 真机实测：引擎里 AI 调 shizuku_status / shizuku_shell（内部走 rish 广播）能弹出 Shizuku 授权框，
+                // 控制台却不弹；差别就在“有没有发出真实请求”。改走统一入口：
+                // 实时探测 → 未授权就 requestPermission + 两条真实触发（binder / rish）→ 仍未授权给手动引导。
+                showShizukuDialog();
+                return;
+            }
+            if ("a11y".equals(id)) {
+                startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS));
+                return;
+            }
+            if ("install".equals(id)) {
+                if (Build.VERSION.SDK_INT >= 26) {
+                    startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName())));
+                } else {
+                    conToast("本机系统无需单独授权");
+                }
+                return;
+            }
+        } catch (Throwable t) {
+            conToast("打不开系统页：" + t.getMessage());
+        }
+    }
+
+    // ---------- 插件页 ----------
+    private static final String[][] CON_PLUGINS = {
+        {"tool-vscreen", "虚拟屏：建屏 / 看图 / 点击 · 8 个工具"},
+        {"tool-accessibility", "无障碍读屏 / 手势 / 截图理解"},
+        {"tool-android", "用量统计 / 悬浮窗 / 剪贴板 / 定时任务"},
+        {"tool-shizuku", "特权 shell（root 或 Shizuku 任一）"},
+        {"llm-pi-ai", "第三方供应商适配（关掉则「添加提供方」不可用）"},
+        {"session-telemetry-otel", "遥测上报 · Android 上不需要"},
+        {"session-log-download", "会话日志导出按钮（右上角）"},
+        {"pwsh-sandbox", "PowerShell 沙箱 · Android 无 pwsh"},
+        {"bash-sandbox", "bash 沙箱（本项目用 bash-local 替代）"},
+        {"sandbox", "沙箱服务"},
+    };
+
+    private String conPlugSummary() {
+        int on = 0;
+        for (int i = 0; i < CON_PLUGINS.length; i++) if (!conPluginDisabled(CON_PLUGINS[i][0])) on++;
+        return "已启用 " + on + " / " + CON_PLUGINS.length;
+    }
+
+    private String conPatchPath() { return new File(payloadDir(), "dshhome/cordis.patch.yml").getAbsolutePath(); }
+
+    // ---------- cordis.patch.yml 读写（v1.13 重写） ----------
+    // 文件结构：顶层是**平铺的 patch 条目数组** —— 要么 `- id: <行id>` + `disabled: true` / `config:`
+    // （作用在别层已注册的行上），要么 `- insert:` 桶（桶内 `    - id: <行id>` + `      name:` 注册新行）。
+    // 两条硬规则：① patch 按列表顺序生效 —— insert 桶里的行必须先被注册，之后的行才能按 id 命中该行；
+    // ② 开关只能**原地**改写条目本身那一行 —— 删掉 `- id:` 行会留下悬空 `name:`（YAML 重复键 → 引擎启动即崩）。
+
+    /** 行首缩进宽度（空格/Tab 各计 1，够用）。 */
+    private static int conIndentOf(String line) {
+        int n = 0;
+        while (n < line.length() && (line.charAt(n) == ' ' || line.charAt(n) == '\t')) n++;
+        return n;
+    }
+
+    private static boolean conBlankOrComment(String trimmed) {
+        return trimmed.length() == 0 || trimmed.startsWith("#");
+    }
+
+    private static String conSpaces(int n) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < n; i++) sb.append(' ');
+        return sb.toString();
+    }
+
+    /** 拆行（去行尾 CR，保留空行）。 */
+    private static java.util.List<String> conSplitLines(String txt) {
+        String[] raw = txt.split("\n");
+        java.util.List<String> out = new java.util.ArrayList<String>();
+        for (int i = 0; i < raw.length; i++) {
+            String l = raw[i];
+            if (l.endsWith("\r")) l = l.substring(0, l.length() - 1);
+            out.add(l);
+        }
+        return out;
+    }
+
+    private static String conJoinLines(java.util.List<String> lines, String nl) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < lines.size(); i++) { sb.append(lines.get(i)); sb.append(nl); }
+        return sb.toString();
+    }
+
+    /** 该行若是 `- id: xxx` 则返回 xxx，否则 null。 */
+    private static String conRowIdOf(String trimmed) {
+        if (!trimmed.startsWith("- id:")) return null;
+        String id = trimmed.substring(5).trim();
+        return id.length() == 0 ? null : id;
+    }
+
+    private int conFindRow(java.util.List<String> lines, String id) {
+        for (int i = 0; i < lines.size(); i++) {
+            String rid = conRowIdOf(lines.get(i).trim());
+            if (rid != null && rid.equals(id)) return i;
+        }
+        return -1;
+    }
+
+    /** 条目块末行下标（含）：往下直到同级/更浅缩进的非空白行。 */
+    private int conRowEnd(java.util.List<String> lines, int idIdx) {
+        int base = conIndentOf(lines.get(idIdx));
+        int end = idIdx;
+        for (int j = idIdx + 1; j < lines.size(); j++) {
+            String t = lines.get(j).trim();
+            if (t.length() == 0) break;              // 空行即条目结束
+            if (t.startsWith("#")) continue;         // 注释归下一条目
+            if (conIndentOf(lines.get(j)) <= base) break;
+            end = j;
+        }
+        return end;
+    }
+
+    /** 该行是否位于 `- insert:` 桶内（桶内行只能原地开关；顶层条目作用于别层注册的行）。 */
+    private boolean conInsideInsert(java.util.List<String> lines, int idIdx) {
+        int base = conIndentOf(lines.get(idIdx));
+        for (int j = idIdx - 1; j >= 0; j--) {
+            String t = lines.get(j).trim();
+            if (conBlankOrComment(t)) continue;
+            if (conIndentOf(lines.get(j)) < base) return t.startsWith("- insert:");
+        }
+        return false;
+    }
+
+    /** 条目内原地增/删/改 `disabled:` 行（绝不搬动条目本身）。 */
+    private void conSetRowDisabled(java.util.List<String> lines, int idIdx, boolean disabled) {
+        int end = conRowEnd(lines, idIdx);
+        int at = -1;
+        for (int j = idIdx + 1; j <= end; j++) {
+            if (lines.get(j).trim().startsWith("disabled:")) { at = j; break; }
+        }
+        if (disabled) {
+            String ind = conSpaces(conIndentOf(lines.get(idIdx)) + 2);
+            if (at >= 0) lines.set(at, ind + "disabled: true");
+            else lines.add(idIdx + 1, ind + "disabled: true");
+        } else if (at >= 0) {
+            lines.remove(at);
+        }
+    }
+
+    /** 顶层 patch 条目（id 由别层注册，如 sandbox）：禁用=确保该条目存在且 disabled: true；
+     *  启用=删掉 disabled 行，条目再无其它键时连 `- id:` 行一起删；新增一律**追加到文件末尾**
+     *  （patch 按顺序生效，插入行必须先被注册）。 */
+    private void conSetTopEntryDisabled(java.util.List<String> lines, String id, boolean disabled) {
+        int at = conFindRow(lines, id);
+        if (at < 0) {
+            if (!disabled) return;
+            lines.add("- id: " + id);
+            lines.add("  disabled: true");
+            return;
+        }
+        if (disabled) { conSetRowDisabled(lines, at, true); return; }
+        int end = conRowEnd(lines, at);
+        boolean hasOther = false;
+        for (int j = at + 1; j <= end; j++) {
+            String t = lines.get(j).trim();
+            if (conBlankOrComment(t) || t.startsWith("disabled:")) continue;
+            hasOther = true;
+            break;
+        }
+        if (hasOther) { conSetRowDisabled(lines, at, false); return; }
+        for (int j = end; j > at; j--) lines.remove(j);
+        lines.remove(at);
+    }
+
+    /** 结构性自愈（返回是否有改动）：修复控制台旧实现写坏的 cordis.patch.yml。
+     *  旧实现关插件时把 `- id: xxx` 整行删掉、再把条目搬到文件顶部，后果两连：
+     *   ① 原地留下悬空 `name:` → YAML “duplicated mapping key” → 引擎**启动即崩**、App 反复重拉（界面一直闪）；
+     *   ② 搬上去的条目落在 `- insert:` 之前 → 插入行还没注册 → 就算 YAML 合法也不生效。
+     *  自愈动作：按包名补回被删的 `- id:` 行；把“只有 disabled 的顶层条目”折叠回它对应的 insert 行内。 */
+    /** 从 `name: '@deepseek-ai/dsh-tool-vscreen'` 反推行 id（补回被删的 `- id:` 行用）。 */
+    private static String conIdFromName(String raw) {
+        String n = raw;
+        if (n.length() > 1 && ((n.charAt(0) == '\'' && n.endsWith("'"))
+                || (n.charAt(0) == '"' && n.endsWith("\"")))) {
+            n = n.substring(1, n.length() - 1);
+        }
+        if (n.startsWith("@deepseek-ai/dsh-")) n = n.substring("@deepseek-ai/dsh-".length());
+        else { int k = n.lastIndexOf('/'); if (k >= 0) n = n.substring(k + 1); }
+        return n.length() == 0 ? null : n;
+    }
+
+    private boolean conNormalizePatchLines(java.util.List<String> lines) {
+        boolean changed = false;
+        // ① 悬空 name 行 → 补回 `- id:`。判据：一个条目里只允许一个 `name:` 键，
+        //   同一个条目里再碰到第二个 name（前面不是 `- id:`）就说明它的 id 行被删了。
+        int curRow = -1;            // 当前条目的 `- id:` 缩进；-1 = 不在条目内
+        boolean sawName = false;
+        for (int i = 0; i < lines.size(); i++) {
+            String t = lines.get(i).trim();
+            if (t.length() == 0) { curRow = -1; sawName = false; continue; }   // 空行结束条目
+            if (t.startsWith("#")) continue;
+            int ind = conIndentOf(lines.get(i));
+            if (conRowIdOf(t) != null) { curRow = ind; sawName = false; continue; }
+            if (!t.startsWith("name:")) continue;
+            if (curRow >= 0 && ind > curRow && !sawName) { sawName = true; continue; }   // 正常键
+            String id = conIdFromName(t.substring(5).trim());
+            if (id == null) continue;
+            int at = (curRow >= 0 && ind > curRow) ? curRow : (ind > 2 ? ind - 2 : 0);
+            lines.add(i, conSpaces(at) + "- id: " + id);
+            curRow = at;
+            sawName = false;    // 下一轮处理原 name 行时把它计作新条目的 name
+            changed = true;
+            i++;
+        }
+        // ② 顶层“只有 disabled”的条目若对应文件内某个 insert 行 → 折叠进行内
+        for (int i = 0; i < lines.size(); i++) {
+            String rid = conRowIdOf(lines.get(i).trim());
+            if (rid == null || conIndentOf(lines.get(i)) != 0) continue;
+            int end = conRowEnd(lines, i);
+            boolean hasDisabled = false, hasOther = false;
+            for (int j = i + 1; j <= end; j++) {
+                String tt = lines.get(j).trim();
+                if (conBlankOrComment(tt)) continue;
+                if (tt.startsWith("disabled:")) { hasDisabled = true; continue; }
+                hasOther = true;
+                break;
+            }
+            if (!hasDisabled || hasOther) continue;
+            int row = -1;
+            for (int j = 0; j < lines.size(); j++) {
+                String jid = conRowIdOf(lines.get(j).trim());
+                if (jid != null && jid.equals(rid) && j != i && conInsideInsert(lines, j)) { row = j; break; }
+            }
+            if (row < 0) continue;
+            conSetRowDisabled(lines, row, true);
+            for (int j = end; j > i; j--) lines.remove(j);
+            lines.remove(i);
+            changed = true;
+            i--;
+        }
+        return changed;
+    }
+
+    /** 起引擎前调用（幂等；失败只记日志，不阻断启动）。 */
+    private void conHealPatchConfig() {
+        try {
+            File f = new File(conPatchPath());
+            if (!f.exists()) return;
+            String txt = readFileText(f);
+            if (txt == null) return;
+            String nl = txt.indexOf("\r\n") >= 0 ? "\r\n" : "\n";
+            java.util.List<String> lines = conSplitLines(txt);
+            if (!conNormalizePatchLines(lines)) return;
+            conWriteText(f, conJoinLines(lines, nl));
+            Log.w(TAG, "cordis.patch.yml repaired (broken by an older console plugin toggle)");
+        } catch (Throwable t) {
+            Log.w(TAG, "conHealPatchConfig", t);
+        }
+    }
+
+    private boolean conPluginDisabled(String id) {
+        try {
+            String txt = readFileText(new File(conPatchPath()));
+            if (txt == null) return false;
+            java.util.List<String> lines = conSplitLines(txt);
+            int i = conFindRow(lines, id);
+            if (i < 0) return false;
+            int end = conRowEnd(lines, i);
+            for (int j = i + 1; j <= end; j++) {
+                String t = lines.get(j).trim();
+                if (t.startsWith("disabled:")) return t.indexOf("true") >= 0;
+            }
+        } catch (Throwable t) { Log.w(TAG, "conPluginDisabled", t); }
+        return false;
+    }
+
+    private void conSetPluginDisabled(String id, boolean disabled) {
+        try {
+            File f = new File(conPatchPath());
+            String txt = readFileText(f);
+            if (txt == null) return;
+            String nl = txt.indexOf("\r\n") >= 0 ? "\r\n" : "\n";
+            java.util.List<String> lines = conSplitLines(txt);
+            conNormalizePatchLines(lines);   // 先自愈，避免“越点越烂”
+            int at = conFindRow(lines, id);
+            if (at >= 0 && conInsideInsert(lines, at)) conSetRowDisabled(lines, at, disabled);
+            else conSetTopEntryDisabled(lines, id, disabled);
+            conWriteText(f, conJoinLines(lines, nl));
+        } catch (Throwable t) { Log.w(TAG, "conSetPluginDisabled", t); conToast("写配置失败：" + t.getMessage()); }
+    }
+
+    private void conWriteText(File f, String s) throws IOException {
+        File p = f.getParentFile();
+        if (p != null && !p.exists()) p.mkdirs();
+        FileOutputStream fos = new FileOutputStream(f);
+        try { fos.write(s.getBytes("UTF-8")); } finally { fos.close(); }
+    }
+
+    private void renderConsolePlug() {
+        LinearLayout col = consoleBody;
+        col.addView(conBackRow("插件"));
+        col.addView(cText("关掉的插件不加载：工具不进 AI 的工具表，也少占上下文。改动在重启引擎后生效。",
+                11f, cSub(), false), cTop(dp(10)));
+        col.addView(cSep(dp(12)));
+        for (int i = 0; i < CON_PLUGINS.length; i++) {
+            final String id = CON_PLUGINS[i][0];
+            boolean disabled = conPluginDisabled(id);
+            LinearLayout left = new LinearLayout(this);
+            left.setOrientation(LinearLayout.VERTICAL);
+            left.addView(cText("dsh-" + id, 13.5f, cText(), false));
+            left.addView(cText(CON_PLUGINS[i][1], 11f, cSub(), false));
+            TextView pill = cToggle(id, !disabled);
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            row.setPadding(0, dp(12), 0, dp(12));
+            row.addView(left, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            row.addView(pill);
+            col.addView(row);
+            col.addView(cSep(0));
+        }
+        Button apply = cButton("重启引擎生效", true);
+        apply.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conRestartEngine(); }
+        });
+        col.addView(apply, cTop(dp(14)));
+    }
+
+    // ---------- 日志页 ----------
+    private void renderConsoleLog() {
+        LinearLayout col = consoleBody;
+        col.addView(conBackRow("日志"));
+        col.addView(cText(conLogSummary(), 12f, cText(), false), cTop(dp(12)));
+        col.addView(cText("「查看」直接看末尾 200 行；「分享」调用系统分享（QQ / 微信 / 邮件…都能选），正文里带完整日志路径与末尾 400 行。",
+                11f, cSub(), false), cTop(dp(8)));
+        LinearLayout acts = new LinearLayout(this);
+        acts.setOrientation(LinearLayout.HORIZONTAL);
+        Button v = cButton("查看日志", false);
+        v.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View x) { conViewLog(); } });
+        Button e = cButton("分享", true);
+        e.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View x) { conShareLog(); } });
+        acts.addView(v);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = dp(8);
+        acts.addView(e, lp);
+        col.addView(acts, cTop(dp(14)));
+    }
+
+    private File conLogFile() { return new File(getFilesDir(), "dsh-web.log"); }
+
+    private String conLogSummary() {
+        try {
+            File f = conLogFile();
+            if (!f.exists()) return "还没有日志（引擎没启动过）";
+            return "dsh-web.log · " + (f.length() / 1024) + " KB · "
+                    + new SimpleDateFormat("MM-dd HH:mm").format(new java.util.Date(f.lastModified()));
+        } catch (Throwable t) { return "日志不可读"; }
+    }
+
+    private String conTailOf(File f, int maxLines) {
+        try {
+            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r");
+            long len = raf.length();
+            long start = Math.max(0, len - 65536);
+            raf.seek(start);
+            byte[] buf = new byte[(int) (len - start)];
+            raf.readFully(buf);
+            raf.close();
+            String s = new String(buf, "UTF-8");
+            String[] lines = s.split("\n");
+            if (lines.length <= maxLines) return s;
+            StringBuilder sb = new StringBuilder();
+            for (int i = lines.length - maxLines; i < lines.length; i++) { sb.append(lines[i]); sb.append('\n'); }
+            return sb.toString();
+        } catch (Throwable t) { return "读取失败：" + t.getMessage(); }
+    }
+
+    private void conViewLog() {
+        try {
+            File f = conLogFile();
+            if (!f.exists()) { conToast("还没有日志（引擎没启动过）"); return; }
+            TextView tv = cText(conTailOf(f, 200), 10.5f, cText(), false);
+            tv.setTypeface(android.graphics.Typeface.MONOSPACE);
+            tv.setTextIsSelectable(true);
+            ScrollView sv = new ScrollView(this);
+            sv.setBackground(cShape(isDark() ? 0xFF0F1524 : 0xFFF2F4F8, 0, 0, 6));
+            sv.setPadding(dp(12), dp(12), dp(12), dp(12));
+            sv.addView(tv);
+            sv.setLayoutParams(new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(380)));
+            conDialogView("dsh-web.log（末尾 200 行）", sv, "关闭", null, null);
+        } catch (Throwable t) { conToast("读取日志失败：" + t.getMessage()); }
+    }
+
+    /** v1.12：不再只能导到固定目录 —— 直接调系统分享（QQ / 微信 / 邮件随意选）。 */
+    @SuppressWarnings("unused")
+    private void conShareLogText() {
+        conToast("正在准备日志…");
+        new Thread(new Runnable() { @Override public void run() {
+            final String body = conBuildShareText();
+            ui.post(new Runnable() { @Override public void run() { conSendShare(body); } });
+        }}, "log-share").start();
+    }
+
+    private String conBuildShareText() {
+        try {
+            File f = conLogFile();
+            String head = "DeepSeek Harness 日志\n"
+                    + "版本 " + conVersionLabel() + "\n"
+                    + "端口 " + enginePort + " · " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date()) + "\n"
+                    + "完整日志路径：" + f.getAbsolutePath() + "\n"
+                    + "-------- dsh-web.log（末尾 400 行）--------\n";
+            if (!f.exists()) return head + "（还没有日志：引擎没启动过）";
+            return head + conTailOf(f, 400);
+        } catch (Throwable t) { return "日志读取失败：" + t.getMessage(); }
+    }
+
+    /** v1.13：以**文件**形式分享日志（原来是纯文字）。
+     * 准备好 dsh-web.log + 诊断文件 → 拷到 cache/share → 用 LogShareProvider 的 content:// URI 发出去。 */
+    private void conShareLog() {
+        conToast("正在准备日志文件…");
+        new Thread(new Runnable() { @Override public void run() {
+            final java.util.List<File> files = new java.util.ArrayList<File>();
+            String err = null;
+            try {
+                File dir = LogShareProvider.shareDir(MainActivity.this);
+                // 清掉上一次的残留，避免分享到旧文件
+                File[] old = dir.listFiles();
+                if (old != null) for (File o : old) { try { o.delete(); } catch (Throwable ignored) {} }
+
+                File log = conLogFile();
+                if (log.exists() && log.length() > 0) {
+                    File dst = new File(dir, "dsh-web.log");
+                    copyFile(log, dst);
+                    files.add(dst);
+                }
+                // 启动诊断（启动失败时才有）与外部日志镜像，一并带上
+                File diag = new File(getFilesDir(), "startup-diag.txt");
+                if (diag.exists() && diag.length() > 0) {
+                    File dst = new File(dir, "startup-diag.txt");
+                    copyFile(diag, dst);
+                    files.add(dst);
+                }
+            } catch (Throwable t) { err = String.valueOf(t.getMessage()); }
+            final String e = err;
+            ui.post(new Runnable() { @Override public void run() {
+                if (files.isEmpty()) { conToast("没有可分享的日志：" + (e != null ? e : "引擎还没启动过")); return; }
+                conSendLogFiles(files);
+            } });
+        }}, "log-share").start();
+    }
+
+    /** 发多个文件（ACTION_SEND_MULTIPLE + 读权限临时授权）。 */
+    private void conSendLogFiles(java.util.List<File> files) {
+        try {
+            java.util.ArrayList<Uri> uris = new java.util.ArrayList<Uri>();
+            for (File f : files) uris.add(LogShareProvider.uriFor(this, f.getName()));
+            Intent send;
+            if (uris.size() == 1) {
+                send = new Intent(Intent.ACTION_SEND);
+                send.putExtra(Intent.EXTRA_STREAM, uris.get(0));
+            } else {
+                send = new Intent(Intent.ACTION_SEND_MULTIPLE);
+                send.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+            }
+            send.setType("text/plain");   // 兼容性好：IM/邮件/网盘都能接
+            send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            Intent chooser = Intent.createChooser(send, "分享日志文件");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(chooser);
+        } catch (Throwable t) { conToast("调不起分享：" + t.getMessage()); }
+    }
+
+    /** 原纯文字分享（保留：某些接不住文件的场景可回退）。 */
+    private void conSendShare(String text) {
+        try {
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType("text/plain");
+            send.putExtra(Intent.EXTRA_SUBJECT, "DeepSeek Harness 日志");
+            send.putExtra(Intent.EXTRA_TEXT, text);
+            Intent chooser = Intent.createChooser(send, "分享日志");
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(chooser);
+        } catch (Throwable t) { conToast("调不起分享：" + t.getMessage()); }
+    }
+
+    private void conExportLog() {
+        conToast("正在导出…");
+        new Thread(new Runnable() { @Override public void run() {
+            try {
+                String ts = new SimpleDateFormat("yyyyMMdd-HHmmss").format(new java.util.Date());
+                File dir = new File(Environment.getExternalStorageDirectory(), "Download/DSH日志-" + ts);
+                if (!dir.exists() && !dir.mkdirs()) throw new IOException("mkdir failed: " + dir);
+                File log = conLogFile();
+                if (log.exists()) conCopyFile(log, new File(dir, "dsh-web.log"));
+                File ext = new File(Environment.getExternalStorageDirectory(), pkgRoot());
+                File mirror = new File(ext, "dsh-web.log");
+                if (mirror.exists()) conCopyFile(mirror, new File(dir, "dsh-web-mirror.log"));
+                File diag = new File(ext, "startup-diag.txt");
+                if (diag.exists()) conCopyFile(diag, new File(dir, "startup-diag.txt"));
+                final String p = dir.getAbsolutePath();
+                ui.post(new Runnable() { @Override public void run() { conToast("已导出到 " + p); } });
+            } catch (Throwable t) {
+                final String m = String.valueOf(t.getMessage());
+                ui.post(new Runnable() { @Override public void run() { conToast("导出失败：" + m); } });
+            }
+        }}, "log-export").start();
+    }
+
+    private void conCopyFile(File src, File dst) throws IOException {
+        File p = dst.getParentFile();
+        if (p != null && !p.exists()) p.mkdirs();
+        FileInputStream in = new FileInputStream(src);
+        FileOutputStream out = new FileOutputStream(dst);
+        try {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+        } finally {
+            in.close();
+            out.close();
+        }
+    }
+
     @Override
     public void onBackPressed() {
+        // v1.12：控制台内的返回先回控制台首页，再退出
+        if (consoleVisible) {
+            if (consolePage != 0) { consolePage = 0; renderConsole(); return; }
+            confirmExit();
+            return;
+        }
         // 有历史先回退（可关掉侧边栏/返回上一页）；没有历史则询问是否退出
         if (webView != null && webView.canGoBack()) {
             webView.goBack();
