@@ -226,7 +226,7 @@ fi
 VSC_SRC="$P/src/com/deepseek/harness/vscreen"
 if ! "$JAVA/javac" -source 1.8 -target 1.8 -bootclasspath "$AJ" \
   -classpath "$GEN_CP${CP_SEP}$SHIZUKU_JARS" -d "$P/out/classes" \
-  "$P/src/com/deepseek/harness/MainActivity.java" "$P/src/com/deepseek/harness/EngineService.java" "$P/src/com/deepseek/harness/AlarmReceiver.java" "$P/src/com/deepseek/harness/ScheduleExecutor.java" "$P/src/com/deepseek/harness/OverlayService.java" "$P/src/com/deepseek/harness/UsageStatsHelper.java" "$P/src/com/deepseek/harness/AccessibilityService.java" "$P/src/com/deepseek/harness/VsreenBridgeService.java" \
+  "$P/src/com/deepseek/harness/MainActivity.java" "$P/src/com/deepseek/harness/EngineService.java" "$P/src/com/deepseek/harness/AlarmReceiver.java" "$P/src/com/deepseek/harness/ScheduleExecutor.java" "$P/src/com/deepseek/harness/OverlayService.java" "$P/src/com/deepseek/harness/UsageStatsHelper.java" "$P/src/com/deepseek/harness/AccessibilityService.java" "$P/src/com/deepseek/harness/VsreenBridgeService.java" "$P/src/com/deepseek/harness/LogShareProvider.java" \
   "$VSC_SRC"/*.java \
   "$P/out/gen/com/deepseek/harness/R.java" \
   >"$P/out/javac.log" 2>&1; then
