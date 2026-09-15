@@ -1,3 +1,197 @@
+## v1.13.5（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
+
+> `payload/rish/rish_shizuku.dex` 权限是 0666 → Android 14+ 的 ART 拒绝加载可写 dex
+> （进程直接 SIGABRT / exit 134，终端上只有一句 “Aborted”）—— 修。
+> versionCode **32**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 payload 里的 rish dex 是 0666，导致 rish 调用静默崩溃
+- **现象**（用户/AI 提交的报告，已逐条核实）：任何指向 payload 副本的 rish 调用直接崩溃，
+  `exit=134`（SIGABRT），终端只看到 `Aborted`；真因只在 logcat：
+  `java.lang.SecurityException: Writable dex file '<path>' is not allowed`。
+  同一文件两份权限不一致：`files/payload/rish/rish_shizuku.dex` 是 `-rw-rw-rw-` ❌，
+  `files/rish/rish_shizuku.dex`（`$SHIZUKU_DEX` 指向的那份）是 `-r--r--r--` ✅ → 主流程不受影响。
+- **核实结果**：
+  - `assets/payload.zip` 的 **28604 个条目 unix 权限全部为 0**（create_system=MS-DOS，external_attr=0），
+    即 **权限不是打包带进去的，而是解压时决定的**（这一点报告说得对）；
+  - 解压写入用 `FileOutputStream` 创建文件（本机 umask 下即 rw-rw-rw-）；且 `prepareTarget()` 里的
+    `setWritable(true, false)` 会把 **group/other 的写位也加上**（0444 → 0666）——
+    这就是“`chmod 444` 后一更新就复发”的机制。
+- **修法**（`MainActivity.java` 四处，四份同步，只改 App Java）：
+  1. 解压写入循环：`name.endsWith(".dex")` → `secureDexPermissions(target)`（`chmod 0444`）；
+  2. 解压收尾：`secureDexFiles(payload)` 兜底把 `rish/rish_shizuku.dex`、`vscreen/vscreen_shizuku.dex`
+     收成 0444（覆盖升级时旧文件不会被重写，扫不到就白搭）；
+  3. `extractRishDex()`：**App 自己那份** dex 写出后立即收权（插件 begin 前也存在窗口期）；
+  4. `prepareTarget()`：`setWritable(true, false)` → `setWritable(true, true)`（不再把写位扩散到 group/other）。
+- ⚠️ **本次未在真机复验**（做这轮时用户已关无线调试）。验收方式：
+  ```bash
+  adb shell ls -l /data/user/0/com.deepseek.harness/files/payload/rish/rish_shizuku.dex
+  # 期望 -r--r--r--（旧版是 -rw-rw-rw-）
+  ```
+  再用报告里的复现命令跑一次，应当不再 `Aborted`、正常输出。
+
+---
+
+## v1.13.4（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
+
+> App 侧 JSON 取字段改成**认识转义** —— 修 `shizuku_shell` 传“带引号/换行命令”被截断的隐蔽 bug。
+> versionCode **31**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 `shizuku_shell` 传带引号/换行的命令会被截断（静默执行错的东西）
+- **根因**：`MainActivity.jsonField()` 是朴素实现（“找 `"key"` → 找 `:` → 取下一个 `"` 到再下一个 `"`”），
+  **不认 `\"` `\\` `\n` 等转义**；而插件是用 `JSON.stringify()` 发的正常 JSON，命令里的 `"` 会被写成 `\"` → 在那个引号处提前结束。
+- **真机可复现的例子**（用同一段算法跑出来的）：
+  ```
+  插件发： {"command":"pm install -r \"/sdcard/Download/my app.apk\"", ...}
+  旧实现解析出： "pm install -r \"          ← 断在转义引号处，路径全丢，命令照跑
+  新实现解析出： "pm install -r \"/sdcard/Download/my app.apk\""
+  ```
+  多行命令同理：`{"command":"id\necho hi"}` 旧实现得到字面 `id\necho hi`（`\n` 没还原成换行）。
+- **修法**：`jsonField()` 改为逐字符扫描、处理 `\" \\ \/ \n \r \t \b \f \uXXXX` 的标准转义（约 25 行，无新依赖）。
+  同一个方法也被 `/schedule`、`/setting`、`/clipboard`、`/overlay`、`/usage` 使用 → 那几条一并变正确。
+- **验证（本地单测）**：`tmp-diag/json-test/`（`JsonFieldTest.java` 的方法体由 awk **从源码逐字抽取**，避免手抄走样）
+  11 个用例全过 `PASS=11 FAIL=0`：普通值回归、转义引号、换行、反斜杠、`\uXXXX`、值含键名、数字字段（与旧行为一致）、
+  缺字段、空串、`sh -c "…"`、转义斜杠路径。
+- 说明：本轮**只改 App Java**，未动插件/payload/内核 → 引擎内特权通道行为不变（v1.13.2 已端到端验证）。
+
+---
+
+## v1.13.3（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
+
+> 控制台「管理 Shizuku」弹不出授权框 —— 修。versionCode **30**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 控制台点「管理」（Shizuku 行）不弹授权框，而引擎里 AI 调 shizuku 却会弹
+- **真机现象（用户回报）**：没有给本应用授权 Shizuku 时，引擎里让 AI 调 shizuku → **能弹出** Shizuku 授权框；
+  但在控制台权限页点 Shizuku 行的「管理」→ **什么都不弹**。
+- **根因**：`conPermAction("shizuku")` 里原来只调了 `probeShizuku()`（纯探测），**从未发出过真实请求**，
+  自然不会触发 Shizuku 的授权框；而引擎里那条路会 spawn `rish`（发 `REQUEST_BINDER` 广播），
+  Shizuku 应用收到**真实请求**才弹框。
+- **修法**：
+  1. Shizuku 行改走统一入口 `showShizukuDialog()`（实时探测 → 未授权则请求 → 仍未授权再给手动引导）；
+  2. 新增 `triggerShizukuPrompt()`：在 `Shizuku.requestPermission()` 之外，**补两条与引擎同款的真实触发**
+     —— ① `Shizuku.getBinder()`（client provider 路径）② App 自己 spawn 一个 `rish`（同 dex、同 env 清理、
+     同广播）；真机实测 `requestPermission()` 在本机（Shizuku 13.6.0 + ColorOS 15）不弹框；
+  3. 3 秒后回探刷新（授权后界面立刻变），12 秒仍未授权 → 弹「需手动授权」引导框（带「打开 Shizuku」按钮）。
+
+---
+
+## v1.13.2（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
+
+> 接 v1.13.1：真机端到端实测又抓出并修掉 1 个**我自己引入**的 bug（工具输出 schema 非法）。
+> versionCode **29**。内核仍为 DSH 0.1.5-rc.1。
+> ⚠️ **v1.13.1（vc28）只用于调试、不要发布**——它的 `shizuku_shell` 结果会被判非法输出。
+
+### 🐛 `shizuku_shell` 返回“结果 schema 不匹配”（v1.13.1 引入）
+- **现象（真机、App 内 AI 原话）**：`id output is not obtainable through shizuku_shell right now because of
+  this app-side schema mismatch (a bug in the tool's result schema versus what it returns)`。
+- **根因**：`appShellCmd()` 的返回值里带了内部字段 `transport`，而 `shizuku_shell` 的输出 schema 是
+  `additionalProperties:false`，DSH 校验不通过 → 整个工具结果作废（App 通道其实**已经执行并返回了**）。
+- **修法**：`privCmd()` 返回前 `delete r.transport`（该字段只在插件内部作信号用）。
+- 教训（与本项目已有的两条老坑同源）：**输出 schema 与实现必须同步**；`additionalProperties:false` 下
+  多一个字段 = 结果作废（v1.6、v1.12 都踩过同类）。
+
+---
+
+## v1.13.1（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
+
+> **Shizuku 特权通道改走 App 进程（根治“Request timeout”）**。versionCode **28**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 Shizuku 工具一直“Request timeout” —— 真因与根治
+- **真因（真机日志实锤）**：引擎内的 `rish` 子进程（`app_process … ShizukuShellLoader`，以正式版 uid 运行）
+  调 Shizuku 时，Shizuku **服务端需要回头找 Shizuku 应用本体校验“这个包有没有被授权”**；
+  而 ColorOS 会冻结/查杀 Shizuku 应用：
+  ```
+  OPM: handleAppExit … package=moe.shizuku.privileged.api reason=9 (EXCESSIVE RESOURCE USAGE)
+       subreason=7 (EXCESSIVE CPU USAGE) … description=excessive binder traffic during cached state
+  OplusHansManager: uid=10361 … F exit(), F stay=144 … unfreeze … reason: UidGone
+  NativeFreezeManager: freezeForAppSwitchScene … mFgAppPkgname moe.shizuku.privileged.api
+  ```
+  应用一被冻结/查杀，那一跳就阻塞 → Shizuku 客户端库报
+  `Request timeout. The connection between the current app (…) and Shizuku app may be blocked by your system…`
+- **为什么以前查不出来**：`adb`（uid 2000 = Shizuku server 自己的 uid）**天然免检**，
+  连把 `RISH_APPLICATION_ID` 填成不存在的包名都能跑通 —— 所以“从 adb 测 rish”永远看不到这个故障；
+  而 App 进程内的 Shizuku API 通道（`Shizuku.getBinder()` + `IShizukuService.newProcess`，虚拟屏核心就是它拉起的）**实测一直正常**。
+- **根治**：新增 App 本地路由 **`POST 127.0.0.1:<notifyPort>/shell`**（`MainActivity`），
+  在 **App 进程内**用 Shizuku API 以 shell 身份执行命令并回收 stdout/stderr/退出码（带超时终止）；
+  插件 `dsh-tool-shizuku` 的 `shizuku_shell` 改为**优先走这条通道**，`rish` 仅作旧 APK 兜底。
+- **安全**：`/shell` 需要 **`APP_LOCAL_TOKEN`**（App 开机生成 32 位随机串、存 `dsh_prefs`、经 env 只交给本应用引擎），
+  避免设备上任意应用通过 127.0.0.1 调用拿到 shell 权限。
+- **`shizuku_status` 说真话**：两条通道都实跑探针，分别回报 `shizuku(App 进程 / Shizuku API)` / `shizuku(rish 兜底)`，失败时把两边原因都带出来。
+- **环境侧（用户侧）**：Shizuku 应用需在 ColorOS 里允许后台活动（否则还会被厂商冻结）；
+  本次已用 `cmd deviceidle whitelist +moe.shizuku.privileged.api` 把它加入电池优化白名单。
+
+---
+
+## v1.13（正式版 + Lite 共存版 + 兼容版 · 2026-09-14）
+
+> **控制台/引擎判定大修**（12 项）+ **Shizuku 门卫修复** + **老 WebView `Iterator` 崩溃修复** + 界面/分享打磨。
+> versionCode **27**。内核仍为 DSH 0.1.5-rc.1（随 v1.11 升级，本版未动）。
+
+### 🔧 控制台与引擎状态（真机逐项实测）
+- **关插件把 `cordis.patch.yml` 写坏 → 引擎启动即崩（致命）**：旧实现删掉 `- id:` 整行再把条目搬到文件顶部 →
+  悬空 `name:` 造成 `duplicated mapping key`；且搬到顶部也不生效（patch 按顺序生效，须在 `- insert:` 之后）。
+  现改为**原地**增删 `disabled:` + **结构自愈**（起引擎前/启动自检时自动修复）。
+- **「停止」停不掉**：新增 `engineStartAborted` / `engineStoppedByUser`（打断在飞的等待 + 看门狗不再自动拉起）。
+- **引擎在跑却显示“未启动”**：探测原本在主线程做网络 IO → `NetworkOnMainThreadException` 被吞；
+  现探测全部移到后台线程并缓存（`conProbeEngineNow`），点击启动也先后台真探一次。
+- **启动中界面“一闪一闪”+ 按钮提前点亮、点进去没反应**：真机 node 就绪需 17~43 秒，
+  旧判定把“进程活着”当“已就绪”；现**只认真实端口探测**，未就绪期间显示「启动中…」并**禁用**入口。
+- **重复拉起两个 node（抢 3080，通知端口 EADDRINUSE）**：`launchEngine` 增加“已有 node 存活”“端口已 listen”
+  两道防线，只等待不再 spawn；`startNotifyServer` 改为幂等。
+- **黑鲸鱼悬浮窗 / 常驻通知一直显示“引擎未运行”**：探测只认首页 HTML 的 `<title>`；
+  现与 `isDshEngine` 对齐（`303/302 = token 有效`、`401 + dsh web authentication required = 引擎在跑`）。
+- **定时任务**：`engineReady()` 同上修复；`enginePort()` 三版原**都硬编码 3080**（Lite 的定时任务会打到正式版引擎）→
+  改为按包名派生（3080/3082/3084）。
+
+### 🐛 Shizuku 门卫不认（正式版引擎自称 beta）
+- `MainActivity.spawnNode()` 曾**硬编码** `SHIZUKU_APP_ID="com.deepseek.harness.beta"`，而三版共用同一份源码 →
+  正式版/兼容版也在自称 beta，`rish` 拿它去 Shizuku 要授权时包名/uid 对不上 → 授权被拒。
+- 现改为 `getPackageName()`（与 `ScheduleExecutor` 一致）并写回 `dsh_prefs:shizuku_app_id`。
+
+### 🌐 老 WebView：`Failed to load plugins`（`Iterator is not defined`）
+- 官方插件 `@deepseek-ai/dsh-client-ui-sidebar-documentpreview` 顶层直接读 `Iterator.prototype.join`
+  （ES2025 Iterator Helpers，WebView 122+ 才有）→ 老设备 `ReferenceError` → 插件 import 失败 → 前端白页。
+- **实测发现连现代 Chromium 都还没实现 `Iterator.prototype.join`**，所以补丁对所有设备都必要。
+- 修法：Iterator polyfill 注入 `mobile-patch/mobile.js`（body 末尾普通脚本，早于所有 module，三版通吃）；
+  兼容版另并入 `legacy-patch/polyfill.js`。
+
+### 🎨 界面与分享
+- **退出弹窗“外面还套了一层小白边/小黑边”**：系统对话框面板的圆角/描边露在直角色块外；
+  现将窗口背景置为**全透明**、卡片自绘圆角。
+- **「分享」日志改为文件形式**：新增最小只读 `LogShareProvider`（本项目无 androidx，且 targetSdk 28 不允许直传 `file://`），
+  把 `dsh-web.log`/`startup-diag.txt` 拷到 `cache/share` 后以 `content://` + 读权限授权分享（多文件走 `ACTION_SEND_MULTIPLE`）。
+- **无障碍按文字/坐标点击点不到按钮**（AI 操作手机的基础能力）：新增 `closestClickable()`（向上找可点击祖先，
+  带面积护栏）；`findNodeByText` 改为择优匹配；`findNodeByPoint` 改为最深可点击节点。
+
+### 🔧 验证
+- 用**从 MainActivity.java 原文抽取**的同一份方法做单测（`tmp-diag/patch-test/`）：
+  自愈→幂等、关/开插件、连点 5 轮不增生；产出文件用**内核自带的 yaml 解析器**逐个验证可解析。
+- Iterator polyfill：在真实浏览器里模拟“无 Iterator 的老 WebView”，验证插件原句不再抛错、
+  各类迭代器 `join` 行为与规范一致；并确认不会覆盖原生实现。
+- 真机（PLT120 / Android 15）：逐秒采样验证 —— 启动过程不再闪烁、按钮不再提前点亮、
+  node 始终只有 1 个；无障碍 `tap?text=启动引擎` 返回 `method="node-text"`（修复前 found:false / gesture）。
+
+---
+
+## v1.12（正式版 + Lite 共存版 + 兼容版 · 2026-09-13/14）
+
+> **冷启动先进原生控制台**（不进 DSH 网页）：解压/启动分两步、权限八项检测、插件开关、日志查看导出。
+> versionCode **26**。**只改 App 外壳，未动 DSH 内核与网页**。
+
+- **控制台四页**：① 解压/启动（拆成两步，无“第 1/2 步”标签）② 权限（八项真实检测，点击跳系统页）
+  ③ 插件开关（读写 `cordis.patch.yml` 的 `disabled`）④ 日志（查看/导出/分享）；主题跟随系统深浅色。
+- **修：引擎在跑但控制台显示“未启动”**：
+  ① 探测器用带 token 的 URL 探测，**把一次性 token 吃掉了**，WebView 随后拿同一个 token → 401（白屏）；
+  现改为**只用不带 token 的 `/`** 探测（`401 + dsh web authentication required` 也算“引擎在跑”）。
+  ② 旧实现只看内存里的进程句柄，App 重启后 `nodeProcess == null` → 恒显“未启动”；
+  现改为**先探端口、再回退看句柄**。③ App 重启后丢 token → 新增 `conTokenFromLog()` 从引擎日志尾部捞回。
+- **兼容版白屏的真因（历轮误判）**：`build-legacy.sh` 把 Vite 的 `<script type="module">` 换成
+  head 里**不带 defer** 的普通 script → 在 `<div id="root">` 解析前执行 → `missing #root` 纯白页；
+  现输出 `<script defer src="/assets/index.legacy.js">`。
+- **「增加供应商」按钮置灰的真因**：`dsh-llm-pi-ai` 被 `cordis.patch.yml` 禁用（旧理由已过期）；
+  现取消禁用（0.1.5 树里 `@earendil-works/pi-ai` 为纯 JS，无原生模块）。
+
+---
+
 ## v1.11（正式版 + Lite 共存版 + 兼容版 · 2026-09-12）
 
 > 内核升级 **DSH 0.1.5-rc.1**（原 0.1.1-rc.2）+ **6 个 android 插件缺陷修复** + **虚拟屏比例归一化**。
