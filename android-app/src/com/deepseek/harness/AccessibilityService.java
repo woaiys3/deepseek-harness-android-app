@@ -982,44 +982,88 @@ public class AccessibilityService extends android.accessibilityservice.Accessibi
         }
     }
 
+    /** 从节点向上找最近的可点击祖先（含自身）；找不到返回 null。
+     *  v1.13：按钮内部常常是若干不可点击的子 TextView，直接拿最深节点做 ACTION_CLICK 会失败，
+     *  退化成投递手势——而手势会被悬浮窗（远程控制/小窗等）吃掉。向上找可点击祖先即可绕过。 */
+    private AccessibilityNodeInfo closestClickable(AccessibilityNodeInfo node) {
+        Rect nb = new Rect();
+        try { node.getBoundsInScreen(nb); } catch (Throwable t) { return null; }
+        long nArea = (long) Math.max(1, nb.width()) * Math.max(1, nb.height());
+        AccessibilityNodeInfo cur = node;
+        for (int i = 0; i < 12 && cur != null; i++) {
+            try {
+                if (cur.isClickable() && cur.isEnabled()) {
+                    if (i == 0) return cur;
+                    // 面积护栏：祖先比自己大太多（WebView / 整页容器）时不能当目标，否则 ACTION_CLICK
+                    // 会打在该容器中心（点错位置）；这种情况宁可返回 null 走手势。
+                    Rect cb = new Rect();
+                    cur.getBoundsInScreen(cb);
+                    long cArea = (long) Math.max(1, cb.width()) * Math.max(1, cb.height());
+                    if (cArea <= nArea * 6) return cur;
+                    return null;
+                }
+                cur = cur.getParent();
+            } catch (Throwable t) {
+                return null;
+            }
+        }
+        return null;
+    }
+
     private AccessibilityNodeInfo findNodeByText(String needle) {
         if (needle == null || needle.isEmpty()) return null;
-        final AccessibilityNodeInfo[] found = {null};
         final String target = needle.trim().toLowerCase();
         final AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return null;
+        final AccessibilityNodeInfo[] best = {null};
+        final int[] bestRank = {-1};   // 4=精确且可点击 3=包含且可点击 2=精确 1=包含
         walk(root, new NodeVisitor() {
             @Override
             public void visit(AccessibilityNodeInfo node, int depth) {
-                if (found[0] != null) return;
-                if (node == null) return;
+                if (node == null || bestRank[0] == 4) return;
                 CharSequence textCs = node.getText();
                 CharSequence descCs = node.getContentDescription();
-                String text = textCs == null ? "" : textCs.toString().toLowerCase();
-                String desc = descCs == null ? "" : descCs.toString().toLowerCase();
-                if ((!text.isEmpty() && text.contains(target)) || (!desc.isEmpty() && desc.contains(target))) {
-                    found[0] = node;
+                String text = textCs == null ? "" : textCs.toString().trim().toLowerCase();
+                String desc = descCs == null ? "" : descCs.toString().trim().toLowerCase();
+                boolean exact = text.equals(target) || desc.equals(target);
+                boolean partial = !exact && ((!text.isEmpty() && text.contains(target))
+                        || (!desc.isEmpty() && desc.contains(target)));
+                if (!exact && !partial) return;
+                AccessibilityNodeInfo clickable = closestClickable(node);
+                int rank = exact ? (clickable != null ? 4 : 2) : (clickable != null ? 3 : 1);
+                if (clickable != null) {
+                    if (rank > bestRank[0]) { bestRank[0] = rank; best[0] = clickable; }
+                } else if (best[0] == null && rank > bestRank[0]) {
+                    bestRank[0] = rank;
+                    best[0] = node;
                 }
             }
         }, 0);
-        return found[0];
+        return best[0];
     }
 
+    /** 包含该坐标的**最深可点击节点**（无则退回最深节点）。 */
     private AccessibilityNodeInfo findNodeByPoint(final int x, final int y) {
-        final AccessibilityNodeInfo[] found = {null};
         final AccessibilityNodeInfo root = getRootInActiveWindow();
         if (root == null) return null;
+        final AccessibilityNodeInfo[] best = {null};
+        final int[] bestDepth = {-1};
         walk(root, new NodeVisitor() {
             @Override
             public void visit(AccessibilityNodeInfo node, int depth) {
-                if (found[0] != null) return;
                 if (node == null) return;
                 Rect bounds = new Rect();
-                node.getBoundsInScreen(bounds);
-                if (bounds.contains(x, y)) found[0] = node;
+                try { node.getBoundsInScreen(bounds); } catch (Throwable t) { return; }
+                if (!bounds.contains(x, y)) return;
+                AccessibilityNodeInfo clickable = closestClickable(node);
+                if (clickable == null) {
+                    if (best[0] == null && depth > bestDepth[0]) { bestDepth[0] = depth; best[0] = node; }
+                    return;
+                }
+                if (depth >= bestDepth[0]) { bestDepth[0] = depth; best[0] = clickable; }
             }
         }, 0);
-        return found[0];
+        return best[0];
     }
 
     /** /tap：text/desc 按文本查找点击；x/y 或 fx/fy 按坐标点击（优先节点 ACTION_CLICK，失败手势）。 */
