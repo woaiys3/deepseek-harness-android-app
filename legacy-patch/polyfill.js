@@ -63,4 +63,42 @@
       this.signal.removeEventListener = function () {};
     };
   }
+
+  // v1.13 新增：Iterator Helpers（ES2025；Chrome/WebView 122+ 才有）。
+  // @deepseek-ai/dsh-client-ui-sidebar-documentpreview 的 client.js 顶层直接读
+  // `typeof Iterator.prototype.join` —— 老 WebView 上 Iterator 未定义 → ReferenceError
+  // → 插件 import 失败 → “Failed to load plugins” 白页。已扫描全树：仅此一处 Iterator 用法。
+  (function () {
+    var iterProto = null;
+    try {
+      if (typeof Symbol !== 'undefined' && Symbol.iterator) {
+        iterProto = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+      }
+    } catch (e) { iterProto = null; }
+
+    function joinImpl(sep) {
+      sep = (sep === undefined) ? ',' : String(sep);
+      if (this == null || typeof this.next !== 'function') {
+        throw new TypeError('Iterator.prototype.join called on incompatible receiver');
+      }
+      var out = '', first = true, step;
+      while (!(step = this.next()).done) {
+        if (!first) out += sep;
+        first = false;
+        var v = step.value;
+        out += (v === null || v === undefined) ? '' : String(v);
+      }
+      return out;
+    }
+
+    if (iterProto && typeof iterProto.join !== 'function') iterProto.join = joinImpl;
+
+    if (typeof window.Iterator === 'undefined') {
+      var It = function Iterator() { throw new TypeError('Iterator is not constructible'); };
+      if (iterProto) { It.prototype = iterProto; } else { It.prototype.join = joinImpl; }
+      window.Iterator = It;
+    } else if (window.Iterator.prototype && typeof window.Iterator.prototype.join !== 'function') {
+      window.Iterator.prototype.join = joinImpl;
+    }
+  })();
 })();
