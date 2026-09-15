@@ -29,9 +29,17 @@ public final class ScheduleExecutor {
 
     private ScheduleExecutor() {}
 
-    /** 引擎端口：固定默认端口（v1.5.4 起移除「端口冲突自动换端口」，与 MainActivity 一致，不再读 engine_port）。 */
+    /** 引擎端口：按包名派生（v1.13）。旧实现三套都硬编码 3080 —— Lite/兼容版的定时任务
+     *  会探测并连接到**正式版**的引擎上（跨版本串台，与 v1.11 修过的插件端口串台同源）。 */
     private static int enginePort(Context ctx) {
-        return 3080; // 默认（正式版；Lite 版由构建时改 3082 / 抢先版 3084）
+        try {
+            String p = ctx.getPackageName();
+            if (p != null) {
+                if (p.endsWith(".beta")) return 3082;
+                if (p.endsWith(".compat")) return 3084;
+            }
+        } catch (Throwable ignored) {}
+        return 3080;
     }
 
     /** 执行一条定时任务（后台线程，调用方勿阻塞主线程）。 */
@@ -112,15 +120,32 @@ public final class ScheduleExecutor {
         } catch (Throwable ignored) {}
     }
 
-    /** 引擎是否已在目标端口响应，且确认是 DSH 引擎（首页含 <title>DeepSeek Harness</title>）。
-     *  修复 v1.5.1：原来任意 HTTP 200-499 都算就绪，占位服务会被误判为"引擎就绪"。 */
+    /** 引擎是否已在目标端口响应，且确认是 DSH 引擎。
+     *  修复 v1.5.1：原来任意 HTTP 200-499 都算就绪，占位服务会被误判为"引擎就绪"。
+     *  v1.13：0.1.5 起首页需要一次性 token —— 不带 token 返回 401 + 纯文本
+     *  “dsh web authentication required…”，带有效 token 返回 303。两种都算“引擎在跑”。
+     *  旧实现只认首页 HTML 的 <title>DeepSeek Harness</title> → 引擎在跑也判“未就绪”，
+     *  定时任务于是又去拉起一个引擎（EADDRINUSE）。 */
     private static boolean engineReady(Context ctx) {
         HttpURLConnection c = null;
         try {
             c = (HttpURLConnection) new URL("http://127.0.0.1:" + enginePort(ctx) + "/").openConnection();
             c.setConnectTimeout(1500);
             c.setReadTimeout(1500);
+            c.setInstanceFollowRedirects(false);   // 303 即“token 有效”；跟随反而浪费 token
             int code = c.getResponseCode();
+            if (code == 303 || code == 302) return true;
+            if (code == 401) {
+                InputStream e = null;
+                try { e = c.getInputStream(); } catch (Throwable t) { e = c.getErrorStream(); }
+                if (e == null) return false;
+                ByteArrayOutputStream eb = new ByteArrayOutputStream();
+                byte[] ebuf = new byte[2048];
+                int er;
+                while ((er = e.read(ebuf)) > 0 && eb.size() < 8192) eb.write(ebuf, 0, er);
+                try { e.close(); } catch (Throwable ignored) {}
+                return eb.toString("UTF-8").contains("dsh web authentication required");
+            }
             if (code < 200 || code >= 500) return false;
             InputStream in = c.getInputStream();
             // v1.5.5 修复：首页约 14KB，<title> 在页面末尾（旧实现只读 4096 字节永远匹配不到）。
