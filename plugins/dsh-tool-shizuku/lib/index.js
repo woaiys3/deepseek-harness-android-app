@@ -167,12 +167,65 @@ function suCmd(command, timeoutMs) {
   });
 }
 
-/** 选择特权通道执行：root(su) 优先，否则 Shizuku。 */
+/**
+ * 经 **App 进程**（Shizuku API 通道）执行特权命令：POST 127.0.0.1:<notifyPort>/shell。
+ *
+ * 为什么不再直接用引擎内 rish：Shizuku 服务端校验「某包是否被授权」时要回头问 Shizuku 应用本体，
+ * 而 ColorOS 会冻结/查杀 Shizuku 应用（真机日志：OplusHansManager “F exit()”、NativeFreezeManager、
+ * “excessive binder traffic during cached state”），于是 rish 子进程等不到响应，只能抛
+ * “Request timeout…”。App 进程内的 Shizuku API 通道实测稳定（虚拟屏核心就是它拉起的）。
+ *
+ * 返回结构与 shizukuCmd 一致；另外多一个 transport 字段：true = 压根没谈到 App（旧 APK / 服务未起）。
+ */
+function appShellCmd(command, timeoutMs) {
+  const port = Number(process.env.APP_NOTIFY_PORT) || 3081;
+  const token = process.env.APP_LOCAL_TOKEN || "";
+  const timeout = Math.max(1000, Math.min(timeoutMs || 30000, 120000));
+  const body = JSON.stringify({ command, timeout_ms: timeout, token });
+  return new Promise((resolve) => {
+    import("node:http").then((http) => {
+      const req = http.request({
+        host: "127.0.0.1",
+        port,
+        path: "/shell",
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }
+      }, (res) => {
+        let d = "";
+        res.on("data", (c) => d += c);
+        res.on("end", () => {
+          try {
+            const v = JSON.parse(d || "{}");
+            resolve(Object.assign({ transport: false }, v));
+          } catch (e) {
+            resolve({ ok: false, transport: false, error: "App /shell 响应解析失败：" + String(d).slice(0, 200) });
+          }
+        });
+      });
+      // 网络层超时 = 命令超时 + 10s 余量（命令超时由 App 侧负责终止）
+      req.setTimeout(timeout + 10000, () => { req.destroy(); resolve({ ok: false, transport: true, error: "App /shell 请求超时" }); });
+      req.on("error", (e) => resolve({ ok: false, transport: true, error: "连不上 App 本地特权服务：" + String(e && e.message || e) }));
+      req.write(body);
+      req.end();
+    }).catch((e) => resolve({ ok: false, transport: true, error: "加载 http 模块失败：" + String(e) }));
+  });
+}
+
+/** 选择特权通道执行：root(su) 优先 → App 进程内 Shizuku API → 引擎内 rish（旧 APK 兜底）。 */
 function privCmd(command, timeoutMs) {
   if (process.env.ROOT_AVAILABLE === "1") {
     return suCmd(command, timeoutMs);
   }
-  return shizukuCmd(command, process.env.SHIZUKU_DEX, process.env.SHIZUKU_APP_ID, timeoutMs);
+  return appShellCmd(command, timeoutMs).then((r) => {
+    // exit_code 是数字 = App 真的执行过（成功或失败都算有结论），直接采用，不再退 rish。
+    // ⚠ transport 是内部字段：工具输出 schema 是 additionalProperties:false，多带一个字段
+    // 会让 DSH 判定“非法输出”，模型拿不到真实结果（v1.13.1 首测就是踩了这个坑）。
+    if (r && typeof r.exit_code === "number") {
+      delete r.transport;
+      return r;
+    }
+    return shizukuCmd(command, process.env.SHIZUKU_DEX, process.env.SHIZUKU_APP_ID, timeoutMs);
+  });
 }
 
 function apply(ctx) {
@@ -267,13 +320,70 @@ function apply(ctx) {
       }]
     },
     async execute() {
+      const appId = process.env.SHIZUKU_APP_ID || "";
+      const dex = process.env.SHIZUKU_DEX;
+      // v1.13：**声称的通道必须实跑一次验证**。
+      // 旧实现只要 SHIZUKU_AVAILABLE==="1" 就直接回 available:true —— 但那个环境变量是 App 侧按
+      // **uid** 判的（Shizuku.checkSelfPermission），而 rish 侧是按 RISH_APPLICATION_ID（**包名**）取权限。
+      // 两者不一致时（例如包名写错）会表现为“状态说已授权、实际每次调用都 5 秒超时”，把真正的病因藏起来。
+      // 现在：实跑探针，失败就如实报错并把 appId 带出来（这是排查门卫问题的关键信息）。
       if (process.env.ROOT_AVAILABLE === "1") {
-        return { available: true, channel: "root(su)", detail: "已授予 root 权限" };
+        const rr = await suCmd("id", 10000);
+        if (rr.ok && /uid=0/.test(rr.stdout || "")) {
+          return { available: true, channel: "root(su)", detail: "已授予 root 权限" };
+        }
+        if (process.env.SHIZUKU_AVAILABLE !== "1") {
+          return {
+            available: false,
+            channel: "root(su)",
+            detail: "root 通道实测失败：" + (rr.stderr || rr.error || rr.stdout || "未知错误")
+          };
+        }
       }
       if (process.env.SHIZUKU_AVAILABLE === "1") {
-        return { available: true, channel: "shizuku", detail: "Shizuku 已授权" };
+        // v1.13.1：首选通道 = App 进程内的 Shizuku API（App 本地 127.0.0.1:<notifyPort>/shell）。
+        // 引擎内 spawn rish 仅作兜底：ColorOS 会冻结 Shizuku 应用，rish 只能等到超时。
+        if (process.env.APP_LOCAL_TOKEN) {
+          const ra = await appShellCmd("echo __SHIZUKU_OK__", 10000);
+          if (typeof ra.exit_code === "number") {
+            if (ra.ok && String(ra.stdout || "").includes("__SHIZUKU_OK__")) {
+              return { available: true, channel: "shizuku(App 进程 / Shizuku API)", detail: "Shizuku 已授权（appId=" + appId + "）" };
+            }
+            const whyApp = ra.error || ra.stderr || ra.stdout || "未知错误";
+            if (dex) {
+              const rr = await shizukuCmd("echo __SHIZUKU_OK__", dex, appId, 10000);
+              if (rr.ok && (rr.stdout || "").includes("__SHIZUKU_OK__")) {
+                return { available: true, channel: "shizuku(rish 兜底)", detail: "Shizuku 已授权（appId=" + appId + "）" };
+              }
+              return {
+                available: false,
+                channel: "shizuku(App 进程 / Shizuku API)",
+                detail: "App 通道失败：" + whyApp + "；rish 兜底也失败：" + (rr.stderr || rr.error || rr.stdout || "未知错误")
+              };
+            }
+            return { available: false, channel: "shizuku(App 进程 / Shizuku API)", detail: "App 通道失败：" + whyApp };
+          }
+        }
+        if (!dex) {
+          return { available: false, channel: "shizuku", detail: "SHIZUKU_DEX 未配置（App 未放出 rish dex，appId=" + appId + "）" };
+        }
+        const r = await shizukuCmd("echo __SHIZUKU_OK__", dex, appId, 10000);
+        if (r.ok && (r.stdout || "").includes("__SHIZUKU_OK__")) {
+          return { available: true, channel: "shizuku", detail: "Shizuku 已授权（appId=" + appId + "）" };
+        }
+        const why = r.stderr || r.error || r.stdout || "未知错误";
+        let hint = "";
+        if (/timeout|timed out/i.test(why)) {
+          hint = "；rish 等不到 Shizuku 响应。常见原因：① 本应用未在 Shizuku 里获得授权（请在本应用控制台「授予权限」里授权，并允许 Shizuku 弹窗）" +
+                 "② RISH_APPLICATION_ID 与实际包名不符（appId=" + appId + "）" +
+                 "③ ColorOS 拦住了 Shizuku 的授权弹窗 / Shizuku 被电池优化冻结";
+        }
+        return {
+          available: false,
+          channel: "shizuku",
+          detail: "Shizuku 通道实测失败（appId=" + appId + "）：" + why + hint
+        };
       }
-      const dex = process.env.SHIZUKU_DEX;
       if (!dex) return { available: false, channel: "none", detail: "root 与 Shizuku 均未授予" };
       const r = await shizukuCmd("echo __SHIZUKU_OK__", dex, process.env.SHIZUKU_APP_ID, 10000);
       const available = r.ok && r.stdout.includes("__SHIZUKU_OK__");
