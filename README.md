@@ -14,6 +14,8 @@
 - 🔀 **Root 优先，Shizuku 备用**（v1.4.0）：有 root 走 su 通道，无 root 走 Shizuku，自动选择
 - 👁️ **无障碍屏幕助手**（v1.7.0）：系统设置开启「DeepSeek Harness 屏幕助手」后，AI 能**读屏、点击、输入、滚动、无障碍截图理解**——**不需要 root / Shizuku**，与特权通道互补
 - 🖥️ **虚拟屏 vscreen**（v1.10+）：AI 可以创建一块**独立于主屏的真·虚拟屏**，把 App 启动进去、在里面点击/滑动/输入，**你的主屏照常用**；右上角悬浮窗**实时显示虚拟屏画面**（H.264 视频流，可拖动、可双指缩放），AI 在干什么全程可见。实现移植自开源项目 [Operit](https://github.com/AAswordman/Operit)（LGPL-3.0，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）
+- 🎛️ **原生控制台**（v1.12+）：冷启动先进 App 自己的控制台（**解压 / 权限 / 插件开关 / 日志** 四页），不必先等引擎起来；引擎状态判定全面重做——探测不再吃掉一次性 token、不再误报“未启动”、不会重复拉起两个引擎
+- 🔐 **Shizuku 通道改走 App 进程**（v1.13.1+）：特权命令执行从“引擎内 `rish` 子进程”改为**经 App 进程内的 Shizuku API**（新增本地 `/shell` 路由 + 随机令牌鉴权），根治手机上偶发的 `Request timeout. The connection between the current app … and Shizuku app …`
 - ⏰ **前台保活**（v1.4.0）：AI 干活时挂后台/锁屏不被杀，任务完成推送通知
 - 🔔 **AI 发通知**（v1.4.0）：只需通知权限，任务完成/需要关注时推送到通知栏
 - 🧠 **完整 DSH 内核**：`@deepseek-ai/dsh` **0.1.5-rc.1**（v1.11 升级），保留插件生态 + RPC API，前端用 DSH 原生界面
@@ -121,9 +123,9 @@
 
 下载 [Releases](https://github.com/woaiys3/deepseek-harness-android-app/releases) 里的 APK 安装即可：
 
-- **`DeepSeekHarness-official-v1.11.0.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
-- **`DeepSeekHarness-Lite-v1.11.0.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
-- **`DeepSeekHarness-compat-v1.11.0.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
+- **`DeepSeekHarness-official-v1.13.6.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
+- **`DeepSeekHarness-Lite-v1.13.6.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
+- **`DeepSeekHarness-compat-v1.13.6.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
 
 要求：
 - Android 7.0（API 24）及以上
@@ -131,6 +133,15 @@
 - API Key 在 App 内页面填写，只存本机，绝不打包进 APK
 
 > 🆘 **打不开 / 白屏 / 连接失败？** 先看 [启动排查](docs/启动排查.md)（常见问题都能自助解决）。
+
+## 🐞 遇到问题？日志在哪 / 怎么反馈
+
+- **v1.12 及以后（有控制台）**：打开 App → 控制台 →「日志」页 —— 「查看日志」看 `dsh-web.log` 末尾 200 行（可**截图**发来），「分享」把日志**以文件形式**发出（QQ / 微信 / 邮件都能选；启动失败时还会带上 `startup-diag.txt`）
+- **不用 App 也能取（v1.7.1 起，无需 root / adb）**：用文件管理器进手机存储根目录 ——
+  正式版 `/sdcard/DeepSeekHarness/dsh-web.log`、Lite 共存版 `/sdcard/DeepSeekHarnessLite/dsh-web.log`、兼容版 `/sdcard/DeepSeekHarnessCompat/dsh-web.log`；
+  启动失败时同目录另有 `startup-diag.txt`（错误 + 端口 + node 是否存活 + 日志尾部）
+- **v1.7.0 及更早**：既没有控制台也没有外部日志镜像 → 只能 `adb logcat | grep -i deepseek`（引擎日志在 App 私有目录，无 root 一般读不到）；建议先升级到 v1.12+
+- 反馈请附：**日志** + 机型 / Android 版本 + 用的哪个包（正式版 / Lite / 兼容版）+ 复现步骤
 
 ## 📁 目录结构
 
