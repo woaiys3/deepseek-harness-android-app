@@ -1,4 +1,50 @@
 /**
+ * v1.13 新增：Iterator Helpers polyfill。
+ * 背景：@deepseek-ai/dsh-client-ui-sidebar-documentpreview 的 client.js 顶层有
+ *   "function"!=typeof Iterator.prototype.join&&(Iterator.prototype.join=...)
+ * 而 Iterator 是 ES2025（Chrome/WebView 122+ 才有）。老 WebView 上 Iterator 未定义
+ * → 这一行直接 ReferenceError → 整个插件 import 失败 → 前端白页显示“Failed to load plugins”。
+ * （用户反馈的 GitHub 最新版 bug；在 WebView ≥122 的设备上不复现。）
+ * 位置：mobile.js 是 body 末尾的普通脚本，早于所有 module 脚本执行 —— 时机正确。
+ * 只补全树实际用到的 Iterator.prototype.join（已扫描：仅此一处用法）。
+ */
+(function () {
+  // 真实 %IteratorPrototype%（数组/字符串/Map/Set/生成器迭代器都继承它）
+  var iterProto = null;
+  try {
+    if (typeof Symbol !== 'undefined' && Symbol.iterator) {
+      iterProto = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+    }
+  } catch (e) { iterProto = null; }
+
+  function joinImpl(sep) {
+    sep = (sep === undefined) ? ',' : String(sep);
+    if (this == null || typeof this.next !== 'function') {
+      throw new TypeError('Iterator.prototype.join called on incompatible receiver');
+    }
+    var out = '', first = true, step;
+    while (!(step = this.next()).done) {
+      if (!first) out += sep;
+      first = false;
+      var v = step.value;
+      out += (v === null || v === undefined) ? '' : String(v);   // 与规范一致：null/undefined 当作空串
+    }
+    return out;
+  }
+
+  if (iterProto && typeof iterProto.join !== 'function') iterProto.join = joinImpl;
+
+  // 老 WebView 没有全局 Iterator：补一个占位，让 `typeof Iterator.prototype.join` 不抛
+  if (typeof window.Iterator === 'undefined') {
+    var It = function Iterator() { throw new TypeError('Iterator is not constructible'); };
+    if (iterProto) { It.prototype = iterProto; } else { It.prototype.join = joinImpl; }
+    window.Iterator = It;
+  } else if (window.Iterator.prototype && typeof window.Iterator.prototype.join !== 'function') {
+    window.Iterator.prototype.join = joinImpl;
+  }
+})();
+
+/**
  * 移动端软键盘适配 v0.3（对应 APK v1.3.1）
  * v0.2（历史）：VisualViewport + translateY 方案，竖屏横屏通用，
  *   rAF 节流 + 异常保护，暴露 --kb-height 供 CSS 使用。
