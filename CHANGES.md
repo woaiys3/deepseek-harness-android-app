@@ -1,3 +1,17 @@
+## v1.13.6（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
+
+> 接 v1.13.5：把「**升级用户**」那条路径也覆盖到 —— dex 收权在“文件已存在直接返回”分支也要做。
+> versionCode **33**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🐛 `extractRishDex()` 的“已存在”分支没收权（升级用户中招）
+- v1.13.5 只在**写出后**给 `files/rish/rish_shizuku.dex` 收权，而升级用户走的是
+  `if (dex.exists() && dex.length() > 0) return dex;` —— 旧版留下的 0666 副本不会被修。
+- 现该分支也调用 `secureDexPermissions(dex)`；加上解压收尾的 `secureDexFiles(payload)`（每次启动无条件跑），
+  「新装 / 覆盖升级 / App 自提」**三条路径全部覆盖**（本次只改 App Java，未动插件/payload/内核）。
+- 这是用户追问“不覆盖旧文件真的可以吗”逼出来的一处漏洞，已修。
+
+---
+
 ## v1.13.5（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
 
 > `payload/rish/rish_shizuku.dex` 权限是 0666 → Android 14+ 的 ART 拒绝加载可写 dex
