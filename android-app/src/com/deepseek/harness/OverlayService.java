@@ -389,8 +389,11 @@ public class OverlayService extends Service {
         }
     }
 
-    /** 探测引擎：请求首页并读完整页（≤256KB），含 <title>DeepSeek Harness</title> 才算运行中。
-     *  与 MainActivity.isDshEngine 同款检测，避免首页较大时旧 Socket 16KB 探测误判「未启动」。 */
+    /** 探测引擎是否在跑。
+     *  v1.13：0.1.5 起首页需要一次性 token —— 不带 token 返回 401 + 纯文本
+     *  “dsh web authentication required…”，带有效 token 返回 303 跳转；两种都说明“引擎在跑”。
+     *  旧实现只认首页 HTML 里的 <title>DeepSeek Harness</title>，于是引擎明明在跑（401）
+     *  也被判成“未运行” → 悬浮窗与常驻通知一直显示“未启动”（用户实测）。 */
     private boolean engineAlive(int port) {
         HttpURLConnection c = null;
         try {
@@ -398,7 +401,11 @@ public class OverlayService extends Service {
             c.setConnectTimeout(1200);
             c.setReadTimeout(1500);
             c.setRequestProperty("User-Agent", "dsh-overlay-probe");
+            // 不跟随重定向：303 就是“token 有效”，跟随反而会把 token 浪费掉
+            c.setInstanceFollowRedirects(false);
             int code = c.getResponseCode();
+            if (code == 303 || code == 302) return true;
+            if (code == 401) return bodyContains(c, "dsh web authentication required");
             if (code < 200 || code >= 500) return false;
             InputStream in = c.getInputStream();
             ByteArrayOutputStream body = new ByteArrayOutputStream();
@@ -415,6 +422,23 @@ public class OverlayService extends Service {
             return false;
         } finally {
             if (c != null) c.disconnect();
+        }
+    }
+
+    /** 读一小段响应正文（401 的正文在错误流里）。 */
+    private boolean bodyContains(HttpURLConnection c, String needle) {
+        try {
+            InputStream in = null;
+            try { in = c.getInputStream(); } catch (Throwable t) { in = c.getErrorStream(); }
+            if (in == null) return false;
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[2048];
+            int r;
+            while ((r = in.read(buf)) > 0 && out.size() < 8192) out.write(buf, 0, r);
+            try { in.close(); } catch (Throwable ignored) {}
+            return out.toString("UTF-8").contains(needle);
+        } catch (Throwable t) {
+            return false;
         }
     }
 
