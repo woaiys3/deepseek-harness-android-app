@@ -1,11 +1,15 @@
+# dsh-android-patch: v2
 # Android 兼容性 patch
 # 已修复：subprocess-local（node-pty → child_process；koffi 惰性加载）、
 #        attachment-local（sharp → 纯 JS 头解析 sharp-shim.js）、
 #        bash-local（sandboxMode 覆盖）、session-persistence-jsonl（link → rename）
-# 禁用依赖无法编译原生模块的插件（Pi-AI 模型适配器、sandbox、bash-sandbox）
+# 禁用依赖无法编译原生模块的插件（sandbox、bash-sandbox）
 # 用 bash-local（仅依赖 subprocess，已加 sandboxMode 兼容）替代 bash-sandbox 提供 ctx.shell
-- id: llm-pi-ai
-  disabled: true
+# v1.12：llm-pi-ai 取消禁用（旧版本误当它依赖原生模块）。
+# 0.1.5 树里 @earendil-works/pi-ai 纯 JS：5.7MB，openai / @anthropic-ai/sdk / @google/genai /
+# typebox 等依赖齐全，树内原生模块 0，实测可正常加载。
+# 它一旦被禁：设置 → 模型 取不到协议列表 →「添加提供方」永远置灰，
+# 且「自定义供应商」入口压根不渲染（见 CHANGES.md v1.12）。
 - id: sandbox
   disabled: true
 - id: bash-sandbox
