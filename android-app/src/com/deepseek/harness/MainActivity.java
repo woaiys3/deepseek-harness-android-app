@@ -156,6 +156,7 @@ public class MainActivity extends Activity {
     private View conBar, conFill, conSpacer;
     private Button conExBtn, conEnBtn, conEnRestart, conEnStop;
     private View conDetailBox;
+    private View dialogOverlay = null;   // 自绘弹窗的遮罩层（替代系统 AlertDialog）
     private final Runnable consoleTick = new Runnable() {
         @Override public void run() {
             if (!consoleVisible) return;
@@ -3955,14 +3956,13 @@ public class MainActivity extends Activity {
         if (title != null && title.length() > 0) box.addView(cText(title, 16f, cText(), true));
         if (content != null) box.addView(content, cTop(dp(12)));
 
-        final AlertDialog dlg = new AlertDialog.Builder(this).create();
         LinearLayout acts = new LinearLayout(this);
         acts.setOrientation(LinearLayout.HORIZONTAL);
         acts.setGravity(Gravity.RIGHT);
         if (negative != null) {
             Button nb = cButton(negative, false);
             nb.setOnClickListener(new View.OnClickListener() {
-                @Override public void onClick(View v) { dlg.dismiss(); }
+                @Override public void onClick(View v) { closeDialogOverlay(); }
             });
             acts.addView(nb);
         }
@@ -3970,7 +3970,7 @@ public class MainActivity extends Activity {
             Button pb = cButton(positive, true);
             pb.setOnClickListener(new View.OnClickListener() {
                 @Override public void onClick(View v) {
-                    dlg.dismiss();
+                    closeDialogOverlay();
                     if (onPositive != null) onPositive.run();
                 }
             });
@@ -3981,28 +3981,67 @@ public class MainActivity extends Activity {
         }
         box.addView(acts, cTop(dp(18)));
 
-        dlg.setView(box);
-        dlg.show();
-        try {
-            if (dlg.getWindow() != null) {
-                // 关键：窗口背景**全透明**，让卡片自己的圆角成为唯一轮廓；
-                // 再清掉系统对话框默认的内边距/最小宽度，否则那层“外框”又回来了。
-                dlg.getWindow().setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
-                android.view.View decor = dlg.getWindow().getDecorView();
-                if (decor instanceof android.view.ViewGroup) {
-                    ((android.view.ViewGroup) decor).setPadding(0, 0, 0, 0);
-                }
-                dlg.getWindow().setLayout(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        // 改用 Activity 内自绘浮层（见 showDialogOverlay 注释），
+        // 不再走系统 AlertDialog —— 它会把主题的深色圆角面板画在卡片外面。
+        showDialogOverlay(box);
+    }
+
+    /**
+     * 把弹窗做成 Activity 自己视图树里的浮层，而不是系统对话框窗口。
+     *
+     * 症状：弹窗卡片外面还套着一层深色圆角框（用户截图可见）。
+     * 成因：AlertDialog 的面板背景来自 Activity 主题（Theme.Black 的 alertDialogTheme），
+     *   那层 frame 画在 **对话框布局自己身上**，只把 *窗口* 背景设成透明并不管用
+     *   （旧代码就是把窗口背景设透明，所以外框一直在）。
+     * 做法：自绘「遮罩 + 圆角卡片」，不经过任何系统对话框窗口 —— 没有主题面板，
+     *   也就没有外框；顺带把圆角/边距/点空白取消都握在自己手里。
+     */
+    private void showDialogOverlay(View card) {
+        closeDialogOverlay();
+        FrameLayout host = null;
+        try { host = (FrameLayout) findViewById(android.R.id.content); } catch (Throwable ignored) {}
+        if (host == null || card == null) return;
+        card.setClickable(true);                 // 卡片自己吃掉点击，避免点卡片也被当成“点空白”
+        final FrameLayout scrim = new FrameLayout(this);
+        scrim.setBackgroundColor(0xB3000000);    // 70% 黑遮罩（原系统对话框的 dim 观感）
+        scrim.setClickable(true);
+        scrim.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { closeDialogOverlay(); }   // 点空白 = 取消
+        });
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        lp.gravity = Gravity.CENTER;
+        lp.leftMargin = dp(20);
+        lp.rightMargin = dp(20);
+        scrim.addView(card, lp);
+        // 内容再高也不超过屏幕 80%（历史日志弹窗等），超出部分由内容自己的 ScrollView 滚
+        scrim.post(new Runnable() {
+            @Override public void run() {
+                try {
+                    View c = scrim.getChildAt(0);
+                    if (c == null) return;
+                    int maxH = Math.round(getResources().getDisplayMetrics().heightPixels * 0.8f);
+                    if (c.getHeight() > maxH) {
+                        ViewGroup.LayoutParams p = c.getLayoutParams();
+                        p.height = maxH;
+                        c.setLayoutParams(p);
+                    }
+                } catch (Throwable ignored) {}
             }
-        } catch (Throwable ignored) {}
-        // 外层留出与屏幕边缘的呼吸距离（真正的对话框边距，不是面板边框）
+        });
+        host.addView(scrim, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        dialogOverlay = scrim;
+    }
+
+    /** 关掉当前自绘弹窗（没有则什么都不做）；按钮回调与返回键共用。 */
+    private void closeDialogOverlay() {
+        View v = dialogOverlay;
+        dialogOverlay = null;
+        if (v == null) return;
         try {
-            android.view.ViewGroup.LayoutParams lp = box.getLayoutParams();
-            if (lp instanceof LinearLayout.LayoutParams) {
-                ((LinearLayout.LayoutParams) lp).setMargins(dp(20), 0, dp(20), 0);
-                box.setLayoutParams(lp);
-            }
+            ViewGroup p = (ViewGroup) v.getParent();
+            if (p != null) p.removeView(v);
         } catch (Throwable ignored) {}
     }
 
@@ -5035,6 +5074,8 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
+        // 自绘弹窗优先吃掉返回键（等同“取消”），避免返回键穿透到下层
+        if (dialogOverlay != null) { closeDialogOverlay(); return; }
         // v1.12：控制台内的返回先回控制台首页，再退出
         if (consoleVisible) {
             if (consolePage != 0) { consolePage = 0; renderConsole(); return; }
