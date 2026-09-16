@@ -41,6 +41,7 @@ import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
+import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
@@ -136,6 +137,8 @@ public class MainActivity extends Activity {
     public static volatile boolean overlayForeground = true;
 
     private WebView webView;
+    /** v1.13.11：页面实测背景色（0 = 还没取到，壳底色用 cBg() 兜底）。见 refreshPageBackground()。 */
+    private volatile int pageBgColor = 0;
 
     // ---- v1.12 控制台（冷启动首页，原生界面）----
     private FrameLayout engineRoot;                // WebView + 启动浮层 + 控制台的共同根容器
@@ -209,6 +212,11 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
+        // v1.13.11：主题必须按系统深浅色二选一（且必须在 super.onCreate 之前）。
+        // WebView 的 prefers-color-scheme 只认主题的 android:isLightTheme，不看系统 uiMode
+        // （详见 res/values/styles.xml 里 AppTheme.Light 的注释）——
+        // 壳用深色主题时，浅色系统下前端「跟随系统」也会被判成深色。
+        setTheme(isDark() ? R.style.AppTheme : R.style.AppTheme_Light);
         super.onCreate(savedInstanceState);
         enginePort = defaultEnginePort(this); // 三版本各自独立端口（见 defaultEnginePort）
         applyStatusBar(); // 状态栏/导航栏底色跟随 App 主题（浅色模式不再是一条黑条）
@@ -229,7 +237,7 @@ public class MainActivity extends Activity {
         ws.setBuiltInZoomControls(false);
         ws.setDisplayZoomControls(false);
         ws.setTextZoom(100);
-        webView.setBackgroundColor(Color.parseColor("#0b0f1a"));
+        webView.setBackgroundColor(chromeBg()); // v1.13.11：跟随主题（浅色模式下不再是深色闪屏）
         checkWebViewCompat(); // WebView 兼容检测：老内核提示引导（DSH 前端需 Chromium 80+）
         webView.setWebViewClient(new android.webkit.WebViewClient() {
             private int errorRetries = 0;
@@ -250,6 +258,15 @@ public class MainActivity extends Activity {
             @Override
             public void onPageFinished(WebView view, String url) {
                 errorRetries = 0;
+                // v1.13.11：页面底色决定状态栏/导航栏颜色（前端主题可独立于系统设置），
+                // 且主题可能在页面挂载后才被前端插件应用 → 多试几次，取到即刷新。
+                final int[] delays = {0, 700, 2000, 5000};
+                for (int i = 0; i < delays.length; i++) {
+                    final int d = delays[i];
+                    view.postDelayed(new Runnable() {
+                        @Override public void run() { refreshPageBackground(); }
+                    }, d);
+                }
             }
         });
 
@@ -278,8 +295,8 @@ public class MainActivity extends Activity {
 
         statusView = new TextView(this);
         statusView.setText("正在启动 DeepSeek Harness…");
-        statusView.setTextColor(Color.parseColor("#e6edf3"));
-        statusView.setTextSize(15);
+        statusView.setTextColor(cSub());
+        statusView.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_body));
         statusView.setGravity(Gravity.CENTER);
         statusView.setPadding(dp(24), dp(12), dp(24), dp(12));
 
@@ -442,7 +459,7 @@ public class MainActivity extends Activity {
     private void showEngineScreen() {
         if (engineRoot == null) engineRoot = new FrameLayout(this);
         FrameLayout root = engineRoot;
-        root.setBackgroundColor(Color.parseColor("#0b0f1a"));
+        root.setBackgroundColor(chromeBg()); // v1.13.11：跟随主题/页面底色
         // 成员视图（webView/statusView/progressBar）可能已挂在旧容器上，先全部摘下，避免重复挂载崩溃。
         detachView(webView);
         detachView(statusView);
@@ -465,8 +482,8 @@ public class MainActivity extends Activity {
         // 品牌名
         splashBrand = new TextView(this);
         splashBrand.setText("DeepSeek Harness");
-        splashBrand.setTextColor(Color.parseColor("#f0f6fc"));
-        splashBrand.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+        splashBrand.setTextColor(cText());
+        splashBrand.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_title));
         splashBrand.setTypeface(null, android.graphics.Typeface.BOLD);
         splashBrand.setGravity(Gravity.CENTER);
         LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(
@@ -507,36 +524,110 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 状态栏/导航栏底色跟随主题（跟随系统深/浅色，与 cBg() 一致），
-     * 浅色模式配深色图标（SYSTEM_UI_FLAG_LIGHT_STATUS_BAR），深色模式配浅色图标。
-     * 旧实现只在 styles.xml 里写死 #0b0f1a → 浅色主题下状态栏是一条黑条。
+     * v1.13.11：修「状态栏不显示」「状态栏没有沉浸」两个问题，实现要点有三：
+     * ① **颜色之前根本没生效**。父主题 Theme.Black.NoTitleBar 是 Holo 时代主题，
+     *   不设 windowDrawsSystemBarBackgrounds → Window 上缺 FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS，
+     *   于是 setStatusBarColor()/setNavigationBarColor() 全是空操作（Holo 主题默认色是纯黑）：
+     *   实测顶栏恒为 #000000，而浅色模式下又给了 SYSTEM_UI_FLAG_LIGHT_STATUS_BAR（深色图标）
+     *   → 深色图标画在纯黑条上 = 时间/信号/电池全看不见。这就是「状态栏不显示」。
+     *   现在显式 addFlags(FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)，颜色才真正落地。
+     * ② 底色不再固定用 cBg()，而优先用**页面实测背景色**（refreshPageBackground()）：
+     *   DSH 前端底色实测 #151517，与壳底色 #0b0f1a 并不相同 → 状态栏会与页面割裂成一条色带，
+     *   观感上就是「没有沉浸」。取到页面真实底色后，状态栏/导航栏与页面同色，视觉上无缝。
+     * ③ 图标深浅按**底色亮度**判定，而不是按系统深浅色判定：用户在前端手动选「浅色/深色」时
+     *   系统设置并不跟着变，只有按底色亮度算才不会出现「浅底配白图标」。
      */
     private void applyStatusBar() {
+        applySystemBars(chromeBg());
+    }
+
+    /** 壳的界面底色：优先用页面实测底色，未取到（启动页/控制台）时用主题底色。 */
+    private int chromeBg() {
+        return pageBgColor != 0 ? pageBgColor : cBg();
+    }
+
+    private void applySystemBars(int barColor) {
         try {
-            boolean dark = isDark();
-            int bar = Color.parseColor(dark ? "#0b0f1a" : "#f7f8fb");
-            getWindow().setStatusBarColor(bar);
-            getWindow().setNavigationBarColor(bar);
-            android.view.View decor = getWindow().getDecorView();
+            android.view.Window w = getWindow();
+            w.addFlags(android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
+            w.setStatusBarColor(barColor);
+            w.setNavigationBarColor(barColor);
+            android.view.View decor = w.getDecorView();
             int flags = decor.getSystemUiVisibility();
-            if (dark) flags &= ~android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
-            else flags |= android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            boolean lightBar = isLightColor(barColor);
+            if (lightBar) flags |= android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            else          flags &= ~android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            if (Build.VERSION.SDK_INT >= 26) {
+                if (lightBar) flags |= android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+                else          flags &= ~android.view.View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            }
             decor.setSystemUiVisibility(flags);
         } catch (Throwable ignored) {}
     }
 
+    /** 底色是否偏亮 —— 决定状态栏/导航栏图标用深色还是浅色。 */
+    private boolean isLightColor(int color) {
+        double lum = 0.299 * Color.red(color) + 0.587 * Color.green(color) + 0.114 * Color.blue(color);
+        return lum > 140d;
+    }
+
+    /**
+     * 读页面实测背景色并刷新状态栏/导航栏与壳底色。
+     * 页面主题由 DSH 前端自己的偏好决定（light/dark/system），与壳的系统深浅色**不一定一致**，
+     * 所以只能从页面实际渲染结果里取，不能靠猜。
+     */
+    private void refreshPageBackground() {
+        if (webView == null) return;
+        try {
+            webView.evaluateJavascript(
+                "(function(){try{return getComputedStyle(document.body).backgroundColor||''}catch(e){return ''}})()",
+                new android.webkit.ValueCallback<String>() {
+                    @Override public void onReceiveValue(String v) {
+                        final int c = parseCssColor(v);
+                        if (c == 0 || c == pageBgColor) return;
+                        pageBgColor = c;
+                        applyStatusBar();
+                        if (engineRoot != null) engineRoot.setBackgroundColor(c);
+                        if (webView != null) webView.setBackgroundColor(c);
+                    }
+                });
+        } catch (Throwable ignored) {}
+    }
+
+    /** 解析 "rgb(r, g, b)" / "rgba(r, g, b, a)"；透明或解析失败返回 0（交给主题底色兜底）。 */
+    private int parseCssColor(String css) {
+        try {
+            if (css == null || css.indexOf("rgb") < 0) return 0;
+            int a = css.indexOf('('), b = css.indexOf(')');
+            if (a < 0 || b <= a) return 0;
+            String[] parts = css.substring(a + 1, b).split(",");
+            if (parts.length < 3) return 0;
+            int r = (int) Float.parseFloat(parts[0].trim());
+            int g = (int) Float.parseFloat(parts[1].trim());
+            int bl = (int) Float.parseFloat(parts[2].trim());
+            int al = 255;
+            if (parts.length >= 4) al = Math.round(Float.parseFloat(parts[3].trim()) * 255f);
+            if (al < 8) return 0;   // 全透明取不到底色
+            return Color.argb(al, r, g, bl);
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
 
     // ============ 界面主题色（跟随系统深/浅色，权限页与加载页共用）============
+    // 取色入口：颜色值统一定义在 res/values/colors.xml（配色/主题统一管理），
+    // 这里按主题挑对应的资源；代码其他位置禁止再写死十六进制颜色。
     private boolean isDark() {
         int m = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
         return m == Configuration.UI_MODE_NIGHT_YES;
     }
-    private int cBg() { return Color.parseColor(isDark() ? "#0b0f1a" : "#f7f8fb"); }
-    private int cCard() { return Color.parseColor(isDark() ? "#161c2a" : "#ffffff"); }
-    private int cText() { return Color.parseColor(isDark() ? "#e6edf3" : "#1f2328"); }
-    private int cSub() { return Color.parseColor(isDark() ? "#8b98a9" : "#6b7280"); }
-    private int cGreen() { return Color.parseColor("#1f9d6b"); }
-    private int cRed() { return Color.parseColor("#d9503f"); }
+    private int cBg() { return getColor(isDark() ? R.color.shell_bg_dark : R.color.shell_bg_light); }
+    private int cCard() { return getColor(isDark() ? R.color.shell_card_dark : R.color.shell_card_light); }
+    private int cText() { return getColor(isDark() ? R.color.text_on_dark : R.color.text_on_light); }
+    private int cSub() { return getColor(isDark() ? R.color.sub_on_dark : R.color.sub_on_light); }
+    private int cGreen() { return getColor(R.color.status_green); }
+    private int cRed() { return getColor(R.color.status_red); }
 
     private long deleteRecursive(File f) {
         if (f == null || !f.exists()) return 0;
@@ -564,15 +655,21 @@ public class MainActivity extends Activity {
             String abi = Build.SUPPORTED_ABIS[0];
             boolean arm64 = abi.startsWith("arm64") || abi.contains("arm64-v8a");
             if (arm64) return; // 支持，正常继续
-            // 32 位设备：引擎（node arm64 二进制）无法运行，提示但不阻止（用户可能知道自己在做什么）
+            // 非 arm64 设备：引擎（node arm64 二进制）无法原生运行，提示但不阻止。
+            // 用 Toast 轻提示且只提示一次（SharedPreferences 记录）：原来是模态 AlertDialog，
+            // 真机 arm64 根本不会触发，而 x86_64 模拟器上每次切主题/旋转重建 Activity 都弹一次，
+            // 遮住操作还很吵（用户要求改成 Toast 式提示）。
+            // 位宽用 Process.is64Bit() 如实描述（API 23+，minSdk 24 可直接用），别猜。
+            SharedPreferences sp = getSharedPreferences(PREFS, MODE_PRIVATE);
+            if (sp.getBoolean("abi_warned", false)) return;
+            sp.edit().putBoolean("abi_warned", true).apply();
+            final String abiDesc = (android.os.Process.is64Bit() ? "64 位 " : "32 位 ") + abi;
             ui.post(new Runnable() {
                 @Override public void run() {
                     try {
-                        new AlertDialog.Builder(MainActivity.this)
-                                .setTitle("设备架构不受支持")
-                                .setMessage("当前设备为 32 位（" + abi + "），而 DSH 引擎仅支持 64 位（arm64）。\n\nAI 引擎可能无法启动，建议更换 64 位设备使用。")
-                                .setNegativeButton("知道了", null)
-                                .show();
+                        Toast.makeText(MainActivity.this,
+                                "设备架构为 " + abiDesc + "，DSH 引擎仅提供 arm64 版本，AI 引擎可能无法启动",
+                                Toast.LENGTH_LONG).show();
                     } catch (Throwable ignored) {}
                 }
             });
@@ -2893,6 +2990,11 @@ public class MainActivity extends Activity {
                 }
             }
 
+            // v1.13.11：用户文件（settings.yaml / .credentials.yaml）任何模式都只在缺失时写入。
+            // 「重新解压」走的是 mode="internal"（无 skipIfExists 保护）→ 会把模型配置覆盖回开发机模板，
+            // 这就是「每次重新解压丢配置」的直接原因。
+            if (!skipIfExists && isDshhomeUserFile(name) && target.exists()) skipIfExists = true;
+
             if (skipIfExists) {
                 zis.closeEntry();
                 updateProgress(processed, total, written);
@@ -2967,14 +3069,31 @@ public class MainActivity extends Activity {
     }
 
     // dshhome 里随 APK 更新的官方配置文件（凭证 .credentials.yaml、会话数据 storages/ 等不在内）。
+    // ⚠ settings.yaml **不在此列**：它存的是用户自己填的模型/供应商配置
+    //   （llm-pi-ai.providers.*、agent-default-model 等），属用户数据。
+    //   曾被列在这里 → 每次「重新解压」/覆盖安装都被 APK 里的开发机模板覆盖掉，
+    //   表现为「模型配置莫名为空、要重填」（用户实测报障）。
     private static final String[] DSHHOME_CONFIG_PATHS = {
         "dshhome/cordis.patch.yml",
-        "dshhome/settings.yaml",
         "dshhome/profiles/web/cordis.patch.yml",
         "dshhome/profiles/web/cordis.yml",
         "dshhome/profiles/web/package.json",
         "dshhome/profiles/web/pnpm-workspace.yaml"
     };
+
+    // dshhome 里属于**用户**的文件：只在「不存在」时写入，任何解压模式都不得覆盖。
+    // 双保险：extractPayload（写盘）与 refreshInternalConfig（配置刷新）两处都拦。
+    private static final String[] DSHHOME_USER_PATHS = {
+        "dshhome/settings.yaml",
+        "dshhome/.credentials.yaml"
+    };
+
+    private boolean isDshhomeUserFile(String name) {
+        for (String p : DSHHOME_USER_PATHS) {
+            if (p.equals(name)) return true;
+        }
+        return false;
+    }
 
     // 重装后把 dshhome 的官方配置文件从 payload.zip 覆盖到内部（凭证/会话保留）。
     private void refreshInternalConfig(File payload) throws IOException {
@@ -2990,6 +3109,8 @@ public class MainActivity extends Activity {
                 if (name.equals(p)) { isConfig = true; break; }
             }
             if (!isConfig) { zis.closeEntry(); continue; }
+            // 用户文件永不覆盖（settings.yaml 等）：只补官方配置文件
+            if (isDshhomeUserFile(name)) { zis.closeEntry(); continue; }
             File target = new File(payload, name);
             File parent = target.getParentFile();
             if (parent != null && !parent.exists() && !parent.mkdirs()) throw new IOException("mkdir failed: " + parent);
@@ -3509,7 +3630,7 @@ public class MainActivity extends Activity {
     private long conRootProbeTs = 0L;
 
     private int cLine() { return Color.parseColor(isDark() ? "#232a38" : "#e5e7eb"); }
-    private int cAccent() { return Color.parseColor("#4d6bfe"); }
+    private int cAccent() { return getColor(R.color.accent_brand); }
 
     private File payloadDir() { return new File(getFilesDir(), "payload"); }
 

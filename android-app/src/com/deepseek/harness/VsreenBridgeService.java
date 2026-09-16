@@ -98,12 +98,13 @@ public class VsreenBridgeService extends Service {
     private volatile float lastAspect = 0f;
     /** 用户点了 ✕ 关掉的虚拟屏 displayId —— 轮询别再自动把它弹回来。 */
     private volatile int previewDismissedDisplayId = Integer.MIN_VALUE;
-    /** 预览窗是否已最小化（只留一条按钮栏）。 */
-    private volatile boolean previewCollapsed = false;
-    /** 最小化前记住的画面高度，展开时恢复。 */
-    private volatile int previewExpandedH = 0;
-    /** 最小化/展开按钮（文案在 ▾ / ▴ 之间切换）。 */
-    private Button previewFoldBtn = null;
+    /**
+     * v1.13.11：预览窗被「收起到小鲸鱼」（▾）—— 轮询同样不要自动弹回来，
+     * 但语义与 ✕ 不同：虚拟屏仍在跑，用户可从桌面小鲸鱼面板把预览窗叫回来。
+     */
+    private volatile boolean previewCollapsedToWhale = false;
+    /** v1.13.11：服务实例（供小鲸鱼面板回调「重新打开预览窗」）。 */
+    private static volatile VsreenBridgeService instance = null;
 
     private void showPreviewWindow() {
         try {
@@ -145,19 +146,17 @@ public class VsreenBridgeService extends Service {
 
             // 原来预览窗只有「拖动 + 双指缩放」，界面上**没有任何关闭/缩小的入口**，
             // 用户只能干看着它悬在屏幕上挡着（想关只能让 AI 调 android_vscreen_close）。
-            // 现在在右上角加三个小钮：✕ 关闭预览、− 缩小、＋ 放大（拖动 / 双指缩放照旧可用）。
+            // v1.13.11：两个钮的语义按用户要求改成 —— ✕ 销毁/停止虚拟屏、▾ 收起到小鲸鱼。
             LinearLayout ctl = new LinearLayout(this);
             ctl.setOrientation(LinearLayout.HORIZONTAL);
             ctl.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
             ctl.addView(previewButton("✕", new Runnable() { @Override public void run() {
-                // 记下“是用户主动关的”：轮询发现虚拟屏还在跑时不要再自动弹回来（换一块虚拟屏会重新弹）
-                previewDismissedDisplayId = vdDisplayId;
-                hidePreviewWindow();
+                destroyVscreen();
             }}));
-            // 最小化/展开（只留这条按钮栏，画面收起；再点一次恢复）
-            previewFoldBtn = previewButton("▾", new Runnable() { @Override public void run() { togglePreviewCollapsed(); } });
-            ctl.addView(previewFoldBtn);
-            // 缩放不加按钮：双指捏合已经能缩放（用户要求），按钮栏只保留 关闭 / 最小化
+            ctl.addView(previewButton("▾", new Runnable() { @Override public void run() {
+                collapsePreviewToWhale();
+            }}));
+            // 缩放不加按钮：双指捏合已经能缩放（用户要求），按钮栏保留 关闭 / 收起到小鲸鱼
             FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
             clp.gravity = Gravity.TOP | Gravity.END;
@@ -180,7 +179,7 @@ public class VsreenBridgeService extends Service {
                     // 最小化时不响应双指缩放；缩放后统一走 clampPreviewBounds()
                     //（旧实现只在一处夹边界，双指放大就能把窗口撑到屏幕外，
                     //  于是右上角的按钮条被推出屏幕 → 用户看到的就是“控制条没有出现”）
-                    if (previewLp == null || previewCollapsed) return true;
+                    if (previewLp == null || previewCollapsedToWhale) return true;
                     float f = detector.getScaleFactor();
                     previewLp.width = Math.max(dp(120), Math.round(previewLp.width * f));
                     previewLp.height = Math.max(barHeightPx(), Math.round(previewLp.height * f));
@@ -279,7 +278,7 @@ public class VsreenBridgeService extends Service {
             final int maxH = Math.max(barHeightPx(), Math.round(usableH * 0.7f));
             if (previewLp.width > maxW) previewLp.width = maxW;
             if (previewLp.width < dp(120)) previewLp.width = dp(120);
-            int minH = previewCollapsed ? barHeightPx() : dp(110);
+            int minH = dp(110);
             if (previewLp.height > maxH) previewLp.height = maxH;
             if (previewLp.height < minH) previewLp.height = minH;
             if (previewLp.x > screenW - previewLp.width) previewLp.x = screenW - previewLp.width;
@@ -306,29 +305,68 @@ public class VsreenBridgeService extends Service {
     /** 最小化时保留的高度：一条按钮栏 + 上下留白。 */
     private int barHeightPx() { return dp(40); }
 
-    /** 最小化 / 展开（只收起画面，窗户本身还在，虚拟屏照常运行）。 */
-    private void togglePreviewCollapsed() {
-        previewHandler.post(new Runnable() {
-            @Override public void run() {
+    /**
+     * v1.13.11：预览窗 ✕ = **销毁/停止虚拟屏**。
+     * 旧实现只是「关窗」—— 虚拟屏还继续跑着，想停只能让 AI 调 android_vscreen_close，
+     * 与按钮语义不符（用户明确要求改成销毁/停止）。现在先请求特权服务端 /vscreen/close，
+     * 再收掉预览窗；请求失败如实提示，不假装成功。
+     */
+    private void destroyVscreen() {
+        final int closingId = vdDisplayId;
+        new Thread(new Runnable() { @Override public void run() {
+            final String r = coreGet("/vscreen/close", 8000);
+            previewHandler.post(new Runnable() { @Override public void run() {
                 try {
-                    if (previewLp == null || previewImageView == null) return;
-                    if (!previewCollapsed) {
-                        previewExpandedH = previewLp.height;
-                        previewCollapsed = true;
-                        previewImageView.setVisibility(View.GONE);
-                        previewLp.height = barHeightPx();
-                        if (previewFoldBtn != null) previewFoldBtn.setText("▴");
-                    } else {
-                        previewCollapsed = false;
-                        previewImageView.setVisibility(View.VISIBLE);
-                        previewLp.height = previewExpandedH > 0 ? previewExpandedH : dp(430);
-                        if (previewFoldBtn != null) previewFoldBtn.setText("▾");
-                    }
-                    clampPreviewBounds();
-                    updatePreviewLayout();
+                    // 记下「这块屏是用户主动销毁的」：轮询看到旧 id 时不要再弹回来
+                    previewDismissedDisplayId = closingId;
+                    previewCollapsedToWhale = false;
+                    vdDisplayId = -1;
+                    hidePreviewWindow();
+                    OverlayService.pinForVscreen(false);
+                    toast(r == null ? "关闭虚拟屏失败（特权服务无响应）" : "虚拟屏已关闭");
                 } catch (Throwable ignored) {}
-            }
-        });
+            }});
+        }}, "vscreen-close").start();
+    }
+
+    /**
+     * v1.13.11：预览窗 ▾ = **收起到小鲸鱼**。
+     * 旧实现是缩成一条按钮栏（仍占着屏幕）；现在直接收掉预览悬浮窗，改由桌面小鲸鱼承载画面
+     * （小鲸鱼面板里本来就有虚拟屏画面区），并把它**钉住可见** —— App 在前台时小鲸鱼默认隐藏
+     * （MainActivity.onStart → setOverlayVisible(false)），不钉住的话「收起」之后什么都看不到。
+     */
+    private void collapsePreviewToWhale() {
+        previewHandler.post(new Runnable() { @Override public void run() {
+            try {
+                previewCollapsedToWhale = true;
+                previewDismissedDisplayId = vdDisplayId;   // 别让预览轮询又把它弹回来
+                hidePreviewWindow();
+                OverlayService.pinForVscreen(true);
+                toast("预览已收到小鲸鱼，点小鲸鱼可再打开");
+            } catch (Throwable ignored) {}
+        }});
+    }
+
+    /** v1.13.11：从小鲸鱼面板重新打开预览窗（配合「收起到小鲸鱼」）。 */
+    public static void showPreviewFromWhale() {
+        VsreenBridgeService s = instance;
+        if (s != null) s.doShowPreviewFromWhale();
+    }
+
+    private void doShowPreviewFromWhale() {
+        try {
+            previewDismissedDisplayId = Integer.MIN_VALUE;
+            previewCollapsedToWhale = false;
+            OverlayService.pinForVscreen(false);
+            showPreviewWindow();
+        } catch (Throwable ignored) {}
+    }
+
+    /** 浮层上的短提示（预览窗是 FLAG_NOT_FOCUSABLE，弹不出对话框）。 */
+    private void toast(String msg) {
+        try {
+            android.widget.Toast.makeText(getApplicationContext(), msg, android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Throwable ignored) {}
     }
 
     private void hidePreviewWindow() {
@@ -342,9 +380,6 @@ public class VsreenBridgeService extends Service {
                     previewImageView = null;
                     previewWm = null;
                     previewWindowVisible = false;
-                    previewCollapsed = false;    // 下次建窗从展开态开始
-                    previewExpandedH = 0;
-                    previewFoldBtn = null;
                     if (lastPreviewBitmap != null) {
                         lastPreviewBitmap.recycle();
                         lastPreviewBitmap = null;
@@ -435,7 +470,6 @@ public class VsreenBridgeService extends Service {
                     int maxH = Math.round(getResources().getDisplayMetrics().heightPixels * 0.8f);
                     int minH = dp(110);
                     int h = Math.min(Math.max(Math.round(previewLp.width * aspect), minH), maxH);
-                    if (previewCollapsed) { previewExpandedH = h; return; }   // 最小化时只记住高度
                     if (previewLp.height != h) {
                         previewLp.height = h;
                         updatePreviewLayout();
@@ -463,6 +497,7 @@ public class VsreenBridgeService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;   // v1.13.11：供小鲸鱼面板回调「重新打开预览窗」
         running = true;
         new Thread(new Runnable() {
             @Override public void run() { ensureCoreServer(); }
@@ -485,6 +520,7 @@ public class VsreenBridgeService extends Service {
     @Override
     public void onDestroy() {
         running = false;
+        instance = null;
         stopPreviewPolling();
         hidePreviewWindow();
         if (serverSocket != null) { try { serverSocket.close(); } catch (Throwable ignored) {} }

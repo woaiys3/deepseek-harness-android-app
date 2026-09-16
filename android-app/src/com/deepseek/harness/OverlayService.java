@@ -16,6 +16,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -86,6 +87,14 @@ public class OverlayService extends Service {
     private float touchX, touchY, startX, startY;
     private boolean dragging = false;
     private boolean panelVisible = false;
+    /** v1.13.11：悬浮图标当前吸附在右边？由拖动松手时的 snapToEdge() 决定。 */
+    private boolean snappedRight = false;
+    /** v1.13.11：贴边时与屏幕边缘留的间隙（dp），避免被圆角/曲面边缘裁掉。 */
+    private static final int EDGE_MARGIN = 4;
+    /** v1.13.11：App 在前台 → 悬浮窗应隐藏（由 MainActivity.onStart/onStop 维护）。 */
+    private boolean foregroundWantsHidden = true;
+    /** v1.13.11：被虚拟屏预览「收起到小鲸鱼」钉住 —— 优先于前台隐藏。 */
+    private volatile boolean vscreenPinned = false;
     /** 探测计数：每 PROBE_MS 探测一次引擎；每 3 次（约 6 秒）顺带拉一次会话信息 */
     private int probeCount = 0;
     private volatile boolean lastSessionRunning = false;
@@ -134,7 +143,8 @@ public class OverlayService extends Service {
         buildOverlay();
         addToWindow();
         // 前后台联动：App 前台时隐藏悬浮窗（不挡界面），退后台时显示
-        applyVisible(!MainActivity.overlayForeground);
+        foregroundWantsHidden = MainActivity.overlayForeground;   // v1.13.11：改为记状态再统一应用
+        applyVisibleNow();
         handler.postDelayed(probeRunnable, 200);
     }
 
@@ -214,21 +224,21 @@ public class OverlayService extends Service {
         panelView.setOrientation(LinearLayout.VERTICAL);
         panelView.setPadding(dp(4), dp(4), dp(4), dp(2));
         GradientDrawable pbg = new GradientDrawable();
-        pbg.setColor(0xE61A2140);              // 深蓝半透明
+        pbg.setColor(getColor(R.color.panel_bg));   // 深蓝半透明（colors.xml 统一管理）
         pbg.setCornerRadius(dp(16));
         panelView.setBackground(pbg);
 
         statusText = new TextView(this);
         statusText.setText("状态：检测中…");
-        statusText.setTextColor(0xFFE8EDFF);
-        statusText.setTextSize(12);
+        statusText.setTextColor(getColor(R.color.panel_text_bright));
+        statusText.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_caption));
         panelView.addView(statusText);
 
         // AI 回复状态（session.list 的 running 字段，每 ~6 秒刷新）
         aiText = new TextView(this);
         aiText.setText("AI：—");
-        aiText.setTextColor(0xFF9DB4FF);
-        aiText.setTextSize(12);
+        aiText.setTextColor(getColor(R.color.panel_text_dim));
+        aiText.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_caption));
         panelView.addView(aiText);
 
         // v1.9 虚拟屏预览（默认隐藏）：悬浮窗实时显示虚拟屏画面
@@ -245,19 +255,26 @@ public class OverlayService extends Service {
         panelView.addView(vscreenImageView);
 
         portText = new TextView(this);
-        portText.setText("端口：: " + enginePort);
-        portText.setTextColor(0xFF9DB4FF);
-        portText.setTextSize(12);
+        portText.setText("端口：" + enginePort);
+        portText.setTextColor(getColor(R.color.panel_text_dim));
+        portText.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_caption));
         panelView.addView(portText);
 
-        // 按钮行
-        LinearLayout btnRow = new LinearLayout(this);
-        btnRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams brp = new LinearLayout.LayoutParams(
+        // 按钮区：2×2 两行网格（weight 均分宽度）。原来是 4 个按钮挤一行，
+        // 加「虚拟屏」后 1080px 宽的屏上「关闭」被挤出屏幕外（实测截图 p4_panel.png）。
+        LinearLayout btnGrid = new LinearLayout(this);
+        btnGrid.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams bgp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        brp.topMargin = dp(6);
-        btnRow.setLayoutParams(brp);
+        bgp.topMargin = dp(6);
+        btnGrid.setLayoutParams(bgp);
+
+        LinearLayout btnRow1 = new LinearLayout(this);
+        btnRow1.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout btnRow2 = new LinearLayout(this);
+        btnRow2.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
 
         Button openBtn = smallButton("打开应用");
         openBtn.setOnClickListener(new View.OnClickListener() {
@@ -267,29 +284,34 @@ public class OverlayService extends Service {
                 try { startActivity(i); } catch (Throwable ignored) {}
             }
         });
-        btnRow.addView(openBtn);
+        btnRow1.addView(openBtn, gridCellLp());
+
+        // v1.13.11：虚拟屏预览窗被「收起到小鲸鱼」后的回程入口 ——
+        // 不看这个出口的话「收起」就等于把预览永久关掉（用户会以为功能坏了）。
+        Button vsBtn = smallButton("虚拟屏");
+        vsBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) {
+                try { VsreenBridgeService.showPreviewFromWhale(); } catch (Throwable ignored) {}
+                setPanelVisible(false);
+            }
+        });
+        btnRow1.addView(vsBtn, gridCellLp());
 
         Button collapseBtn = smallButton("收起");
         collapseBtn.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { setPanelVisible(false); }
         });
-        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        cp.leftMargin = dp(6);
-        collapseBtn.setLayoutParams(cp);
-        btnRow.addView(collapseBtn);
+        btnRow2.addView(collapseBtn, gridCellLp());
 
         Button closeBtn = smallButton("关闭");
         closeBtn.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { stopSelf(); }
         });
-        LinearLayout.LayoutParams xp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        xp.leftMargin = dp(6);
-        closeBtn.setLayoutParams(xp);
-        btnRow.addView(closeBtn);
+        btnRow2.addView(closeBtn, gridCellLp());
 
-        panelView.addView(btnRow);
+        btnGrid.addView(btnRow1, rowLp);
+        btnGrid.addView(btnRow2, rowLp);
+        panelView.addView(btnGrid);
         rootView.addView(panelView);
         setPanelVisible(false);
 
@@ -315,7 +337,9 @@ public class OverlayService extends Service {
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
-                        if (!dragging && System.currentTimeMillis() - downAt < 400) {
+                        if (dragging) {
+                            snapToEdge();   // v1.13.11：拖完自动吸到最近的左右边缘
+                        } else if (System.currentTimeMillis() - downAt < 400) {
                             setPanelVisible(!panelVisible);
                         }
                         return true;
@@ -329,11 +353,65 @@ public class OverlayService extends Service {
         });
     }
 
+    /**
+     * v1.13.11：悬浮小鲸鱼自动贴边 —— 拖动松手后吸到最近的屏幕左/右边缘，
+     * 不再停在屏幕中间挡内容（用户报「图标要手动摆，摆完还挡着字」）。
+     * 纵向只做越界夹取，不吸附，保留用户选的高度。
+     */
+    private void snapToEdge() {
+        try {
+            if (lp == null || rootView == null) return;
+            int screenH = getResources().getDisplayMetrics().heightPixels;
+            int w = rootView.getWidth() > 0 ? rootView.getWidth() : dp(40);
+            int h = rootView.getHeight() > 0 ? rootView.getHeight() : dp(40);
+            snappedRight = (lp.x + w / 2) > getResources().getDisplayMetrics().widthPixels / 2;
+            lp.x = edgeXFor(w);
+            if (lp.y < 0) lp.y = 0;
+            if (lp.y > screenH - h) lp.y = Math.max(0, screenH - h);
+            wm.updateViewLayout(rootView, lp);
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * v1.13.11：展开面板后控件变宽 —— 贴右边缘时会把面板推出屏幕外。
+     * 展开时夹回可见范围，收起时还原到贴边位置。（与悬浮预览窗的 clampPreviewBounds 同一思路。）
+     */
+    private void clampPanelOnScreen() {
+        try {
+            if (lp == null || rootView == null) return;
+            int w = rootView.getWidth();
+            if (w <= 0) return;
+            if (!panelVisible) {
+                lp.x = edgeXFor(w);
+            } else {
+                int maxX = getResources().getDisplayMetrics().widthPixels - w - dp(EDGE_MARGIN);
+                if (lp.x > maxX) lp.x = Math.max(dp(EDGE_MARGIN), maxX);
+            }
+            wm.updateViewLayout(rootView, lp);
+        } catch (Throwable ignored) {}
+    }
+
+    /** 贴边坐标：snappedRight 决定靠哪边。 */
+    private int edgeXFor(int viewWidth) {
+        int screenW = getResources().getDisplayMetrics().widthPixels;
+        return snappedRight ? Math.max(dp(EDGE_MARGIN), screenW - viewWidth - dp(EDGE_MARGIN))
+                            : dp(EDGE_MARGIN);
+    }
+
+    /** 2×2 按钮网格的单格参数：weight 均分剩余宽度，格间留 6dp 间距。 */
+    private LinearLayout.LayoutParams gridCellLp() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        lp.leftMargin = dp(3);
+        lp.rightMargin = dp(3);
+        return lp;
+    }
+
     private Button smallButton(String text) {
         Button b = new Button(this);
         b.setText(text);
-        b.setTextSize(12);
-        b.setTextColor(0xFF4D6BFE);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_caption));
+        b.setTextColor(getColor(R.color.accent_brand));
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0xFFFFFFFF);
         bg.setCornerRadius(dp(12));
@@ -353,18 +431,45 @@ public class OverlayService extends Service {
             lp.width = WindowManager.LayoutParams.WRAP_CONTENT;
             lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
             try { wm.updateViewLayout(rootView, lp); } catch (Throwable ignored) {}
+            // v1.13.11：布局落定后再夹一次（展开后面板更宽，贴右边缘会被推出屏幕）
+            if (rootView != null) {
+                rootView.post(new Runnable() { @Override public void run() { clampPanelOnScreen(); } });
+            }
         }
     }
 
     /** 悬浮窗整体可见性（App 前台隐藏、退后台显示；服务常驻只切视图）。 */
     public static void setOverlayVisible(boolean show) {
         OverlayService s = instance;
-        if (s != null) s.applyVisible(show);
+        if (s != null) { s.foregroundWantsHidden = !show; s.applyVisibleNow(); }
     }
 
-    private void applyVisible(boolean show) {
+    /**
+     * v1.13.11：把桌面小鲸鱼钉住可见（虚拟屏预览「收起到小鲸鱼」用）。
+     * App 在前台时小鲸鱼默认是隐藏的；预览收起后画面改由小鲸鱼承载，
+     * 这时必须强制可见，否则用户点完「收起」什么都看不到。
+     * @param pin true=钉住可见并开始拉虚拟屏画面；false=解除，恢复前后台联动
+     */
+    public static void pinForVscreen(boolean pin) {
+        OverlayService s = instance;
+        if (s != null) s.applyVscreenPin(pin);
+    }
+
+    private void applyVscreenPin(boolean pin) {
         try {
-            if (rootView != null) rootView.setVisibility(show ? View.VISIBLE : View.GONE);
+            vscreenPinned = pin;
+            applyVisibleNow();
+            if (pin) startVscreenPreview();
+            else stopVscreenPreview();
+        } catch (Throwable ignored) {}
+    }
+
+    /** 实际可见性 = 钉住 or 未被前台隐藏。 */
+    private void applyVisibleNow() {
+        try {
+            if (rootView != null) {
+                rootView.setVisibility((vscreenPinned || !foregroundWantsHidden) ? View.VISIBLE : View.GONE);
+            }
         } catch (Throwable ignored) {}
     }
 

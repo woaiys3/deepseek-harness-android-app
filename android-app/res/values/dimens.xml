@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 壳的常用字号：原生界面的 setTextSize 一律引用这里的 dimen，不再散落写死。
+     新增字号前先看能不能复用这四档。 -->
+<resources>
+    <dimen name="text_title">22sp</dimen>    <!-- 启动页品牌名 -->
+    <dimen name="text_body">15sp</dimen>    <!-- 启动页状态、正文 -->
+    <dimen name="text_caption">12sp</dimen> <!-- 鲸鱼面板状态/按钮 -->
+</resources>

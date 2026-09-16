@@ -14,6 +14,37 @@
       按主题（跟随系统深/浅色）在运行时设置，否则浅色模式下会是一条黑条。
     -->
     <style name="AppTheme" parent="@android:style/Theme.Black.NoTitleBar">
-        <item name="android:windowBackground">#0b0f1a</item>
+        <item name="android:windowBackground">@color/shell_bg_dark</item>
+        <!-- Holo 时代的默认对话框是经典深色，但观感太旧；显式指定 Material 深色对话框 -->
+        <item name="android:alertDialogTheme">@android:style/Theme.Material.Dialog.Alert</item>
+    </style>
+
+    <!--
+      v1.13.11：浅色主题。MainActivity.onCreate() 按系统深浅色 setTheme() 二选一。
+
+      为什么必须换主题、而不能只改状态栏颜色：
+      WebView 的 prefers-color-scheme **完全**由主题的 android:isLightTheme 决定 ——
+      Chromium 的 AwDarkMode::UpdatePreferredColorScheme() 里
+      prefers_dark_from_theme_ = IsAppUsingDarkTheme()，
+      而 Java 侧 AwDarkMode.isAppUsingDarkTheme() 的实现是
+      DarkModeHelper.getLightTheme(context) == LIGHT_THEME_FALSE，
+      即只读主题的 isLightTheme 属性，**完全不看系统 uiMode**
+      （android_webview/browser/aw_dark_mode.cc:80-83、DarkModeHelper.java）。
+      框架里只有两个样式声明了这个属性：Theme = false、Theme.Light = true，
+      其余（Theme.Black / Theme.Material / DeviceDefault）全部继承。
+      所以只要壳用 Theme.Black.*，系统即使是浅色，WebView 也一律上报 dark →
+      DSH 前端「跟随系统」（boot 脚本里 matchMedia('(prefers-color-scheme: dark)')）
+      永远解析成深色，「跟随系统」形同虚设。这是「主题跟随系统无效」的根因。
+
+      模拟器实测：系统 cmd uimode night = no，页面仍渲染深色；同时抓服务端渲染出的
+      boot 脚本为 const preference = "system" → 证明偏好本身是 system，是解析结果错了。
+    -->
+    <style name="AppTheme.Light" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">@color/shell_bg_light</item>
+        <!-- 修「浅色主题下原生 AlertDialog 仍是深色」：Theme.Light（Holo）的
+             alertDialogTheme 仍指向经典深色对话框 → 浅色模式里弹窗黑底白字。
+             显式指定 Material 浅色对话框（壳里有 7 处平台 AlertDialog：WebView 过旧 /
+             ABI 提示 / AI 工作区 / 目录不可用 / 系统特权 / Shizuku 授权×2）。 -->
+        <item name="android:alertDialogTheme">@android:style/Theme.Material.Light.Dialog.Alert</item>
     </style>
 </resources>
