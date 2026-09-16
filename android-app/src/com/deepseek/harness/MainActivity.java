@@ -290,9 +290,12 @@ public class MainActivity extends Activity {
         rishDex = extractRishDex();
         vscreenDex = extractVscreenDex();
         // 虚拟屏接入桥：启动 Operit server + HTTP->binder 转发（插件走 8999）
+        // 原实现用反射按包名拼类名（getPackageName() + ".VsreenBridgeService"）——
+        //   API 包名一改（本项目另有 Lite / 兼容版等只改 manifest 包名的变体），
+        //   拼出来的类名就找不到 → ClassNotFoundException → 桥服务根本没起来 → 预览窗永远不出现。
+        // 改用类字面量即与包名解耦（manifest 里的组件名仍由变体构建脚本展开成绝对包名）。
         try {
-            Class<?> bCls = Class.forName(getPackageName() + ".VsreenBridgeService");
-            startService(new Intent(this, bCls));
+            startService(new Intent(this, VsreenBridgeService.class));
         } catch (Throwable t) {
             Log.w(TAG, "start VsreenBridgeService failed", t);
         }
