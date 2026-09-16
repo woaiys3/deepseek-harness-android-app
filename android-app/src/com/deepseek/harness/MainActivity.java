@@ -212,11 +212,11 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
-        // v1.13.11：主题必须按系统深浅色二选一（且必须在 super.onCreate 之前）。
+        // v1.13.11：主题必须先定（且必须在 super.onCreate 之前）。
         // WebView 的 prefers-color-scheme 只认主题的 android:isLightTheme，不看系统 uiMode
         // （详见 res/values/styles.xml 里 AppTheme.Light 的注释）——
-        // 壳用深色主题时，浅色系统下前端「跟随系统」也会被判成深色。
-        setTheme(isDark() ? R.style.AppTheme : R.style.AppTheme_Light);
+        // v1.13.12 起主题可在控制台选「跟随系统/浅色/深色」，不再只能跟系统。
+        setTheme(themePrefersDark() ? R.style.AppTheme : R.style.AppTheme_Light);
         super.onCreate(savedInstanceState);
         enginePort = defaultEnginePort(this); // 三版本各自独立端口（见 defaultEnginePort）
         applyStatusBar(); // 状态栏/导航栏底色跟随 App 主题（浅色模式不再是一条黑条）
@@ -267,8 +267,43 @@ public class MainActivity extends Activity {
                         @Override public void run() { refreshPageBackground(); }
                     }, d);
                 }
+                // v1.13.12：让页面把底色变化主动推给壳（用户在前端里切深浅色时状态栏能跟着变，
+                // 不再只靠页面加载时的几次采样）。注入 MutationObserver，主题 class/属性一变就上报。
+                try {
+                    view.evaluateJavascript(
+                        "(function(){try{if(window.__dshBgWatch)return;window.__dshBgWatch=1;"
+                        + "function opaque(s){return s&&!/rgba?\\([^)]*,\\s*0\\s*\\)/.test(s);}"
+                        + "function cur(){var b='';try{b=getComputedStyle(document.body).backgroundColor||''}catch(e){}"
+                        + "if(opaque(b))return b;var h='';try{h=getComputedStyle(document.documentElement).backgroundColor||''}catch(e){}"
+                        + "return opaque(h)?h:b;}"
+                        + "function push(){try{if(window.dshshell&&dshshell.onBg)dshshell.onBg(cur())}catch(e){}}"
+                        + "var t=null;function soon(){if(t)return;t=setTimeout(function(){t=null;push()},250);}"
+                        + "try{new MutationObserver(soon).observe(document.documentElement,"
+                        + "{attributes:true,attributeFilter:['class','style','data-theme','color-scheme']})}catch(e){}"
+                        + "document.addEventListener('transitionend',soon,true);"
+                        + "push();setTimeout(push,800);setTimeout(push,2500);}catch(e){}})()",
+                        null);
+                } catch (Throwable ignored) {}
             }
         });
+
+        // v1.13.12：页面 → 壳的底色上报通道（配合上面注入的观察器；只暴露一个只读回调）
+        try {
+            webView.addJavascriptInterface(new Object() {
+                @android.webkit.JavascriptInterface
+                public void onBg(String css) {
+                    final int c = parseCssColor(css);
+                    if (c == 0) return;
+                    ui.post(new Runnable() { @Override public void run() {
+                        if (c == pageBgColor) return;
+                        pageBgColor = c;
+                        applyStatusBar();
+                        if (engineRoot != null) engineRoot.setBackgroundColor(c);
+                        if (webView != null) webView.setBackgroundColor(c);
+                    }});
+                }
+            }, "dshshell");
+        } catch (Throwable ignored) {}
 
         // 附件/文件选择：官方前端用 <input type="file"> 选文件，Android WebView 必须实现
         // onShowFileChooser 才会弹系统文件选择器，否则点「添加附件」没有任何反应。
@@ -515,7 +550,9 @@ public class MainActivity extends Activity {
 
     /** 退出确认对话框（浮动按钮与系统返回键共用） */
     private void confirmExit() {
-        conDialog("退出 DeepSeek Harness", "确定要退出吗？服务器将停止运行。", "退出", new Runnable() {
+        // v1.13.12 文案纠偏：退出只是关掉本界面，引擎 node 进程是独立子进程，会在后台继续运行
+        // （这正是"手机当服务器"的设计意图，不需要停）。旧文案"服务器将停止运行"与实际行为不符。
+        conDialog("退出 DeepSeek Harness", "确定要退出吗？界面会关闭，服务器将在后台继续运行。", "退出", new Runnable() {
             @Override public void run() {
                 stopKeepAliveService(); // 用户主动退出：停止保活服务
                 finish();
@@ -579,8 +616,11 @@ public class MainActivity extends Activity {
     private void refreshPageBackground() {
         if (webView == null) return;
         try {
+            // body 透明（全透明底）时退回 <html> 的底色 —— 有些前端把底色画在根元素上
             webView.evaluateJavascript(
-                "(function(){try{return getComputedStyle(document.body).backgroundColor||''}catch(e){return ''}})()",
+                "(function(){try{function op(s){return s&&!/rgba?\\([^)]*,\\s*0\\s*\\)/.test(s);}"
+                + "var b=getComputedStyle(document.body).backgroundColor||'';if(op(b))return b;"
+                + "var h=getComputedStyle(document.documentElement).backgroundColor||'';return op(h)?h:''}catch(e){return ''}})()",
                 new android.webkit.ValueCallback<String>() {
                     @Override public void onReceiveValue(String v) {
                         final int c = parseCssColor(v);
@@ -619,8 +659,57 @@ public class MainActivity extends Activity {
     // 取色入口：颜色值统一定义在 res/values/colors.xml（配色/主题统一管理），
     // 这里按主题挑对应的资源；代码其他位置禁止再写死十六进制颜色。
     private boolean isDark() {
+        return themePrefersDark();
+    }
+
+    // ---- v1.13.12 主题设置（跟随系统 / 浅色 / 深色）----
+    // 之前壳只能跟随系统深浅色；前端"跟随系统"又是看 App 主题的 isLightTheme 属性，
+    // 用户想白天用深色也没办法。现在主题偏好在控制台可设，onCreate 按偏好选主题，
+    // WebView 的 prefers-color-scheme 自然跟着偏好走（机制见 styles.xml 的注释）。
+    /** 0=跟随系统 1=浅色 2=深色 */
+    public static final int THEME_SYSTEM = 0, THEME_LIGHT = 1, THEME_DARK = 2;
+
+    private int themeMode() {
+        try {
+            return getSharedPreferences(PREFS, MODE_PRIVATE).getInt("theme_mode", THEME_SYSTEM);
+        } catch (Throwable t) { return THEME_SYSTEM; }
+    }
+
+    /** 主题偏好解析出的"是否深色"：浅色偏好恒 false，深色偏好恒 true，跟随系统才看系统 uiMode。 */
+    private boolean themePrefersDark() {
+        int mode = themeMode();
+        if (mode == THEME_LIGHT) return false;
+        if (mode == THEME_DARK) return true;
         int m = getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK;
         return m == Configuration.UI_MODE_NIGHT_YES;
+    }
+
+    private String themeModeLabel(int mode) {
+        if (mode == THEME_LIGHT) return "浅色";
+        if (mode == THEME_DARK) return "深色";
+        return "跟随系统";
+    }
+
+    /** 控制台「主题」行弹出的三选一对话框；选择后重建 Activity 使主题立即生效。 */
+    private void conThemeDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        int cur = themeMode();
+        for (int i = 0; i <= 2; i++) {
+            final int mode = i;
+            TextView row = cText(themeModeLabel(i) + (i == cur ? "  ✓" : ""), 14f, cText(), false);
+            row.setPadding(0, dp(12), 0, dp(12));
+            row.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    closeDialogOverlay();
+                    if (mode == themeMode()) return;
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt("theme_mode", mode).apply();
+                    recreate(); // 主题（含 WebView 的 prefers-color-scheme）随 onCreate 重新生效
+                }
+            });
+            box.addView(row);
+        }
+        conDialogView("界面主题", box, null, null, "关闭");
     }
     private int cBg() { return getColor(isDark() ? R.color.shell_bg_dark : R.color.shell_bg_light); }
     private int cCard() { return getColor(isDark() ? R.color.shell_card_dark : R.color.shell_card_light); }
@@ -825,296 +914,385 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void showPermissionScreen() {
-        permRows.clear();
+    // ============ 首次使用 · 翻页式权限引导（v1.13.12 重做） ============
+    // 旧版是一屏 9 行权限列表，用户不知道每项是干什么的、也不能跳过某一项。
+    // 现在改成翻页式：一页只讲一个权限（它做什么 / 授权后能得到什么 / 当前状态），
+    // 每页都可以「跳过」，走完再统一「开始使用」。返回键/重进时按 setup_done 判断不再进入。
 
-        ScrollView scroll = new ScrollView(this);
-        scroll.setBackgroundColor(cBg());
+    /** 引导页的一页。 */
+    private static class GuidePage {
+        String title;            // 权限名
+        String desc;             // 这个权限是做什么的（页面上显示给用户看）
+        String actionLabel;      // 授权按钮文案
+        StatusProvider provider; // 是否已授权
+        View.OnClickListener action; // 授权动作
+    }
 
-        LinearLayout col = new LinearLayout(this);
-        col.setOrientation(LinearLayout.VERTICAL);
-        col.setPadding(dp(24), dp(20), dp(24), dp(24));
-        scroll.addView(col, new ScrollView.LayoutParams(
-                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
+    private final java.util.ArrayList<GuidePage> guidePages = new java.util.ArrayList<GuidePage>();
+    private int guideIndex = 0;                 // 当前页（== guidePages.size() 时是最后的完成页）
+    private LinearLayout guideBody = null;      // 页面内容区（每页重建）
+    private TextView guideDots = null;          // 顶部进度文字（第 X / N 步）
+    private Button guidePrevBtn = null, guideNextBtn = null;
+    private TextView guideSkipBtn = null;
+    private Button guideActionBtn = null;       // 当前页的授权按钮（授权回来后要刷新成"已授权"）
 
-        // 标题
-        TextView title = new TextView(this);
-        title.setText("首次使用 · 配置手机权限");
-        title.setTextColor(cText());
-        title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
-        title.setTypeface(null, android.graphics.Typeface.BOLD);
-        col.addView(title);
+    /** 定义每一页（顺序即翻页顺序，与旧列表一致）。 */
+    private void buildGuidePages() {
+        guidePages.clear();
 
-        TextView subtitle = new TextView(this);
-        subtitle.setText("在进入 DeepSeek Harness 之前，请先授权以下能力。\n配好后点底部「开始使用」才会解压运行时。");
-        subtitle.setTextColor(cSub());
-        subtitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
-        subtitle.setPadding(0, dp(8), 0, dp(16));
-        col.addView(subtitle);
+        GuidePage p1 = new GuidePage();
+        p1.title = "存储权限"; p1.actionLabel = "去授权";
+        p1.desc = "读写手机上的文件：导入/导出内容、把 AI 生成的文件存到手机、写日志与运行数据。\n\n不给的话，AI 无法保存任何文件。";
+        p1.provider = new StatusProvider() { @Override public boolean granted() {
+            return checkSelfPermission("android.permission.READ_EXTERNAL_STORAGE") == PackageManager.PERMISSION_GRANTED
+                    && checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") == PackageManager.PERMISSION_GRANTED;
+        }};
+        p1.action = new View.OnClickListener() { @Override public void onClick(View v) {
+            requestPermissions(new String[]{
+                    "android.permission.READ_EXTERNAL_STORAGE",
+                    "android.permission.WRITE_EXTERNAL_STORAGE"}, REQ_STORAGE);
+        }};
+        guidePages.add(p1);
 
-        // 权限项
-        addPermRow(col, "存储权限", "读写手机文件、导入导出内容。",
-                new StatusProvider() {
-                    @Override public boolean granted() {
-                        return checkSelfPermission("android.permission.READ_EXTERNAL_STORAGE") == PackageManager.PERMISSION_GRANTED
-                                && checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") == PackageManager.PERMISSION_GRANTED;
-                    }
-                },
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        requestPermissions(new String[]{
-                                "android.permission.READ_EXTERNAL_STORAGE",
-                                "android.permission.WRITE_EXTERNAL_STORAGE"}, REQ_STORAGE);
-                    }
-                });
-
-        addPermRow(col, "所有文件访问", "访问手机所有文件（Android 11 及以上需单独授权，11 以下由存储权限覆盖）。",
-                new StatusProvider() {
-                    @Override public boolean granted() {
-                        if (Build.VERSION.SDK_INT >= 30) {
-                            return Environment.isExternalStorageManager();
-                        } else {
-                            return checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") == PackageManager.PERMISSION_GRANTED;
-                        }
-                    }
-                },
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        if (Build.VERSION.SDK_INT >= 30) {
-                            try {
-                                Intent i = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
-                                i.setData(Uri.parse("package:" + getPackageName()));
-                                startActivity(i);
-                            } catch (Exception e) {
-                                try {
-                                    startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
-                                } catch (Exception e2) {
-                                    Log.w(TAG, "无法打开所有文件访问设置", e2);
-                                }
-                            }
-                        } else {
-                            requestPermissions(new String[]{
-                                    "android.permission.READ_EXTERNAL_STORAGE",
-                                    "android.permission.WRITE_EXTERNAL_STORAGE"}, REQ_STORAGE);
-                        }
-                    }
-                });
-
-        addPermRow(col, "悬浮窗", "让 AI 和工具能在其它应用之上显示内容。",
-                new StatusProvider() {
-                    @Override public boolean granted() { return Settings.canDrawOverlays(MainActivity.this); }
-                },
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        openSystemSetting(Settings.ACTION_MANAGE_OVERLAY_PERMISSION);
-                    }
-                });
-
-        addPermRow(col, "修改系统设置", "允许读写系统设置（亮度、音量、常亮等）。",
-                new StatusProvider() {
-                    @Override public boolean granted() { return Settings.System.canWrite(MainActivity.this); }
-                },
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        openSystemSetting(Settings.ACTION_MANAGE_WRITE_SETTINGS);
-                    }
-                });
-
-        addPermRow(col, "使用情况访问", "查看应用使用时长与统计信息。",
-                new StatusProvider() {
-                    @Override public boolean granted() {
-                        AppOpsManager ops = (AppOpsManager) getSystemService(Context.APP_OPS_SERVICE);
-                        int mode = ops.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), getPackageName());
-                        return mode == AppOpsManager.MODE_ALLOWED;
-                    }
-                },
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        openSystemSetting(Settings.ACTION_USAGE_ACCESS_SETTINGS);
-                    }
-                });
-
-        addPermRow(col, "安装未知来源应用", "允许安装 APK（侧载、AI 帮你装应用）。",
-                new StatusProvider() {
-                    @Override public boolean granted() {
-                        if (Build.VERSION.SDK_INT < 26) return true;
-                        return getPackageManager().canRequestPackageInstalls();
-                    }
-                },
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        openSystemSetting(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES);
-                    }
-                });
-
-        addPermRow(col, "忽略电池优化", "后台常驻不被系统杀掉（保持服务在线）。",
-                new StatusProvider() {
-                    @Override public boolean granted() {
-                        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                        return pm.isIgnoringBatteryOptimizations(getPackageName());
-                    }
-                },
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        openSystemSetting(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                    }
-                });
-
-        addPermRow(col, "通知权限", "接收 AI 完成、提醒等通知。",
-                new StatusProvider() {
-                    @Override public boolean granted() {
-                        if (Build.VERSION.SDK_INT < 33) return true;
-                        return checkSelfPermission("android.permission.POST_NOTIFICATIONS") == PackageManager.PERMISSION_GRANTED;
-                    }
-                },
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        if (Build.VERSION.SDK_INT >= 33) {
-                            if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
-                                requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIFICATION);
-                            } else {
-                                // 已授权，跳到应用通知设置
-                                try {
-                                    Intent i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
-                                    i.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
-                                    startActivity(i);
-                                } catch (Exception e) {
-                                    openSystemSetting(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
-                                }
-                            }
-                        } else {
-                            openSystemSetting(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
-                        }
-                    }
-                });
-
-        addPermRow(col, "Shizuku / Root 特权（可选）", "不授权也能正常使用：文件读写、预览、编辑只需「所有文件访问」权限。授权后可让 AI 执行系统级操作（安装/卸载应用、改系统设置、模拟点击等）。",
-                new StatusProvider() {
-                    @Override public boolean granted() {
-                        // 只读缓存：root 探测在后台线程执行（probeShizuku），不在主线程跑 su
-                        return (shizukuOk != null && shizukuOk) || (rootOk != null && rootOk);
-                    }
-                },
-                new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        showShizukuDialog();
-                    }
-                });
-
-        // ===== AI 工作区（可选）：选择外部共享存储文件夹作为 AI 文件操作的工作根目录 =====
-        LinearLayout wsRow = new LinearLayout(this);
-        wsRow.setOrientation(LinearLayout.HORIZONTAL);
-        wsRow.setGravity(Gravity.CENTER_VERTICAL);
-        wsRow.setPadding(dp(16), dp(14), dp(16), dp(14));
-        wsRow.setBackgroundColor(cCard());
-        LinearLayout.LayoutParams wslp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        wslp.bottomMargin = dp(10);
-        wsRow.setLayoutParams(wslp);
-
-        LinearLayout wsLeft = new LinearLayout(this);
-        wsLeft.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams wsllp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        wsLeft.setLayoutParams(wsllp);
-
-        TextView wsTitle = new TextView(this);
-        wsTitle.setText("AI 工作区（可选）");
-        wsTitle.setTextColor(cText());
-        wsTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
-        wsTitle.setTypeface(null, android.graphics.Typeface.BOLD);
-        wsLeft.addView(wsTitle);
-
-        workspaceDescView = new TextView(this);
-        workspaceDescView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        workspaceDescView.setTextColor(cSub());
-        workspaceDescView.setPadding(0, dp(3), 0, 0);
-        wsLeft.addView(workspaceDescView);
-
-        wsRow.addView(wsLeft);
-        wsRow.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { onWorkspaceRowClick(); }
-        });
-        col.addView(wsRow);
-
-        // 开始使用按钮
-        Button start = new Button(this);
-        start.setText("开始使用");
-        start.setTextColor(Color.WHITE);
-        start.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-        start.setBackgroundColor(Color.parseColor("#4d6bfe"));
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(52));
-        lp.topMargin = dp(20);
-        start.setLayoutParams(lp);
-        start.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("setup_done", true).apply();
-                showEngineScreen();
-                startEngine();
+        GuidePage p2 = new GuidePage();
+        p2.title = "所有文件访问"; p2.actionLabel = "去授权";
+        p2.desc = "访问手机上所有文件（Android 11 及以上需要单独授权，11 以下由存储权限覆盖）。\n\nAI 读写你的项目文件、整理文档都靠它。";
+        p2.provider = new StatusProvider() { @Override public boolean granted() {
+            if (Build.VERSION.SDK_INT >= 30) {
+                return Environment.isExternalStorageManager();
+            } else {
+                return checkSelfPermission("android.permission.WRITE_EXTERNAL_STORAGE") == PackageManager.PERMISSION_GRANTED;
             }
-        });
-        col.addView(start);
+        }};
+        p2.action = new View.OnClickListener() { @Override public void onClick(View v) {
+            if (Build.VERSION.SDK_INT >= 30) {
+                try {
+                    Intent i = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
+                    i.setData(Uri.parse("package:" + getPackageName()));
+                    startActivity(i);
+                } catch (Exception e) {
+                    try {
+                        startActivity(new Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION));
+                    } catch (Exception e2) {
+                        Log.w(TAG, "无法打开所有文件访问设置", e2);
+                    }
+                }
+            } else {
+                requestPermissions(new String[]{
+                        "android.permission.READ_EXTERNAL_STORAGE",
+                        "android.permission.WRITE_EXTERNAL_STORAGE"}, REQ_STORAGE);
+            }
+        }};
+        guidePages.add(p2);
 
-        TextView skip = new TextView(this);
-        skip.setText("部分权限可稍后在系统设置中开启");
-        skip.setTextColor(cSub());
-        skip.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        skip.setGravity(Gravity.CENTER);
-        skip.setPadding(0, dp(10), 0, 0);
-        col.addView(skip);
+        GuidePage p3 = new GuidePage();
+        p3.title = "悬浮窗"; p3.actionLabel = "去授权";
+        p3.desc = "在其它应用之上显示内容：桌面小鲸鱼状态窗、虚拟屏预览窗都靠它。\n\n不给的话没有小鲸鱼，也看不到虚拟屏画面。";
+        p3.provider = new StatusProvider() { @Override public boolean granted() {
+            return Settings.canDrawOverlays(MainActivity.this);
+        }};
+        p3.action = new View.OnClickListener() { @Override public void onClick(View v) {
+            openSystemSetting(Settings.ACTION_MANAGE_OVERLAY_PERMISSION);
+        }};
+        guidePages.add(p3);
 
-        setContentView(scroll);
-        refreshAllStatuses();
+        GuidePage p4 = new GuidePage();
+        p4.title = "修改系统设置"; p4.actionLabel = "去授权";
+        p4.desc = "允许读写系统设置，比如调亮度、音量、保持屏幕常亮。\n\nAI 帮你改设置时需要；不给只是这类操作不可用。";
+        p4.provider = new StatusProvider() { @Override public boolean granted() {
+            return Settings.System.canWrite(MainActivity.this);
+        }};
+        p4.action = new View.OnClickListener() { @Override public void onClick(View v) {
+            openSystemSetting(Settings.ACTION_MANAGE_WRITE_SETTINGS);
+        }};
+        guidePages.add(p4);
+
+        GuidePage p5 = new GuidePage();
+        p5.title = "使用情况访问"; p5.actionLabel = "去授权";
+        p5.desc = "查看应用使用时长与统计信息，AI 才能回答\"我今天用了多久微信\"这类问题。\n\n不给的话应用使用统计相关功能不可用。";
+        p5.provider = new StatusProvider() { @Override public boolean granted() {
+            AppOpsManager ops = (AppOpsManager) getSystemService(Context.APP_OPS_SERVICE);
+            int mode = ops.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), getPackageName());
+            return mode == AppOpsManager.MODE_ALLOWED;
+        }};
+        p5.action = new View.OnClickListener() { @Override public void onClick(View v) {
+            openSystemSetting(Settings.ACTION_USAGE_ACCESS_SETTINGS);
+        }};
+        guidePages.add(p5);
+
+        GuidePage p6 = new GuidePage();
+        p6.title = "安装未知来源应用"; p6.actionLabel = "去授权";
+        p6.desc = "允许安装 APK：侧载应用、AI 帮你下载并安装应用时需要。\n\n不给的话 AI 无法替你安装应用。";
+        p6.provider = new StatusProvider() { @Override public boolean granted() {
+            if (Build.VERSION.SDK_INT < 26) return true;
+            return getPackageManager().canRequestPackageInstalls();
+        }};
+        p6.action = new View.OnClickListener() { @Override public void onClick(View v) {
+            openSystemSetting(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES);
+        }};
+        guidePages.add(p6);
+
+        GuidePage p7 = new GuidePage();
+        p7.title = "忽略电池优化"; p7.actionLabel = "去授权";
+        p7.desc = "让本应用在后台常驻、不被系统提前杀掉 —— 引擎要一直在跑，这是稳定在线的前提。\n\n强烈建议授权；不给的话切后台后引擎可能被杀。";
+        p7.provider = new StatusProvider() { @Override public boolean granted() {
+            PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+            return pm.isIgnoringBatteryOptimizations(getPackageName());
+        }};
+        p7.action = new View.OnClickListener() { @Override public void onClick(View v) {
+            openSystemSetting(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
+        }};
+        guidePages.add(p7);
+
+        GuidePage p8 = new GuidePage();
+        p8.title = "通知权限"; p8.actionLabel = "去授权";
+        p8.desc = "接收 AI 完成、定时提醒等通知，人不在应用里也能知道任务跑完了。\n\n不给的话收不到这些提醒（其它功能不受影响）。";
+        p8.provider = new StatusProvider() { @Override public boolean granted() {
+            if (Build.VERSION.SDK_INT < 33) return true;
+            return checkSelfPermission("android.permission.POST_NOTIFICATIONS") == PackageManager.PERMISSION_GRANTED;
+        }};
+        p8.action = new View.OnClickListener() { @Override public void onClick(View v) {
+            if (Build.VERSION.SDK_INT >= 33) {
+                if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+                    requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_NOTIFICATION);
+                } else {
+                    try {
+                        Intent i = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+                        i.putExtra(Settings.EXTRA_APP_PACKAGE, getPackageName());
+                        startActivity(i);
+                    } catch (Exception e) {
+                        openSystemSetting(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+                    }
+                }
+            } else {
+                openSystemSetting(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+            }
+        }};
+        guidePages.add(p8);
+
+        GuidePage p9 = new GuidePage();
+        p9.title = "Shizuku / Root 特权（可选）"; p9.actionLabel = "去配置";
+        p9.desc = "授权后 AI 可以执行系统级操作：安装/卸载应用、改系统设置、模拟点击等。\n\n不给也完全能用 —— 文件读写、预览、编辑只需要上面的「所有文件访问」。";
+        p9.provider = new StatusProvider() { @Override public boolean granted() {
+            // 只读缓存：root 探测在后台线程执行（probeShizuku），不在主线程跑 su
+            return (shizukuOk != null && shizukuOk) || (rootOk != null && rootOk);
+        }};
+        p9.action = new View.OnClickListener() { @Override public void onClick(View v) {
+            showShizukuDialog();
+        }};
+        guidePages.add(p9);
+    }
+
+    private void showPermissionScreen() {
+        buildGuidePages();
+        guideIndex = 0;
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(cBg());
+
+        // 顶部：品牌标题 + 进度
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.VERTICAL);
+        head.setPadding(dp(24), dp(20), dp(24), dp(8));
+        guideDots = new TextView(this);
+        guideDots.setTextColor(cSub());
+        guideDots.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        head.addView(guideDots);
+        TextView headTitle = new TextView(this);
+        headTitle.setText("首次使用 · 配置手机权限");
+        headTitle.setTextColor(cText());
+        headTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 20);
+        headTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        headTitle.setPadding(0, dp(6), 0, 0);
+        head.addView(headTitle);
+        root.addView(head);
+
+        // 中间：每页内容（滚动）
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(true);
+        guideBody = new LinearLayout(this);
+        guideBody.setOrientation(LinearLayout.VERTICAL);
+        guideBody.setPadding(dp(24), dp(8), dp(24), dp(12));
+        scroll.addView(guideBody, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT, ScrollView.LayoutParams.WRAP_CONTENT));
+        root.addView(scroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // 底部：跳过 / 上一步 / 下一步
+        LinearLayout nav = new LinearLayout(this);
+        nav.setOrientation(LinearLayout.HORIZONTAL);
+        nav.setGravity(Gravity.CENTER_VERTICAL);
+        nav.setPadding(dp(20), dp(10), dp(20), dp(16));
+
+        guideSkipBtn = new TextView(this);
+        guideSkipBtn.setText("跳过");
+        guideSkipBtn.setTextColor(cSub());
+        guideSkipBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
+        guideSkipBtn.setPadding(dp(6), dp(10), dp(6), dp(10));
+        guideSkipBtn.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) {
+            guideGo(+1);
+        }});
+        nav.addView(guideSkipBtn);
+
+        guidePrevBtn = cButton("上一步", false);
+        LinearLayout.LayoutParams prevLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        prevLp.leftMargin = dp(8);
+        guidePrevBtn.setLayoutParams(prevLp);
+        guidePrevBtn.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) {
+            guideGo(-1);
+        }});
+        nav.addView(guidePrevBtn);
+
+        guideNextBtn = cButton("下一步", true);
+        LinearLayout.LayoutParams nextLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        nextLp.leftMargin = dp(8);
+        guideNextBtn.setLayoutParams(nextLp);
+        guideNextBtn.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) {
+            if (guideIndex >= guidePages.size()) {
+                guideFinish();          // 完成页上的「下一步」就是开始使用
+            } else {
+                guideGo(+1);
+            }
+        }});
+        nav.addView(guideNextBtn);
+        root.addView(nav);
+
+        setContentView(root);
+        renderGuidePage();
         probeShizuku();
     }
 
-    private void addPermRow(LinearLayout parent, String title, String desc,
-                            final StatusProvider provider, final View.OnClickListener click) {
-        LinearLayout row = new LinearLayout(this);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setPadding(dp(16), dp(14), dp(16), dp(14));
-        row.setBackgroundColor(cCard());
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.bottomMargin = dp(10);
-        row.setLayoutParams(lp);
+    /** 翻一页（dir=+1/-1），越界即停在完成页/首页。 */
+    private void guideGo(int dir) {
+        int next = guideIndex + dir;
+        if (next < 0) next = 0;
+        if (next > guidePages.size()) next = guidePages.size();
+        if (next == guideIndex) return;
+        guideIndex = next;
+        renderGuidePage();
+    }
 
-        LinearLayout left = new LinearLayout(this);
-        left.setOrientation(LinearLayout.VERTICAL);
-        LinearLayout.LayoutParams llp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
-        left.setLayoutParams(llp);
+    /** 走完引导：记录 setup_done 并进入引擎流程（与旧「开始使用」一致）。 */
+    private void guideFinish() {
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("setup_done", true).apply();
+        showEngineScreen();
+        startEngine();
+    }
+
+    /** 渲染当前页（guideIndex == guidePages.size() 时是完成页）。 */
+    private void renderGuidePage() {
+        if (guideBody == null) return;
+        guideBody.removeAllViews();
+        permRows.clear();
+        guideActionBtn = null;
+        boolean finishPage = guideIndex >= guidePages.size();
+        int total = guidePages.size() + 1;
+
+        guideDots.setText(finishPage
+                ? "准备完成 · 最后一步"
+                : "第 " + (guideIndex + 1) + " / " + total + " 步");
+        guidePrevBtn.setEnabled(guideIndex > 0);
+        guideNextBtn.setText(finishPage ? "开始使用" : "下一步");
+        guideSkipBtn.setVisibility(finishPage ? View.GONE : View.VISIBLE);
+        guideSkipBtn.setText(guideIndex == guidePages.size() - 1 ? "跳过" : "跳过这页");
+
+        if (finishPage) {
+            TextView t = new TextView(this);
+            t.setText("配置完成");
+            t.setTextColor(cText());
+            t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
+            t.setTypeface(null, android.graphics.Typeface.BOLD);
+            guideBody.addView(t, cTop(dp(18)));
+
+            guideBody.addView(cText("权限可以随时在控制台的「权限」页里再改。现在可以进入 DeepSeek Harness 了。",
+                    13.5f, cSub(), false), cTop(dp(10)));
+
+            // AI 工作区（可选）：沿用原来的选择逻辑
+            LinearLayout wsRow = new LinearLayout(this);
+            wsRow.setOrientation(LinearLayout.HORIZONTAL);
+            wsRow.setGravity(Gravity.CENTER_VERTICAL);
+            wsRow.setPadding(dp(16), dp(14), dp(16), dp(14));
+            wsRow.setBackgroundColor(cCard());
+            LinearLayout.LayoutParams wslp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+            wslp.topMargin = dp(18);
+            wsRow.setLayoutParams(wslp);
+            LinearLayout wsLeft = new LinearLayout(this);
+            wsLeft.setOrientation(LinearLayout.VERTICAL);
+            wsLeft.addView(cText("AI 工作区（可选）", 15f, cText(), true));
+            workspaceDescView = new TextView(this);
+            workspaceDescView.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            workspaceDescView.setTextColor(cSub());
+            workspaceDescView.setPadding(0, dp(3), 0, 0);
+            wsLeft.addView(workspaceDescView);
+            wsRow.addView(wsLeft, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+            wsRow.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) {
+                onWorkspaceRowClick();
+            }});
+            guideBody.addView(wsRow);
+            refreshAllStatuses();
+            return;
+        }
+
+        final GuidePage pg = guidePages.get(guideIndex);
+        boolean granted = false;
+        try { granted = pg.provider.granted(); } catch (Throwable ignored) {}
 
         TextView t = new TextView(this);
-        t.setText(title);
+        t.setText(pg.title);
         t.setTextColor(cText());
-        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
         t.setTypeface(null, android.graphics.Typeface.BOLD);
-        left.addView(t);
+        guideBody.addView(t, cTop(dp(14)));
 
         TextView d = new TextView(this);
-        d.setText(desc);
+        d.setText(pg.desc);
         d.setTextColor(cSub());
-        d.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
-        d.setPadding(0, dp(3), 0, 0);
-        left.addView(d);
+        d.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        d.setLineSpacing(dp(3), 1f);
+        guideBody.addView(d, cTop(dp(10)));
 
+        // 状态行（挂进 permRows，onResume / Shizuku 事件回来时 refreshAllStatuses 会统一刷新）
+        LinearLayout stRow = new LinearLayout(this);
+        stRow.setOrientation(LinearLayout.HORIZONTAL);
+        stRow.setGravity(Gravity.CENTER_VERTICAL);
+        stRow.setPadding(0, dp(18), 0, 0);
+        stRow.addView(cText("当前状态：", 13f, cSub(), false));
         TextView status = new TextView(this);
-        status.setText("检测中…");
-        status.setTextColor(cSub());
         status.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13);
-        status.setGravity(Gravity.CENTER_VERTICAL);
-        status.setPadding(dp(10), 0, dp(4), 0);
-
-        row.addView(left);
-        row.addView(status);
-        row.setOnClickListener(click);
-        parent.addView(row);
-
+        stRow.addView(status);
+        guideBody.addView(stRow);
         PermRow pr = new PermRow();
         pr.status = status;
-        pr.provider = provider;
+        pr.provider = pg.provider;
         permRows.add(pr);
+
+        Button act = cButton(pg.actionLabel, true);
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(46));
+        alp.topMargin = dp(14);
+        act.setLayoutParams(alp);
+        act.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) {
+            try { pg.action.onClick(v); } catch (Throwable ignored) {}
+        }});
+        act.setEnabled(!granted);
+        if (granted) act.setText("已授权 ✓");
+        guideBody.addView(act);
+        guideActionBtn = act;
+
+        refreshAllStatuses();
+    }
+
+    /** refreshAllStatuses 的引导页扩展：授权按钮状态跟着"是否已授权"走。 */
+    private void guideSyncButtons() {
+        if (guideActionBtn == null || guideBody == null) return;
+        if (guideIndex < 0 || guideIndex >= guidePages.size()) return;
+        GuidePage pg = guidePages.get(guideIndex);
+        boolean granted = false;
+        try { granted = pg.provider.granted(); } catch (Throwable ignored) {}
+        guideActionBtn.setText(granted ? "已授权 ✓" : pg.actionLabel);
+        guideActionBtn.setEnabled(!granted);
     }
 
     private void refreshAllStatuses() {
@@ -1140,6 +1318,8 @@ public class MainActivity extends Activity {
                 workspaceDescView.setText("已设置：" + p + "（点此更改或恢复默认）");
             }
         }
+        // 翻页式引导：当前页的授权按钮状态跟着"是否已授权"走（从系统设置授权回来时刷新）
+        guideSyncButtons();
     }
 
     // ============ AI 工作区（可选） ============
@@ -1735,6 +1915,8 @@ public class MainActivity extends Activity {
         refreshAllStatuses();
         // 从 Shizuku/设置页返回时重新检测
         if (permRows != null && !permRows.isEmpty()) probeShizuku();
+        // v1.13.12：切回前台时补采样一次页面底色（离开期间前端主题可能被改过）
+        refreshPageBackground();
     }
 
     @Override
@@ -1821,21 +2003,20 @@ public class MainActivity extends Activity {
                     // REVISION 不匹配（重装）或 .complete 缺失（中断）都补。
                     // v1.5.2：REVISION 是构建时间戳每次构建都变——同内核升级走「快速同步」
                     //（只更新 REVISION+白名单文件，秒级）；.complete 缺失或内核版本变化才全量补齐。
+                    // v1.13.12：布局标记变化也不再全量重推（老版本升上来常因无标记/标记不同被判
+                    // "布局变了"→ 2.5 万文件全部重写，用户看到的就是"更新后又要解压一遍"）。
+                    // 改走「增量补齐」：只写缺失文件 + 官方白名单覆盖 + 清理新树里已不存在的顶层插件包。
                     File internalBase = payload; // 内部 dshroot 位于 payload/dshroot
                     File internalDshroot = new File(payload, "dshroot");
                     boolean kernelOnExternal = false;
                     try {
                         if (dshrootNeedsSync(internalBase)) {
                             boolean revisionChanged = dshrootRevisionChanged(internalBase);
-                            boolean layoutChanged = dshrootLayoutChanged(internalBase);
                             boolean full = dshrootNeedsFullSync(internalBase);
+                            boolean layoutOnly = !full && dshrootLayoutChanged(internalBase);
                             fastSyncedThisBoot = !full;
-                            // 布局变更：先整棵清掉旧 dshroot 再落地。全量覆盖只写文件不删多余项，
-                            // 旧树的嵌套副本会被 Node 优先解析到（补丁包/依赖树换过就失效）。
-                            if (layoutChanged) {
-                                try { deleteRecursive(internalDshroot); } catch (Throwable ignored) {}
-                            }
-                            extractPayload(payload, null, full ? "dshroot" : "dshroot-fast");
+                            String mode = full ? "dshroot" : (layoutOnly ? "dshroot-add" : "dshroot-fast");
+                            extractPayload(payload, null, mode);
                             writeDshrootComplete(internalBase);
                             if (revisionChanged) refreshInternalConfig(payload);
                         }
@@ -1847,12 +2028,9 @@ public class MainActivity extends Activity {
                         try { deleteRecursive(internalDshroot); } catch (Throwable ignored) {}
                         if (useExternal) {
                             if (dshrootNeedsSync(externalRoot)) {
-                                boolean layoutChanged = dshrootLayoutChanged(externalRoot);
                                 boolean full = dshrootNeedsFullSync(externalRoot);
-                                if (layoutChanged) {
-                                    try { deleteRecursive(new File(externalRoot, "dshroot")); } catch (Throwable ignored) {}
-                                }
-                                extractPayload(payload, externalRoot, full ? "dshroot" : "dshroot-fast");
+                                boolean layoutOnly = !full && dshrootLayoutChanged(externalRoot);
+                                extractPayload(payload, externalRoot, full ? "dshroot" : (layoutOnly ? "dshroot-add" : "dshroot-fast"));
                                 writeDshrootComplete(externalRoot);
                             }
                             dshrootDir = new File(externalRoot, "dshroot");
@@ -2879,11 +3057,13 @@ public class MainActivity extends Activity {
     // 仅两种情况需要：① .complete 缺失（上次解压被打断，缺文件）② 内核版本变化（新内核新增包文件）。
     // 同内核升级（REVISION 变化但内容几乎不变）→ false → 走快速同步，避免真机外部存储 FUSE 上
     // 2 万+ 次 stat 造成的 50-60s 慢启动（模拟器宿主机磁盘快，测不出）。
+    // v1.13.12：布局标记变化也不再触发全量 —— 老版本升上来（.complete 里没有/是别的布局标记）
+    // 会被判"布局变了"而整棵重写 2.5 万文件；改由 startEngine 走「dshroot-add」增量补齐
+    //（只写缺失文件 + 白名单覆盖 + 清理多余顶层插件包），更新安装不再出现"又解压一遍"。
     private boolean dshrootNeedsFullSync(File dshrootBase) {
         File complete = new File(dshrootBase, "dshroot/" + DSHROOT_COMPLETE);
         if (!complete.exists()) return true;
-        if (dshKernelChanged(dshrootBase)) return true;
-        return dshrootLayoutChanged(dshrootBase);
+        return dshKernelChanged(dshrootBase);
     }
 
     // 内核树布局标记（build.sh 写入 assets/dshroot_layout.txt）：布局变更时必须全量重推，
@@ -2942,14 +3122,24 @@ public class MainActivity extends Activity {
         // mode: "internal" = 只解压内部条目（runtime/bin/dshhome/rish，不含 dshroot）；
         //       "dshroot"  = 只解压 dshroot 条目（外部优先，回退内部）；
         //       "dshroot-fast" = 快速同步：只更新 REVISION + 官方白名单文件，不 stat 已有文件
-        //                        （同内核升级用，避免真机 FUSE 2 万+ 次 stat 造成慢启动）。
+        //                        （同内核升级用，避免真机 FUSE 2 万+ 次 stat 造成慢启动）；
+        //       "dshroot-add"  = 增量补齐（v1.13.12）：缺失文件才写入 + REVISION/白名单总是覆盖，
+        //                        结束后清理新树里已不存在的顶层插件包。升级安装不再整棵重写。
         final boolean fast = "dshroot-fast".equals(mode);
+        final boolean additive = "dshroot-add".equals(mode);
         final boolean internalPatch = "internal-patch".equals(mode);
         final boolean internalOnly = "internal".equals(mode) || internalPatch;
-        final boolean dshrootOnly = "dshroot".equals(mode) || fast;
+        final boolean dshrootOnly = "dshroot".equals(mode) || fast || additive;
         if (!destInternal.exists() && !destInternal.mkdirs()) throw new IOException("mkdir failed: " + destInternal);
+        // 进度文案按实际动作说：首次解压才叫"解压"，升级同步叫"同步"，别让用户以为又在重装
+        final String progressLabel = extractProgressLabel(mode);
+        lastExtractLabel = progressLabel;
         final int total = fast ? 0 : countPayloadEntries(mode); // 快速同步无进度条（更新极少文件）
-        if (total > 0) setProgress(0, "首次启动 · 正在解压运行时 0/" + total + " 个文件…");
+        if (total > 0) setProgress(0, progressLabel + " 0/" + total + " 个文件…");
+        // 增量补齐时记录新树包含的顶层插件包（dshroot/lib/node_modules/@deepseek-ai/<pkg>），
+        // 结束后把已存在的同名层级里多余的包删掉 —— 这是旧实现"布局变了就整棵重推"要防的
+        // 「旧嵌套副本被 Node 优先解析」，现在只清插件层这一小块，不再动整棵树。
+        java.util.HashSet<String> addPkgs = additive ? new java.util.HashSet<String>() : null;
         byte[] buf = new byte[128 * 1024];
         InputStream in = getAssets().open("payload.zip");
         ZipInputStream zis = new ZipInputStream(in);
@@ -2968,6 +3158,12 @@ public class MainActivity extends Activity {
 
             File target;
             boolean skipIfExists = false;
+            if (additive && isDshroot && name.startsWith("dshroot/lib/node_modules/@deepseek-ai/")) {
+                // 记录新树里的顶层插件包名（@deepseek-ai/<pkg>/... 的第三段）
+                String rest = name.substring("dshroot/lib/node_modules/@deepseek-ai/".length());
+                int slash = rest.indexOf('/');
+                if (slash > 0) addPkgs.add(rest.substring(0, slash));
+            }
             if (isDshroot && externalRoot != null) {
                 target = new File(externalRoot, name);
                 // 外部 dshroot：REVISION 与官方白名单路径总是覆盖；其他已有文件跳过（保留 AI 运行时修改）。
@@ -2975,6 +3171,9 @@ public class MainActivity extends Activity {
                     // 快速同步（内外通用）：只处理 REVISION + 白名单文件，其余条目直接跳过（不做 exists() stat）
                     if (!name.equals("dshroot/REVISION") && !isForceOverwrite(name)) { zis.closeEntry(); continue; }
                     skipIfExists = false;
+                } else if (additive) {
+                    // 增量补齐：已有文件一律保留（保留 AI 运行时修改），缺失文件才落地
+                    skipIfExists = !name.equals("dshroot/REVISION") && !isForceOverwrite(name) && target.exists();
                 } else {
                     skipIfExists = !name.equals("dshroot/REVISION") && !isForceOverwrite(name) && target.exists();
                 }
@@ -2984,6 +3183,9 @@ public class MainActivity extends Activity {
                     // 快速同步：内部 dshroot 也只更新 REVISION + 白名单文件（同内核升级，避免全量重写）
                     if (!name.equals("dshroot/REVISION") && !isForceOverwrite(name)) { zis.closeEntry(); continue; }
                     skipIfExists = false;
+                } else if (additive) {
+                    // 增量补齐（内部树同理）：只写缺失文件，REVISION/白名单总是覆盖
+                    skipIfExists = !name.equals("dshroot/REVISION") && !isForceOverwrite(name) && target.exists();
                 } else if (internalPatch) {
                     // 覆盖升级补齐：内部运行时只写缺失文件（新增文件如 runtime/bin/rg），白名单路径总是覆盖
                     skipIfExists = !isForceOverwrite(name) && target.exists();
@@ -3025,6 +3227,23 @@ public class MainActivity extends Activity {
             updateProgress(processed, total, written);
         }
         zis.close();
+        // 增量补齐收尾：清理"新树里已不存在"的顶层插件包，防止旧副本被 Node 优先解析。
+        // 只清 @deepseek-ai 插件层（包管理范畴，AI 不会改），不动整棵树。
+        if (additive && addPkgs != null && !addPkgs.isEmpty()) {
+            File[] scope = { new File(destInternal, "dshroot/lib/node_modules/@deepseek-ai") };
+            if (externalRoot != null) scope = new File[]{
+                    new File(destInternal, "dshroot/lib/node_modules/@deepseek-ai"),
+                    new File(externalRoot, "dshroot/lib/node_modules/@deepseek-ai") };
+            for (File dir : scope) {
+                File[] kids = dir.listFiles();
+                if (kids == null) continue;
+                for (File kid : kids) {
+                    if (addPkgs.contains(kid.getName())) continue;
+                    Log.i(TAG, "prune stale kernel pkg: " + kid.getName());
+                    deleteRecursive(kid);
+                }
+            }
+        }
         Log.i(TAG, "extracted " + written + " entries (external=" + (externalRoot != null) + ", mode=" + mode + ")");
         if (failed > 0) throw new IOException("有 " + failed + " 个文件写不进去，首个：" + firstFail);
     }
@@ -3128,7 +3347,7 @@ public class MainActivity extends Activity {
     // 预扫 payload.zip 统计要处理的条目数（只读 entry 头，不写盘），供进度条使用。
     private int countPayloadEntries(String mode) throws IOException {
         final boolean internalOnly = "internal".equals(mode) || "internal-patch".equals(mode);
-        final boolean dshrootOnly = "dshroot".equals(mode);
+        final boolean dshrootOnly = "dshroot".equals(mode) || "dshroot-add".equals(mode);
         InputStream in = getAssets().open("payload.zip");
         ZipInputStream zis = new ZipInputStream(in);
         ZipEntry e;
@@ -3146,11 +3365,20 @@ public class MainActivity extends Activity {
         return n;
     }
 
+    /** 当前解压动作的进度文案前缀（updateProgress 用；extractPayload 每次进入时刷新）。 */
+    private volatile String lastExtractLabel = "首次启动 · 正在解压运行时";
+
+    private String extractProgressLabel(String mode) {
+        if ("internal-patch".equals(mode)) return "正在同步运行时文件";
+        if ("dshroot-add".equals(mode)) return "正在同步内核文件（增量）";
+        return "首次启动 · 正在解压运行时";
+    }
+
     private void updateProgress(int processed, int total, int written) {
         if (total <= 0) return;
         if (processed != total && processed % 200 != 0) return;
         int pct = (int)(processed * 100L / total);
-        setProgress(pct, "首次启动 · 正在解压运行时 " + processed + "/" + total + " 个文件…");
+        setProgress(pct, lastExtractLabel + " " + processed + "/" + total + " 个文件…");
     }
 
     private void applyLinks(File payload) throws IOException {
@@ -3419,8 +3647,42 @@ public class MainActivity extends Activity {
             waitForServer();
             return;
         }
-        setStatus("引擎启动超时（端口 " + enginePort + "），请重启应用");
-        loadHome();
+        // v1.13.12：超时不再 loadHome()（引擎没起来，WebView 只会对着死端口反复重试，
+        // 用户看到的就是"权限引导走完进不了应用"，只能杀掉重开）。改为：
+        // ① 回控制台（那里有真实状态与「启动引擎/日志」入口）；② 后台继续等引擎"迟到"——
+        // 首启在真机上（首次建 profiles/冷启动）可能超过 90 秒，引擎一旦就绪自动进入主界面。
+        setStatus("引擎启动超时（端口 " + enginePort + "），已回到控制台，引擎就绪后会自动进入");
+        conEngineTimedOut();
+    }
+
+    /** 引擎启动超时后的兜底：回控制台 + 后台守望，引擎迟到就绪时自动进入主界面。 */
+    private void conEngineTimedOut() {
+        ui.post(new Runnable() { @Override public void run() {
+            try {
+                conToast("引擎启动超时，已回到控制台；就绪后会自动进入");
+                showConsole();
+                refreshConsole();
+            } catch (Throwable ignored) {}
+        }});
+        final long deadline = System.currentTimeMillis() + 600000L; // 最多再守望 10 分钟
+        new Thread(new Runnable() { @Override public void run() {
+            while (System.currentTimeMillis() < deadline) {
+                if (engineStoppedByUser || engineStartAborted) return; // 用户主动停止 → 不再打扰
+                if (engineStartTs == 0L) return;                       // 期间被重启流程接管 → 收手
+                try {
+                    if (healthOk()) {
+                        starting = false;
+                        ui.post(new Runnable() { @Override public void run() {
+                            try {
+                                if (consoleVisible) { conToast("引擎已就绪"); enterMainUi(); refreshConsole(); }
+                            } catch (Throwable ignored) {}
+                        }});
+                        return;
+                    }
+                } catch (Throwable ignored) {}
+                try { Thread.sleep(3000); } catch (InterruptedException e) { return; }
+            }
+        }}, "engine-late-bloom").start();
     }
 
     /** 定时任务自动执行：闹钟到点后引擎就绪，把任务文本作为消息自动发送给 AI（无需用户操作）。 */
@@ -4066,6 +4328,19 @@ public class MainActivity extends Activity {
         conFoot = cText("就绪", 11f, cSub(), false);
         col.addView(conFoot, cTop(dp(14)));
         col.addView(cText("换内核版本 / 覆盖安装后需要重新解压；平时只用到「启动引擎」。", 11f, cSub(), false), cTop(dp(6)));
+        // v1.13.12：界面主题设置（跟随系统/浅色/深色）。前端「跟随系统」看的就是这里的生效主题。
+        LinearLayout themeRow = new LinearLayout(this);
+        themeRow.setOrientation(LinearLayout.HORIZONTAL);
+        themeRow.setGravity(Gravity.CENTER_VERTICAL);
+        themeRow.setPadding(0, dp(12), 0, dp(12));
+        themeRow.addView(cText("界面主题", 12f, cSub(), false),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        themeRow.addView(cText(themeModeLabel(themeMode()) + " ›", 12f, cSub(), false));
+        themeRow.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conThemeDialog(); }
+        });
+        col.addView(themeRow);
+        col.addView(cSep(0));
         // 检查更新（v1.12：不再启动时自动检查，改这里手动触发）
         LinearLayout upd = new LinearLayout(this);
         upd.setOrientation(LinearLayout.HORIZONTAL);
@@ -4357,6 +4632,9 @@ public class MainActivity extends Activity {
         engineStoppedByUser = true;
         engineStartAborted = true;
         conToast("正在停止引擎…");
+        // v1.13.12：停引擎 = 虚拟屏一起销毁（用户确认的行为）。虚拟屏由 AI 经引擎驱动，
+        // 引擎停了虚拟屏就是一块没人管的孤儿屏；不一起收掉的话它还挂在屏幕上。
+        VsreenBridgeService.requestDestroyVscreen();
         new Thread(new Runnable() { @Override public void run() {
             killEngineNow();
             starting = false;

@@ -51,7 +51,17 @@ public class Main {
      */
     // ⚠ 改过任何影响对外行为的核心代码（路由 / 参数 / 尺寸归一化等）都必须同时升这个值：
     // 只改代码不升指纹，App 就判不出"跑的是旧 core"，改动会静默失效。
-    static final String BUILD = "vs112-20260912";
+    static final String BUILD = "vs113-20260916";
+
+    /**
+     * 心跳看门狗（v1.13.12）。App 进程内的桥服务每 ~750ms 就来拉一次 /vscreen/status，
+     * 插件请求也走桥 —— "20 秒没有任何请求" ⟺ App 已经不在了（强制关闭/被系统杀）。
+     * core 是 shell 身份的独立进程，App 死了它不会跟着死，虚拟屏会变成一块
+     * 没人管的孤儿屏；看门狗负责销毁虚拟屏并退出进程（用户问过"强制关闭会不会
+     * 销毁虚拟桌面"，现在答案是：会，20 秒内自动收掉）。
+     */
+    private static final long HEARTBEAT_TIMEOUT_MS = 20000L;
+    private static volatile long sLastRequestAt = System.currentTimeMillis();
 
     private static final int DEFAULT_PORT = 8998;
     private static final String DEFAULT_EXTERNAL_ROOT = "/sdcard/DeepSeekHarness";
@@ -92,11 +102,45 @@ public class Main {
             return;
         }
 
+        startHeartbeatWatchdog();
+
         try {
             Looper.loop();
         } catch (Throwable t) {
             log("Looper.loop 退出", t);
         }
+    }
+
+    /** 心跳看门狗：App 消失（20 秒无请求）→ 销毁虚拟屏 + 退出进程。 */
+    private static void startHeartbeatWatchdog() {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                while (true) {
+                    try {
+                        Thread.sleep(5000);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    long idle = System.currentTimeMillis() - sLastRequestAt;
+                    if (idle <= HEARTBEAT_TIMEOUT_MS) continue;
+                    // App 没了：先显式销毁虚拟屏（哪怕进程退出系统也会回收，显式关闭更干净）
+                    log("心跳超时 " + idle + "ms 无请求，判定宿主 App 已退出：销毁虚拟屏并退出", null);
+                    try {
+                        closeDisplay();
+                    } catch (Throwable t2) {
+                        log("看门狗销毁虚拟屏失败", t2);
+                    }
+                    try {
+                        Thread.sleep(500);   // 给日志一点落盘时间
+                    } catch (InterruptedException ignored) {
+                    }
+                    System.exit(0);
+                }
+            }
+        }, "vscreen-heartbeat");
+        t.setDaemon(true);
+        t.start();
     }
 
     private static void parseArgs(String[] args) {
@@ -622,6 +666,7 @@ public class Main {
 
     private static void handle(Socket sock) {
         try {
+            sLastRequestAt = System.currentTimeMillis();   // 心跳：任何请求都算 App 活着
             sock.setSoTimeout(15000);
             BufferedReader in = new BufferedReader(new InputStreamReader(sock.getInputStream()));
             String requestLine = in.readLine();

@@ -69,8 +69,9 @@ public class VsreenBridgeService extends Service {
      * 期望的服务端构建指纹（必须与 vscreen/Main.java 的 BUILD 一致）。
      * 不匹配 → 杀掉旧 core 重新拉起。旧进程偷生过很多次，
      * 表现为“服务在跑但新路由/新参数静默失效”（如 create 的 width/height 被完全忽略）。
+     * v1.13.12：core 加了心跳看门狗（App 死了 → 20 秒后自动销毁虚拟屏并退出）。
      */
-    private static final String EXPECTED_CORE_BUILD = "vs112-20260912";
+    private static final String EXPECTED_CORE_BUILD = "vs113-20260916";
 
     /** 持有 Shizuku 拉起的进程引用：被 GC 回收会连带清理子进程。 */
     private static volatile IRemoteProcess sCoreProc;
@@ -105,6 +106,29 @@ public class VsreenBridgeService extends Service {
     private volatile boolean previewCollapsedToWhale = false;
     /** v1.13.11：服务实例（供小鲸鱼面板回调「重新打开预览窗」）。 */
     private static volatile VsreenBridgeService instance = null;
+    /**
+     * v1.13.12：虚拟屏当前是否在跑（预览轮询每 ~750ms 刷新）。
+     * 小鲸鱼面板据此决定要不要显示「销毁屏」按钮。
+     */
+    public static volatile boolean sVscreenRunning = false;
+
+    /** 小鲸鱼面板「虚拟屏」按钮：重新打开预览窗（配合「收起到小鲸鱼」）。 */
+    public static void showPreviewFromWhale() {
+        VsreenBridgeService s = instance;
+        if (s != null) s.doShowPreviewFromWhale();
+    }
+
+    /** 小鲸鱼面板「销毁屏」按钮：销毁虚拟屏并收掉预览窗（替代旧预览窗上的 ✕）。 */
+    public static void destroyVscreenFromWhale() {
+        VsreenBridgeService s = instance;
+        if (s != null) s.destroyVscreen();
+    }
+
+    /** 控制台「停止引擎」联动：引擎停了虚拟屏一起销毁（用户确认的行为）。 */
+    public static void requestDestroyVscreen() {
+        VsreenBridgeService s = instance;
+        if (s != null) s.destroyVscreen();
+    }
 
     private void showPreviewWindow() {
         try {
@@ -135,34 +159,44 @@ public class VsreenBridgeService extends Service {
             previewLp.x = getResources().getDisplayMetrics().widthPixels - dp(260) - dp(24);
             previewLp.y = dp(120);
 
-            previewRootView = new FrameLayout(this);
-            previewRootView.setBackgroundColor(0xCC000000);
+            // v1.13.12 重做（用户要求）：控件全部挪到**显示区域外面**的边框上，
+            // 形态就是用户截图里的"小条"——一条居中的小圆角短横。
+            // 点小条 = 收起到小鲸鱼；销毁功能移进小鲸鱼面板（预览窗上不再放 ✕）。
+            LinearLayout shell = new LinearLayout(this);
+            shell.setOrientation(LinearLayout.VERTICAL);
+            GradientDrawable shellBg = new GradientDrawable();
+            shellBg.setColor(0xCC000000);
+            shellBg.setCornerRadius(dp(10));
+            shell.setBackground(shellBg);
+            try { shell.setClipToOutline(true); } catch (Throwable ignored) {}
+
+            // --- 边框小条（显示区域外的顶部）：视觉是 64×6dp 的圆角短横，点整条区域收起 ---
+            FrameLayout barZone = new FrameLayout(this);
+            barZone.setClickable(true);
+            View bar = new View(this);
+            GradientDrawable barBg = new GradientDrawable();
+            barBg.setColor(getColor(R.color.accent_brand));
+            barBg.setCornerRadius(dp(3));
+            bar.setBackground(barBg);
+            FrameLayout.LayoutParams barLp = new FrameLayout.LayoutParams(dp(64), dp(6));
+            barLp.gravity = Gravity.CENTER_HORIZONTAL | Gravity.CENTER_VERTICAL;
+            barZone.addView(bar, barLp);
+            barZone.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) {
+                try { collapsePreviewToWhale(); } catch (Throwable ignored) {}
+            }});
+            shell.addView(barZone, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, dp(24)));
+
+            // --- 显示区域（虚拟屏画面）---
             previewImageView = new ImageView(this);
             previewImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
-            previewRootView.addView(previewImageView,
-                    new FrameLayout.LayoutParams(
-                            FrameLayout.LayoutParams.MATCH_PARENT,
-                            FrameLayout.LayoutParams.MATCH_PARENT));
+            shell.addView(previewImageView, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
 
-            // 原来预览窗只有「拖动 + 双指缩放」，界面上**没有任何关闭/缩小的入口**，
-            // 用户只能干看着它悬在屏幕上挡着（想关只能让 AI 调 android_vscreen_close）。
-            // v1.13.11：两个钮的语义按用户要求改成 —— ✕ 销毁/停止虚拟屏、▾ 收起到小鲸鱼。
-            LinearLayout ctl = new LinearLayout(this);
-            ctl.setOrientation(LinearLayout.HORIZONTAL);
-            ctl.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
-            ctl.addView(previewButton("✕", new Runnable() { @Override public void run() {
-                destroyVscreen();
-            }}));
-            ctl.addView(previewButton("▾", new Runnable() { @Override public void run() {
-                collapsePreviewToWhale();
-            }}));
-            // 缩放不加按钮：双指捏合已经能缩放（用户要求），按钮栏保留 关闭 / 收起到小鲸鱼
-            FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
-            clp.gravity = Gravity.TOP | Gravity.END;
-            clp.topMargin = dp(4);
-            clp.rightMargin = dp(4);
-            previewRootView.addView(ctl, clp);
+            previewRootView = new FrameLayout(this);
+            previewRootView.addView(shell, new FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT));
 
             // 建窗即按当前虚拟屏比例算尺寸（否则要等下一次比例“变化”才生效）
             lastAspect = 0f;
@@ -171,7 +205,7 @@ public class VsreenBridgeService extends Service {
                 final float ratio = vdH / (float) vdW;
                 int fh = Math.min(Math.max(Math.round(fw * ratio), dp(110)),
                         Math.round(getResources().getDisplayMetrics().heightPixels * 0.8f));
-                previewLp.height = fh;
+                previewLp.height = fh + dp(24); // 补上顶部小条的高度
             }
 
             scaleDetector = new ScaleGestureDetector(this, new ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -190,6 +224,7 @@ public class VsreenBridgeService extends Service {
             });
             previewRootView.setOnTouchListener(new View.OnTouchListener() {
                 @Override public boolean onTouch(View v, MotionEvent e) {
+                    // 小条区域自己消费点击（收起）；拖动/缩放在画面区域做
                     scaleDetector.onTouchEvent(e);
                     switch (e.getActionMasked()) {
                         case MotionEvent.ACTION_DOWN:
@@ -204,7 +239,7 @@ public class VsreenBridgeService extends Service {
                                 float dy = e.getRawY() - downY;
                                 previewLp.x = Math.round(startLpX + dx);
                                 previewLp.y = Math.round(startLpY + dy);
-                                // 统一夹边界（含状态栏让位后的可用高度），保证按钮条永远可点
+                                // 统一夹边界（含状态栏让位后的可用高度），保证小条永远可点
                                 clampPreviewBounds();
                                 updatePreviewLayout();
                             }
@@ -217,7 +252,7 @@ public class VsreenBridgeService extends Service {
             clampPreviewBounds();          // 建窗即夹，避免初始就超出屏幕
             previewWm.addView(previewRootView, previewLp);
             previewWindowVisible = true;
-            Log.i(TAG, "虚拟屏预览窗已显示（可拖动/双指缩放）");
+            Log.i(TAG, "虚拟屏预览窗已显示（画面区拖动/缩放，顶部小条点击收起到小鲸鱼）");
         } catch (Throwable t) {
             Log.w(TAG, "showPreviewWindow failed: " + t.getMessage());
         }
@@ -235,36 +270,7 @@ public class VsreenBridgeService extends Service {
     }
 
     /**
-     * 预览窗右上角的小圆钮（✕ / − / ＋）。
-     * 半透明圆角底 + 白字，直接叠在画面上；按钮自己消费点击，
-     * 所以点按钮不会触发根布局的拖动/缩放。
-     */
-    private Button previewButton(String text, final Runnable action) {
-        Button b = new Button(this);
-        b.setText(text);
-        b.setTextSize(13);
-        b.setTextColor(0xFFFFFFFF);
-        b.setPadding(dp(9), 0, dp(9), 0);
-        b.setMinWidth(0);
-        b.setMinimumWidth(0);
-        b.setMinHeight(0);
-        b.setMinimumHeight(0);
-        GradientDrawable bg = new GradientDrawable();
-        bg.setColor(0x99000000);
-        bg.setCornerRadius(dp(7));
-        b.setBackground(bg);
-        b.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { try { action.run(); } catch (Throwable ignored) {} }
-        });
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, dp(30));
-        lp.leftMargin = dp(4);
-        b.setLayoutParams(lp);
-        return b;
-    }
-
-    /**
-     * 把预览窗的尺寸与位置**统一**夹回可见范围。
+     * 预览窗尺寸与位置的**统一**夹回可见范围。
      * 任何会改 previewLp 的路径（建窗 / 双指缩放 / 拖动 / 折叠）都必须调它，
      * 否则窗口能超出屏幕 —— 按钮条被推出屏幕，用户看到的就是「控制条没出现」。
      */
@@ -312,7 +318,18 @@ public class VsreenBridgeService extends Service {
      * 再收掉预览窗；请求失败如实提示，不假装成功。
      */
     private void destroyVscreen() {
+        // 没有虚拟屏在跑：静默收掉窗与钉住即可，不发请求也不弹"已关闭"（避免假反馈）
+        if (!sVscreenRunning && vdDisplayId < 0) {
+            previewHandler.post(new Runnable() { @Override public void run() {
+                try {
+                    hidePreviewWindow();
+                    OverlayService.pinForVscreen(false);
+                } catch (Throwable ignored) {}
+            }});
+            return;
+        }
         final int closingId = vdDisplayId;
+        sVscreenRunning = false;
         new Thread(new Runnable() { @Override public void run() {
             final String r = coreGet("/vscreen/close", 8000);
             previewHandler.post(new Runnable() { @Override public void run() {
@@ -345,12 +362,6 @@ public class VsreenBridgeService extends Service {
                 toast("预览已收到小鲸鱼，点小鲸鱼可再打开");
             } catch (Throwable ignored) {}
         }});
-    }
-
-    /** v1.13.11：从小鲸鱼面板重新打开预览窗（配合「收起到小鲸鱼」）。 */
-    public static void showPreviewFromWhale() {
-        VsreenBridgeService s = instance;
-        if (s != null) s.doShowPreviewFromWhale();
     }
 
     private void doShowPreviewFromWhale() {
@@ -406,8 +417,10 @@ public class VsreenBridgeService extends Service {
                             vdDisplayId = id;
                             vdW = jsonInt(st, "width", 0);
                             vdH = jsonInt(st, "height", 0);
+                            boolean running = id >= 0 && jsonBool(st, "running");
+                            sVscreenRunning = running;   // 小鲸鱼面板「销毁屏」按钮的显示依据
                             if (id >= 0 && vdW > 0 && vdH > 0) applyAspect(vdW, vdH);
-                            if (id >= 0 && jsonBool(st, "running")) {
+                            if (running) {
                                 // 用户手动 ✕ 关掉的那块虚拟屏不再自动弹回来
                                 // （虚拟屏被关掉/换新的一块时下面会清掉这个标记）
                                 if (!previewWindowVisible && id != previewDismissedDisplayId) showPreviewWindow();
@@ -469,7 +482,8 @@ public class VsreenBridgeService extends Service {
                     if (previewLp == null) { lastAspect = 0f; return; }
                     int maxH = Math.round(getResources().getDisplayMetrics().heightPixels * 0.8f);
                     int minH = dp(110);
-                    int h = Math.min(Math.max(Math.round(previewLp.width * aspect), minH), maxH);
+                    // v1.13.12：窗口 = 顶部小条(dp 24) + 画面区；按画面比例算完要补小条高度
+                    int h = Math.min(Math.max(Math.round(previewLp.width * aspect), minH), maxH - dp(24)) + dp(24);
                     if (previewLp.height != h) {
                         previewLp.height = h;
                         updatePreviewLayout();
