@@ -41,7 +41,11 @@
             android:exported="true"
             android:screenOrientation="unspecified"
             android:configChanges="orientation|screenSize|keyboardHidden"
-            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+            android:theme="@style/AppTheme">
+            <!-- 原主题 Theme.Black.NoTitleBar.Fullscreen 会隐藏状态栏，
+                 部分 ROM（如 ColorOS）还会把窗口整体下移，顶部露出一块黑条。
+                 改为 res/values/styles.xml 的 AppTheme（父主题 Theme.Black.NoTitleBar，
+                 不隐藏状态栏，状态栏/导航栏底色跟随主题）。 -->
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

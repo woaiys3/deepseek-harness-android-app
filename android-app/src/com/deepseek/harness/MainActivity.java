@@ -210,6 +210,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         enginePort = defaultEnginePort(this); // 三版本各自独立端口（见 defaultEnginePort）
+        applyStatusBar(); // 状态栏/导航栏底色跟随 App 主题（浅色模式不再是一条黑条）
         installCrashHandler();
         checkAbiCompat(); // ② ABI 检测：非 arm64 设备引擎可能无法运行，弹提示
         checkBatteryOptimization(); // ④ 电池优化引导：被限制时提示（挂后台可能被杀）
@@ -500,6 +501,26 @@ public class MainActivity extends Activity {
             }
         }, "取消");
     }
+
+    /**
+     * 状态栏/导航栏底色跟随主题（跟随系统深/浅色，与 cBg() 一致），
+     * 浅色模式配深色图标（SYSTEM_UI_FLAG_LIGHT_STATUS_BAR），深色模式配浅色图标。
+     * 旧实现只在 styles.xml 里写死 #0b0f1a → 浅色主题下状态栏是一条黑条。
+     */
+    private void applyStatusBar() {
+        try {
+            boolean dark = isDark();
+            int bar = Color.parseColor(dark ? "#0b0f1a" : "#f7f8fb");
+            getWindow().setStatusBarColor(bar);
+            getWindow().setNavigationBarColor(bar);
+            android.view.View decor = getWindow().getDecorView();
+            int flags = decor.getSystemUiVisibility();
+            if (dark) flags &= ~android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            else flags |= android.view.View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            decor.setSystemUiVisibility(flags);
+        } catch (Throwable ignored) {}
+    }
+
 
     // ============ 界面主题色（跟随系统深/浅色，权限页与加载页共用）============
     private boolean isDark() {
