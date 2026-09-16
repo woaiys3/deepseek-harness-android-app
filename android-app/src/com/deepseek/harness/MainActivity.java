@@ -4147,14 +4147,24 @@ public class MainActivity extends Activity {
         startEngine();   // 文件已就绪 → 只起引擎
     }
 
+    /**
+     * 「重启」原来只 destroy 内存里的 nodeProcess 句柄 ——
+     * Activity 被重建 / 进程被杀后重开时那个句柄是 null，于是点了重启等于什么都没发生
+     * （用户反馈原话：“点重启其实没有用，你并没有被重启”）。
+     * 现在改成按 PID 真杀（见 killEngineNow），并等端口真正释放后再拉起新引擎。
+     */
     private void conRestartEngine() {
         if (starting) return;
         conToast("正在重启引擎…");
+        engineStoppedByUser = false;
+        engineStartAborted = false;
         new Thread(new Runnable() { @Override public void run() {
-            try {
-                if (nodeProcess != null && nodeProcess.isAlive()) nodeProcess.destroy();
-                Thread.sleep(1500);
-            } catch (Throwable ignored) {}
+            killEngineNow();
+            // 等端口释放：否则紧接着的探针会看到旧进程还 listen → 误判“已在运行” → 又不重启
+            long deadline = System.currentTimeMillis() + 10000;
+            while (System.currentTimeMillis() < deadline && portListening(enginePort)) {
+                try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+            }
             ui.post(new Runnable() { @Override public void run() { conEngineClick(); } });
         }}, "engine-restart").start();
     }
@@ -4162,15 +4172,91 @@ public class MainActivity extends Activity {
     private void conStopEngine() {
         // v1.13：旧实现只 destroy 进程，两个后果 —— ① 在飞的 waitForServer 仍每秒刷“已等待 N 秒”（界面一直计时）；
         // ② 看门狗 5 秒后看到 nodeProcess 非空却已死 → 又把引擎拉起来（用户看到的“停不掉”）。
+        // 同样不能只 destroy 句柄 —— 句柄丢了就什么都停不掉，改用 killEngineNow（按 PID）。
         engineStoppedByUser = true;
         engineStartAborted = true;
+        conToast("正在停止引擎…");
+        new Thread(new Runnable() { @Override public void run() {
+            killEngineNow();
+            starting = false;
+            engineStartTs = 0L;
+            ui.post(new Runnable() { @Override public void run() {
+                setStatus("引擎已停止");
+                refreshConsole();
+                conToast("引擎已停止");
+            }});
+        }}, "engine-stop").start();
+    }
+
+    /**
+     * 找出当前真正在跑的引擎 node 进程 PID（不依赖内存里的 Process 句柄）。
+     *
+     * 为什么可行：node 是本 App 的子进程、**同一个 uid**，而同 uid 的进程在 /proc 里互相可见
+     * （真机实测：App 身份能读到 /proc/&lt;pid&gt;/cmdline）。所以哪怕 Activity 被重建、
+     * 句柄丢了，也仍然能定位并终止它。
+     * 认人条件：cmdline 同时含 bin.js、web、--port &lt;enginePort&gt;，避免误杀别的 node。
+     */
+    private int findEnginePid() {
+        File[] kids;
+        try { kids = new File("/proc").listFiles(); } catch (Throwable t) { return -1; }
+        if (kids == null) return -1;
+        int self = android.os.Process.myPid();
+        for (File d : kids) {
+            String name = d.getName();
+            if (name == null || name.isEmpty() || !Character.isDigit(name.charAt(0))) continue;
+            int pid;
+            try { pid = Integer.parseInt(name); } catch (Throwable t) { continue; }
+            if (pid == self) continue;
+            String cmd = readProcCmdline(pid);
+            if (cmd == null || cmd.length() == 0) continue;
+            if (cmd.indexOf("bin.js") < 0) continue;
+            if (cmd.indexOf(" web") < 0) continue;
+            if (cmd.indexOf("--port " + enginePort) < 0) continue;
+            return pid;
+        }
+        return -1;
+    }
+
+    /** 读 /proc/&lt;pid&gt;/cmdline（NUL 分隔 → 空格）。读不到返回 null。 */
+    private String readProcCmdline(int pid) {
+        FileInputStream in = null;
+        try {
+            in = new FileInputStream("/proc/" + pid + "/cmdline");
+            byte[] buf = new byte[1024];
+            int n = in.read(buf);
+            if (n <= 0) return "";
+            for (int i = 0; i < n; i++) if (buf[i] == 0) buf[i] = ' ';
+            return new String(buf, 0, n, "UTF-8");
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            try { if (in != null) in.close(); } catch (Throwable ignored) {}
+        }
+    }
+
+    /**
+     * 真把引擎进程杀掉（阻塞直到死透或超时）。
+     * 先 SIGTERM 让 node 正常退出（会释放端口），6 秒内没死再 SIGKILL 兜底。
+     * 调用方必须在后台线程（内部有 sleep / 轮询）。
+     */
+    private void killEngineNow() {
+        int pid = findEnginePid();
+        if (pid > 0) {
+            try { android.os.Process.sendSignal(pid, 15); } catch (Throwable ignored) {}   // SIGTERM
+        }
         try { if (nodeProcess != null && nodeProcess.isAlive()) nodeProcess.destroy(); } catch (Throwable ignored) {}
+        long deadline = System.currentTimeMillis() + 6000;
+        while (System.currentTimeMillis() < deadline) {
+            if (findEnginePid() <= 0) break;
+            try { Thread.sleep(200); } catch (InterruptedException e) { break; }
+        }
+        int still = findEnginePid();
+        if (still > 0) {
+            Log.w(TAG, "engine pid " + still + " still alive after SIGTERM, SIGKILL");
+            try { android.os.Process.killProcess(still); } catch (Throwable ignored) {}     // SIGKILL 兜底
+            try { Thread.sleep(600); } catch (InterruptedException ignored) {}
+        }
         nodeProcess = null;
-        starting = false;
-        engineStartTs = 0L;
-        setStatus("引擎已停止");
-        refreshConsole();
-        conToast("引擎已停止");
     }
 
     private void enterMainUi() {
