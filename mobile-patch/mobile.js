@@ -143,3 +143,55 @@
 // conversation.session.header.utilities，单一实例），由核心渲染；
 // 位置用 mobile.css 的 position:fixed 挪到三条杠下方（不动 DOM，
 // 保证 React 事件委托有效）。
+
+/**
+ * 手机端回车行为 v0.4——**回车换行，Ctrl/Cmd+回车 发送**
+ *
+ * 问题（用户反馈）：手机软键盘上按回车 = 直接把消息发出去，换不了行。
+ * 成因：DSH 前端 composer 的键盘映射（dsh-client-ui-conversation 的
+ *   registerComposerKeymap）对 Enter 命令只在 event.shiftKey === true 时
+ *   放行给编辑器做换行，其余情况一律 handlers.submit()。实体键盘有 Shift，
+ *   手机软键盘没有 —— 所以手机上永远触发不了换行。
+ *
+ * 做法：**不改内核代码**（保持 mobile-patch “只注入、不覆盖原生”的原则）。
+ *   在 document 的捕获阶段拦下裸 Enter（仅限聊天输入栏 [data-composer-card]
+ *   内、且不是输入法组词中），阻止默认行为与冒泡（=> Lexical 收不到“发送”），
+ *   再补发一个 shiftKey=true 的合成 keydown：让编辑器走它自己本来就有的
+ *   「Shift+Enter = 换行」路径（不自己拼 DOM / 不直接改 React 状态，
+ *   避免受控组件状态脱节）。合成事件打 __dshSynthEnter 标记避免自拦截。
+ *   万一 KeyboardEvent 不可用，退化用 execCommand('insertLineBreak')。
+ *
+ * 保留：Ctrl/Cmd + Enter 仍是原语义（发送/插队加速）；右下角发送按钮照常可用。
+ */
+(function () {
+  var SYNTH_FLAG = '__dshSynthEnter';
+
+  function inComposer(t) {
+    try {
+      // data-composer-card 是 composer 卡片的稳定标记（占位符 data-composer-placeholder
+      // 只在草稿为空时存在，不能用来定位输入栏）
+      return !!(t && t.closest && t.closest('[data-composer-card]'));
+    } catch (e) { return false; }
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e[SYNTH_FLAG]) return;                                  // 自己补发的事件：放行
+    if (e.key !== 'Enter' && e.keyCode !== 13) return;
+    if (e.isComposing || e.keyCode === 229) return;              // 输入法组词中的回车：交给输入法
+    if (e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return; // 组合键保持原语义
+    var t = e.target;
+    if (!t || !t.isContentEditable || !inComposer(t)) return;    // 只管聊天输入栏
+    e.preventDefault();
+    e.stopPropagation();                                        // 拦住 Lexical 的“回车即发送”
+    try {
+      var ev = new KeyboardEvent('keydown', {
+        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+        shiftKey: true, bubbles: true, cancelable: true
+      });
+      ev[SYNTH_FLAG] = true;
+      t.dispatchEvent(ev);
+    } catch (err) {
+      try { document.execCommand('insertLineBreak'); } catch (e2) {}
+    }
+  }, true);
+})();
