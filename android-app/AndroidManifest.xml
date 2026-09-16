@@ -36,14 +36,14 @@
             android:name="moe.shizuku.client.V3_SUPPORT"
             android:value="true" />
 
+        <!-- 原来写的是 screenOrientation="unspecified"（=「不表态，系统看着办」），真机表现为沿用当前屏幕旋转：
+             从横屏的游戏/视频切回来仍是横屏（跟随的是上一个应用，而不是系统设置）。
+             fullUser：系统「自动旋转」开着 → 跟随重力感应（含反向横竖屏）；
+             关着（锁定方向）→ 跟随用户锁定。 -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:screenOrientation="fullUser"
-            <!-- 原来写的是 unspecified（=「不表态，系统看着办」），真机表现为沿用当前屏幕旋转：
-                 从横屏的游戏/视频切回来仍是横屏（跟随的是上一个应用，而不是系统设置）。
-                 fullUser：系统「自动旋转」开着 → 跟随重力感应（含反向横竖屏）；
-                 关着（锁定方向）→ 跟随用户锁定。 -->
             android:configChanges="orientation|screenSize|keyboardHidden"
             android:theme="@style/AppTheme">
             <!-- 原主题 Theme.Black.NoTitleBar.Fullscreen 会隐藏状态栏，
