@@ -143,3 +143,33 @@
 // conversation.session.header.utilities，单一实例），由核心渲染；
 // 位置用 mobile.css 的 position:fixed 挪到三条杠下方（不动 DOM，
 // 保证 React 事件委托有效）。
+
+/**
+ * 禁止网页被双指缩放 v0.5
+ *
+ * 症状：**预览窗存在时**双指捏合会把整个对话页缩放；
+ * 没有预览窗时又缩不动 —— 行为不一致，是 bug。
+ *
+ * 成因：DSH 的 index.html viewport 只写了 `width=device-width, initial-scale=1`，
+ *   **没有** `user-scalable=no` / `maximum-scale`；而 WebView 侧的
+ *   `setSupportZoom(false)` 在现代 WebView 上并不能可靠地禁掉 pinch-zoom
+ *   （viewport 声明才是权威）。预览窗出现时 WebView 会重排（loadWithOverviewMode=true
+ *   下 Chrome 会重算页面缩放），于是"有时能缩"被暴露出来。
+ *
+ * 做法（两层，都不改内核代码）：
+ *   ① inject.sh 给 viewport 补 `maximum-scale=1.0, user-scalable=no`（权威手段）；
+ *   ② 这里再兜一道：捕获阶段拦 ≥2 指的 touchmove / gesture*，preventDefault 掉，
+ *      Chrome 就不会把它当翻页缩放。（touchmove 必须 passive:false 才拦得住）
+ *
+ * 注意：虚拟屏预览窗是**独立原生窗口**，不走网页事件 —— 它的双指缩放不受影响。
+ */
+(function () {
+  function blockMulti(e) {
+    if (e && e.touches && e.touches.length > 1 && e.cancelable) e.preventDefault();
+  }
+  document.addEventListener('touchmove', blockMulti, { passive: false, capture: true });
+  ['gesturestart', 'gesturechange', 'gestureend'].forEach(function (n) {
+    document.addEventListener(n, function (e) { if (e && e.cancelable) e.preventDefault(); },
+      { passive: false, capture: true });
+  });
+})();

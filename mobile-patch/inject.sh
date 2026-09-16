@@ -40,4 +40,19 @@ else
   echo "  index.html 已含 mobile.js 引用，跳过"
 fi
 
+# 3. viewport 补 maximum-scale / user-scalable=no（幂等）
+# 为什么：DSH 原生 index.html 只声明 width=device-width, initial-scale=1，
+# 没有禁止用户缩放 → 双指捏合能把整页缩放（正式版实测：预览窗存在时尤其明显）。
+# WebView 的 setSupportZoom(false) 不足以禁掉 pinch，viewport 声明才是权威手段。
+if grep -q 'user-scalable=no' "$DIST/index.html" 2>/dev/null; then
+  echo "  viewport 已含 user-scalable=no，跳过"
+else
+  sed -i 's|content="width=device-width, initial-scale=1"|content="width=device-width, initial-scale=1, maximum-scale=1.0, user-scalable=no"|' "$DIST/index.html"
+  if grep -q 'user-scalable=no' "$DIST/index.html"; then
+    echo "  已补 viewport: maximum-scale=1.0, user-scalable=no"
+  else
+    echo "  !! viewport 未匹配（index.html 结构变了？请手工检查）" >&2
+  fi
+fi
+
 echo "== 完成 =="
