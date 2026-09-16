@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      修复：状态栏被隐藏、顶部露出一大块黑条。
+
+      原来 MainActivity 用的是 @android:style/Theme.Black.NoTitleBar.Fullscreen：
+      Fullscreen 会把状态栏藏掉，ColorOS（vivo）上窗口还会被整体下移 ——
+      真机 dumpsys 实证：Window attrs 含 FULLSCREEN + FIT_INSETS_CONTROLLED，
+      SurfPosition=Point(0, 133)，也就是屏幕最上面 133px 根本没被 App 绘制，
+      状态栏又被自己藏了 → 那块区域是纯黑，用户看到的就是「一大块黑条」。
+
+      修法：去掉 .Fullscreen（不再隐藏状态栏），窗口底色 = App 深色底。
+      状态栏/导航栏的**颜色**不再在这里写死 —— 改由 MainActivity.applyStatusBar()
+      按主题（跟随系统深/浅色）在运行时设置，否则浅色模式下会是一条黑条。
+    -->
+    <style name="AppTheme" parent="@android:style/Theme.Black.NoTitleBar">
+        <item name="android:windowBackground">#0b0f1a</item>
+    </style>
+</resources>
