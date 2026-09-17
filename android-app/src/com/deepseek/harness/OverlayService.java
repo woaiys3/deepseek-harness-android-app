@@ -468,15 +468,11 @@ public class OverlayService extends Service {
         lp.y = dp(160);
         try {
             wm.addView(rootView, lp);
-            // 长期兜底：窗口尺寸只要变（展开面板 / 虚拟屏预览出现…），就按真实尺寸自纠位置。
-            // 位置变化本身不会触发 layoutChange，所以这里不会递归。
-            rootView.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
-                @Override public void onLayoutChange(View v, int l, int t, int r, int b,
-                                                      int ol, int ot, int orr, int ob) {
-                    if (r - l <= 0) return;
-                    applyEdgePos(true);
-                }
-            });
+            // 只做一次"布局落定后摆正"。
+            // ⚠ 不要在这里挂长期的 OnLayoutChangeListener：拖动窗口、以及"半藏"时
+            // 系统重测宽度都会触发 layoutChange，长期监听会把 x 每帧拽回贴边位 ——
+            // 表现就是"小鲸鱼横向拖不动、半藏也站不住"。而这里要修的只是"面板
+            // 展开/收起瞬间 getWidth() 还是旧值"，一次性摆正就够。
             settleAfterLayout();
         } catch (Throwable t) {
             stopSelf();
