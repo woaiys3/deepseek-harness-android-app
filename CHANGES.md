@@ -1,94 +1,99 @@
 ## v1.14.0（正式版 + Lite 共存版 + 兼容版 · 2026-09-18）
 
-> 合并社区 @xhwxt 的 PR #22（壳层修复与改进，11 文件 +1546/−773），并修掉本轮查出的 4 个真 bug。
-> 其中「**快速同步自 v1.5.2 引入起从未生效**」是issue #20 之前用户最早那个疑问
-> ——「每次更新 APP 都要重新解压是 bug 吗」——的**真答案**。
+> 接 v1.13.6：以社区 @xhwxt 的 9 个修复为主体（#12~#19、#22），另修掉 4 个真 bug ——
+> 其中「**快速同步自 v1.5.2 引入起从未生效**」（每次升级都整棵重解压 2.5 万文件）是本轮最重要的一个。
 > versionCode **36**，内核仍为 DSH 0.1.5-rc.1。
 
-### 🎁 合并 PR #22（@xhwxt）
+### ✨ 新功能
 
-- **覆盖安装丢模型/供应商配置（#20）**：`dshhome/settings.yaml` 与 `.credentials.yaml` 移出覆盖清单，
-  改入 `DSHHOME_USER_PATHS`，在 `extractPayload()`（写盘处）与 `refreshInternalConfig()`（配置刷新处）
-  **两处都拦**。真机日志 `refreshed 5 dshhome config files`（原为 6）验证生效。
-  > 我此前独立改过一份，但**他这份更彻底，故未重复施加**，以他的实现为准。
-- 另含沉浸式布局、桥服务类名、解压流程等改进（详见 PR）。
+- **控制台「界面主题」设置**（跟随系统 / 浅色 / 深色）：WebView 的 `prefers-color-scheme` 跟随 `isLightTheme`，
+  前端随之切换。
+- **权限引导改翻页式**：一页一项、说明用途、可逐项跳过，最后一页含 AI 工作区与「开始使用」。
+- **小鲸鱼交互重做**：
+  - 静置半藏贴边（`FLAG_LAYOUT_NO_LIMITS`，窗口可越界 55%）；
+  - 收起 / 唤出旋转抖动动画；
+  - 拖到屏幕底部松手隐藏（悬浮窗无系统级拖底隐藏，气泡 API 会替换整个交互形态，故自实现），
+    通知栏常驻「显示小鲸鱼」动作可恢复；
+  - 面板紧凑化（小胶囊按钮）、移除端口行；虚拟屏运行时面板内提供「销毁屏」。
+- **虚拟屏预览窗控件外移为顶部小条**（点小条收起到小鲸鱼），✕ 移入鲸鱼面板。
+- **状态栏 / 导航栏颜色实时跟随页面底色**：注入 MutationObserver 经 JS 桥上报 +
+  body 透明时回退读 `<html>` 底色 + onResume 补采样。
 
-### 🐛 `dshKernelChanged()` 用字符串拼接比内核版本 → 快速同步恒失效
+### 🐛 修复
 
-- **根因**（`MainActivity.java`）：
+- **首次启动完成权限引导后卡在启动页**：根因是引擎启动超时（90s）后直接 `loadHome()`，
+  WebView 对着死端口反复重试，用户只能杀掉重开。现超时后回控制台并后台继续守望（最长 10 分钟），
+  引擎就绪后自动进入主界面。
+- **覆盖安装更新后重新解压整个内核树**：老版本升级上来（`.complete` 无布局标记或标记不同）会触发
+  `dshrootNeedsFullSync` → 2.5 万文件整棵重写。现布局差异不再触发全量，改走新的 `dshroot-add` 增量模式：
+  缺失文件才写入 + REVISION/白名单覆盖 + 清理新树中已不存在的插件包。解压进度文案也按实际动作区分
+  「首次解压」与「同步」。
+- **悬浮窗 AI 状态永远显示「空闲」**：0.1.5 加认证后，悬浮窗的 `POST /api/session.list` 先是 401，
+  实测该路径本身也 404（RPC 走 WebSocket）。现改为扫描 `/proc/<同 uid 进程>/fd` 中指向
+  `dshhome/sessions/**/session.lock` 的句柄 —— 该锁由会话写入器存活期间持有，是「会话正在工作」的一手证据，
+  且无需认证。显示：空闲 / N 个会话工作中… / 已完成 ✓。
+- **DSH 界面内偶尔浮现小鲸鱼**：虚拟屏预览「收起到小鲸鱼」的钉住状态会盖过前台隐藏。
+  现前台隐藏优先级最高，钉住只控制预览帧是否继续拉取。
+- **退出确认文案与实际不符**：退出只是关界面，node 在后台继续跑（这正是设计意图），
+  文案改为「服务器将在后台继续运行」。
+- **手机软键盘回车直接发送、无法换行**（#12）。
+- **控制台「重启 / 停止」点了没反应**（#13）：引擎其实没被重启。
+- **虚拟屏预览窗没有关闭/最小化入口，且能被缩放撑出屏幕**（#14）。
+- **状态栏被隐藏、顶部露出一大块黑条**（#15）。
+- **弹窗卡片外面还套着一层深色圆角框**（#16）。
+- **横竖屏跟随上一个应用，而不是跟随系统设置**（#17）。
+- **有虚拟屏预览窗时网页会被双指缩放**（#18）：`index.html` 的 viewport 缺
+  `maximum-scale` / `user-scalable=no`（现代 WebView 上 `setSupportZoom(false)` 并不权威），
+  补 viewport 声明 + 捕获阶段拦 ≥2 指的 `touchmove` / `gesture*`；预览窗是独立原生窗口，其自身缩放不受影响。
+- **桥服务按包名拼类名启动，改过包名的构建起不来**（#19）：`ClassNotFoundException`。
+- **覆盖安装更新后模型 / 供应商配置丢失**（#20）：`dshhome/settings.yaml` 与 `.credentials.yaml`
+  被当作可覆盖的本内置文件，版本号一变就无条件覆盖，而 `llm-*`、`agent-default-model` 全在这一个文件里。
+  现两者移出覆盖清单（改入 `DSHHOME_USER_PATHS`），在写盘与配置刷新两处都做拦截。
+
+### 🐛 补充修复（维护者）
+
+- **`dshKernelChanged()` 用字符串拼接比内核版本 → 快速同步恒失效**（本轮最重要）：
   ```java
   return !readFileText(pkg).contains("\"version\":\"" + builtin + "\"");
   //                                        └─ 拼出 "version":"0.1.5-rc.1"（冒号后无空格）
   //                                           而 dsh/package.json 是 pretty-print，实为 "version": "0.1.5-rc.1"
   //                                           → contains 恒为 false → !false 恒为 true
   ```
-  `dsh/package.json` 是带空格的 JSON，于是**恒判「内核变了」** → `dshrootNeedsFullSync` 恒真 →
-  `full` 恒 true → **`dshroot-fast` 与 `dshroot-add` 都是死代码**，每次升级全量重写 25,283 个文件。
-- **连带影响**：PR #22 那条「升级重解压」修复（`dshroot-add`）因此**完全没生效**
-  —— `layoutOnly = !full && ...`，而 `full` 恒真。
-- **起始版本**：解老包 payload 验证，v1.5.5 与 v1.9 的 `package.json` 都是 `"version": "0.1.1-rc.2",`（带空格）
-  → **从 v1.5.2 引入快速同步那天起就没工作过**。
-- **修法**：
-  ```java
-  String v = new org.json.JSONObject(readFileText(pkg)).optString("version", "");
-  return !builtin.equals(v);
-  ```
-- **验证**（真机，同机同场景同 `.complete`，只换 App）：
-  ```
-  23:31:50   extracted 25283 entries (mode=dshroot)       ← 修复前
-  23:36:25   extracted    82 entries (mode=dshroot-fast)  ← 修复后
-  ```
+  于是**恒判「内核变了」** → `full` 恒 true → **`dshroot-fast` 与 `dshroot-add` 都是死代码**。
+  这也让上面那条「升级重解压」修复**完全失效**（`layoutOnly = !full && ...`，而 `full` 恒真）。
+  解老包 payload 核实：v1.5.5 与 v1.9 的 `package.json` 同样是带空格的写法
+  → **从 v1.5.2 引入快速同步那天起就没工作过**。改用 `JSONObject.optString("version")` 取值比较。
+  真机验证（同机同场景，只换 App）：`extracted 25283 entries (mode=dshroot)` → `extracted 82 entries (mode=dshroot-fast)`。
+- **`dshroot-add` 的「清理过期插件包」是空转**：实现假设插件包在顶层
+  `dshroot/lib/node_modules/@deepseek-ai/` 下，但本项目 payload 是 hoisted+nested 混合布局
+  —— 顶层只有 `dsh` 一个包，其余全在
+  `dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/`。
+  记录端因此取出的「包名」恒为 `dsh`，清理端又只扫顶层目录（里面只有 `dsh`，恰在保留名单里）
+  → **一个包都不会被删**，作者注释里要防的「旧嵌套副本被 Node 优先解析」并未防住。
+  现识别真实嵌套前缀来记录包名，清理范围同时覆盖嵌套层与顶层（内外置 dshroot 均覆盖）。
+- **悬浮小鲸鱼 / 面板跑出屏幕**：贴边坐标用 `rootView.getWidth()` 计算，而该值在
+  `wm.updateViewLayout()` 之后、下一次 layout 之前仍是旧的。展开面板时按「小图标宽度」定位
+  → 面板被推出屏幕；收起时按「面板大宽度」算半藏位 → 整只鲸鱼出屏。原实现的 `rootView.post()`
+  只延后一条消息、常在 layout 之前；又因 `FLAG_LAYOUT_NO_LIMITS` 系统不夹边界。
+  现改用 `ViewTreeObserver.OnGlobalLayoutListener`，布局真正落定后再摆正。
+- **PR #17 把 XML 注释写进 `<activity>` 开始标签内部** → `aapt` 报
+  `AndroidManifest.xml:43: error: Error parsing XML: not well-formed (invalid token)`，
+  即合并后的 main **处于编译阻塞状态**。注释移到标签之前修复。
 
-### 🐛 `dshroot-add` 的「清理过期插件包」是空转（同 PR 内，同轮查出）
+### 🔧 调整
 
-- **背景**：PR #22 用「增量补齐 + 清理过期顶层插件包」替代旧代码的「整棵删树」，
-  其注释写明是为防「旧树的嵌套副本会被 Node 优先解析到（补丁包/依赖树换过就失效）」。
-- **它没起作用**。本项目 payload 是 hoisted+nested 混合布局：
-  ```
-  dshroot/lib/node_modules/@deepseek-ai/                                   ← 顶层，只有 dsh 一个包
-  dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/<pkg>/   ← 所有包都在这一层
-  ```
-  而实现里：记录只认顶层前缀（嵌套路径取出的「包名」恒为 `dsh`）→ `addPkgs` 恒为 `{"dsh"}`；
-  清理也只扫顶层目录（里面只有 `dsh`，且它在 `addPkgs` 里 → `continue`）
-  → **一个包都不会被删，整段空转**。
-- **为何现在才要紧**：在 `dshKernelChanged` 修好之前 `dshroot-add` 是死代码，空转无人发现；
-  修好之后它**真的会跑**了，这层保护缺失就成了实打实的缺口。
-- **修法**：识别真实嵌套前缀来记录包名；清理范围同时覆盖**嵌套层**与顶层（内外置 dshroot 都覆盖）。
-- **验证**（电脑，把 `extractPayload` **逐字抽自源码**、stub 掉 `getAssets`/`Os.chmod` 后跑真 payload）：
+- 虚拟屏看门狗阈值 **20s → 60s**：请求超时可能拖长轮询，20s 余量偏紧会误杀虚拟屏。
 
-  | 断言 | 修复前 | 修复后 |
-  |---|---|---|
-  | ① 白名单文件被强制覆盖 | PASS | PASS |
-  | ② 非白名单已存在文件保持原样 | PASS | PASS |
-  | ③ 磁盘缺失文件被补齐 | PASS | PASS |
-  | ④ 已存在插件包保留 | PASS | PASS |
-  | **⑤ 过期插件包被清理** | **FAIL** `staleExists=true` | **PASS** `false` |
-  | ⑥ REVISION 更新 | PASS | PASS |
+### ⚠️ 已知边界
 
-### 🐛 悬浮小鲸鱼 / 面板跑出屏幕（用户实测必现）
+- 从 ≤ v1.13.6 升级上来（`.complete` 无布局标记）首次启动走的是**增量同步**而非全量，
+  属预期；若仍有异常请附启动日志中 `extracted N entries (…, mode=…)` 一行反馈。
+- 正式版与 Lite 共存版**同时启动**时 **8999 端口互斥** → 虚拟屏实际二选一。
+- 虚拟屏为 PUBLIC 类型显示，部分系统弹窗（如输入法）行为与主屏有差异。
 
-- **根因**：贴边坐标用 `rootView.getWidth()` 算，而该值在 `wm.updateViewLayout()` 之后、
-  下一次 layout 之前仍是旧的。展开面板时按「小图标宽度」定位 → 面板被推出屏幕；
-  收起时按「面板大宽度」算半藏位 → 整只鲸鱼出屏。原实现的 `rootView.post()` 只延后一条消息，
-  常在 layout 之前；又因 `FLAG_LAYOUT_NO_LIMITS` 系统不夹边界。
-- **修法**：新增 `settleAfterLayout()`（`ViewTreeObserver.OnGlobalLayoutListener`，布局真正落定后
-  调 `applyEdgePos(true)`）+ `applyEdgePos(boolean animate)`。
-- ⚠️ **中途引入过一个回归**：第一版还挂了长期 `addOnLayoutChangeListener` → 拖动窗口/半藏时
-  系统重测宽度都会触发 layoutChange → 每帧把 x 拽回贴边位 → **横向拖不动、半藏站不住**。
-  用户实测报回后已撤掉，只保留一次性摆正。**教训：这类"纠偏"监听必须用完即卸。**
+### 🙏 致谢
 
-### 🐛 PR #17 把 XML 注释写进 `<activity>` 开始标签内部 → 合并后 main 编不过
-
-- `aapt` 报 `AndroidManifest.xml:43: error: Error parsing XML: not well-formed (invalid token)`，
-  即**合并 PR 后的 main 处于编译阻塞状态**。注释移到标签之前修复。
-
-### 🐛 上游未声明推理强度时，无法给名单外模型配置推理强度（#21）
-
-- 本轮**按维护者决定不做**，issue 保持开启留待后续评估。
-
-### 🔧 虚拟屏看门狗阈值 20s → 60s
-
-- 请求超时可能拖长轮询，20s 余量偏紧会误杀虚拟屏。
+本版 9 个修复来自社区 @xhwxt（#12~#19、#22），其中 #18 因与 main 冲突由维护者手动并入。
 
 ---
 
