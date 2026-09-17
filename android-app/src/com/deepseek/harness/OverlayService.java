@@ -468,7 +468,16 @@ public class OverlayService extends Service {
         lp.y = dp(160);
         try {
             wm.addView(rootView, lp);
-            rootView.post(new Runnable() { @Override public void run() { snapToEdge(); } });
+            // 长期兜底：窗口尺寸只要变（展开面板 / 虚拟屏预览出现…），就按真实尺寸自纠位置。
+            // 位置变化本身不会触发 layoutChange，所以这里不会递归。
+            rootView.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+                @Override public void onLayoutChange(View v, int l, int t, int r, int b,
+                                                      int ol, int ot, int orr, int ob) {
+                    if (r - l <= 0) return;
+                    applyEdgePos(true);
+                }
+            });
+            settleAfterLayout();
         } catch (Throwable t) {
             stopSelf();
         }
@@ -519,14 +528,70 @@ public class OverlayService extends Service {
             snapToEdge();
         } else {
             wiggle();
-            animateToEdge();
         }
-        if (rootView != null) {
-            rootView.post(new Runnable() { @Override public void run() {
-                // 布局落定后再夹一次（展开后面板更宽，贴右边缘会被推出屏幕）
-                if (panelVisible) clampPanelOnScreen(); else snapToEdge();
-            }});
+        // 展开/收起必然改变窗口尺寸，而 getWidth() 在下一次 layout 之前仍是旧值：
+        // 用它算贴边坐标 → 展开时按"图标宽度"摆（面板被推出右边）、收起时按"面板宽度"
+        // 算半藏位（整只鲸鱼被推出屏幕）。又因为 FLAG_LAYOUT_NO_LIMITS 系统不夹边界，
+        // 算错就真的出屏。原实现用 rootView.post() 补救，但 post 只延后一条消息、
+        // 常常仍在下一次 layout 之前，等于没夹。改为等布局真正落定后再算。
+        settleAfterLayout();
+    }
+
+    /**
+     * 布局真正落定后，按**真实尺寸**重算贴边位置。
+     * 这是"小鲸鱼/面板跑出屏幕"的根因修法 —— 不能再依赖调用时刻的 getWidth()。
+     */
+    private void settleAfterLayout() {
+        try {
+            if (rootView == null) return;
+            rootView.getViewTreeObserver().addOnGlobalLayoutListener(
+                    new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                @Override public void onGlobalLayout() {
+                    try {
+                        android.view.ViewTreeObserver vto = rootView.getViewTreeObserver();
+                        if (vto.isAlive()) vto.removeOnGlobalLayoutListener(this);
+                    } catch (Throwable ignored) {}
+                    applyEdgePos(true);
+                }
+            });
+        } catch (Throwable ignored) {
+            applyEdgePos(false);
         }
+    }
+
+    /**
+     * 按真实尺寸把窗口摆到正确的贴边位：
+     * 面板展开 → 完整可见（留 4dp 边距）；面板收起 → 半藏（露出 TUCK_VISIBLE_FRACTION）。
+     * @param animate 是否平滑过渡（布局刚落定时用 true，观感更顺）
+     */
+    private void applyEdgePos(boolean animate) {
+        try {
+            if (lp == null || rootView == null) return;
+            int w = rootView.getWidth() > 0 ? rootView.getWidth() : dp(60);
+            int h = rootView.getHeight() > 0 ? rootView.getHeight() : dp(56);
+            int targetX = edgeXFor(w);
+            int screenH = getResources().getDisplayMetrics().heightPixels;
+            if (lp.y < 0) lp.y = 0;
+            if (lp.y > screenH - h) lp.y = Math.max(0, screenH - h);
+            if (!animate || lp.x == targetX) {
+                lp.x = targetX;
+                wm.updateViewLayout(rootView, lp);
+                return;
+            }
+            final int fromX = lp.x;
+            android.animation.ValueAnimator va =
+                    android.animation.ValueAnimator.ofInt(fromX, targetX);
+            va.setDuration(220);
+            va.setInterpolator(new OvershootInterpolator(0.6f));
+            va.addUpdateListener(new android.animation.ValueAnimator.AnimatorUpdateListener() {
+                @Override public void onAnimationUpdate(android.animation.ValueAnimator a) {
+                    if (lp == null || rootView == null) return;
+                    lp.x = (Integer) a.getAnimatedValue();
+                    try { wm.updateViewLayout(rootView, lp); } catch (Throwable ignored) {}
+                }
+            });
+            va.start();
+        } catch (Throwable ignored) {}
     }
 
     /** 面板每次展开时刷新"看场景才该出现"的行（如销毁屏按钮）。 */
