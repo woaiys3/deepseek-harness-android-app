@@ -11,3 +11,4 @@ android-app/out/
 android-app/assets/
 .credentials.yaml
 payload.zip
+*.idsig

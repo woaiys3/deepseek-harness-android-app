@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  壳（Android 原生界面）的配色统一在这里管理：改品牌色/深浅主题色只动这一个文件，
+  代码里一律通过 cXxx()（MainActivity）或 R.color 引用取色，禁止再写死十六进制。
+
+  注意区分两类颜色：
+  - 「壳静态配色」：控制台、启动页、鲸鱼面板等原生界面 —— 全部走这里的定义。
+  - 「页面实测底色」：MainActivity.refreshPageBackground() 从 DSH 前端渲染结果里
+    取 body 背景色回填状态栏 —— 那是运行时数据，不属于静态配色，别往这里搬。
+-->
+<resources>
+    <!-- 品牌色（DSH 品牌蓝：小鲸鱼、主按钮、强调文字共用；改名/换品牌只改这里） -->
+    <color name="accent_brand">#4D6BFE</color>
+
+    <!-- 壳背景（深色主题 / 浅色主题；styles.xml 的 windowBackground 也引用这里） -->
+    <color name="shell_bg_dark">#0B0F1A</color>
+    <color name="shell_bg_light">#F7F8FB</color>
+
+    <!-- 壳卡片/次级容器背景（控制台卡片、输入框底等） -->
+    <color name="shell_card_dark">#161C2A</color>
+    <color name="shell_card_light">#FFFFFF</color>
+
+    <!-- 壳文字：主文字 / 次级文字（各分深色主题、浅色主题两套） -->
+    <color name="text_on_dark">#E6EDF3</color>
+    <color name="text_on_light">#1F2328</color>
+    <color name="sub_on_dark">#8B98A9</color>
+    <color name="sub_on_light">#6B7280</color>
+
+    <!-- 语义色（不分深浅主题） -->
+    <color name="status_green">#1F9D6B</color>
+    <color name="status_red">#D9503F</color>
+
+    <!-- 小鲸鱼面板专属（深蓝半透明面板上的文字，不跟系统主题走） -->
+    <color name="panel_text_bright">#E8EDFF</color>
+    <color name="panel_text_dim">#9DB4FF</color>
+    <color name="panel_bg">#E61A2140</color>
+</resources>

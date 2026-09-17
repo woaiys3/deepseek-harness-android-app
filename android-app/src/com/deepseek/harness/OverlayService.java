@@ -11,35 +11,50 @@ import android.content.SharedPreferences;
 import android.graphics.PixelFormat;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
+import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.view.animation.OvershootInterpolator;
 import android.widget.Button;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
-import java.net.Socket;
 import java.net.URL;
 
-import org.json.JSONArray;
+import java.util.HashSet;
+
 import org.json.JSONObject;
 
 /**
  * 小鲸鱼悬浮窗服务：
- *  - 常驻悬浮小鲸鱼图标（可拖动）
- *  - 点击展开状态面板：引擎运行状态 / 端口 / 打开应用 / 收起
- *  - 每 2 秒探测引擎端口，实时刷新状态
+ *  - 常驻悬浮小鲸鱼图标（可拖动；松手自动贴边，静置时半藏在屏幕边缘）
+ *  - 点击展开紧凑状态面板：引擎状态 / AI 会话状态 / 打开应用 / 虚拟屏 / 销毁屏 / 收起
+ *  - 拖到屏幕底部区域松手 = 隐藏小鲸鱼（通知栏「显示小鲸鱼」可恢复）
+ *  - 每 2 秒探测引擎端口；每 6 秒扫一次 /proc 统计"正在写入的会话"刷新 AI 状态
  *  - 需要 SYSTEM_ALERT_WINDOW（悬浮窗）权限；前台服务保活
+ *
+ * v1.13.12 大改（用户 15 条反馈里的悬浮窗部分）：
+ *  ① 前台隐藏优先级最高 —— 之前虚拟屏预览「收起到小鲸鱼」的钉住状态会盖过前台隐藏，
+ *     导致 App 里偶尔冒出小鲸鱼；现在 App 前台一律隐藏（预览仍由钉住状态保持拉帧）。
+ *  ② 静置半藏：面板收起时小鲸鱼滑到屏幕边缘、只露一半（FLAG_LAYOUT_NO_LIMITS 允许越界）；
+ *     点开面板/拖动时完整露出。收起与唤出都带旋转抖动动画。
+ *  ③ 拖到底部隐藏：悬浮窗没有系统级的"拖底消失"（那是通知气泡的特权），
+ *     这里自实现同款手势 + 通知栏恢复入口。
+ *  ④ AI 状态不再走 HTTP：0.1.5 起接口要认证 cookie，悬浮窗拿不到（401 → 永远"空闲"）。
+ *     改为扫 /proc/<同uid进程>/fd 里持着 dshhome/sessions/**​/session.lock 的文件描述符 ——
+ *     内核的会话写入器持锁多久，fd 就开多久（dsh-session-persistence-jsonl 的 SessionWriteLease），
+ *     这是"会话正在工作"的一手证据，无需任何认证。
  */
 public class OverlayService extends Service {
     /**
@@ -59,6 +74,13 @@ public class OverlayService extends Service {
     private static final String CHANNEL_ID = "dsh_overlay";
     private static final int NOTIF_ID = 9002;
     private static final long PROBE_MS = 2000L;
+    /** 静置半藏时露在外面的比例（另一半越界到屏幕外）。 */
+    private static final float TUCK_VISIBLE_FRACTION = 0.45f;
+    /** 拖到距底部多少 dp 内松手 = 隐藏。 */
+    private static final int DISMISS_ZONE_DP = 84;
+    /** AI "已完成"提示在状态切换后保留的时长（毫秒）。 */
+    private static final long FINISHED_TTL_MS = 60000L;
+
     /** 当前运行的 OverlayService 实例（供 MainActivity 前后台联动控制视图可见性）。 */
     private static OverlayService instance = null;
 
@@ -75,7 +97,7 @@ public class OverlayService extends Service {
     private LinearLayout panelView;
     private TextView statusText;
     private TextView aiText;
-    private TextView portText;
+    private Button destroyBtn;
     // v1.9 虚拟屏预览：悬浮窗实时显示虚拟屏画面（用户可看 AI 操作）
     private ImageView vscreenImageView = null;
     private volatile boolean vscreenPreviewRunning = false;
@@ -86,9 +108,21 @@ public class OverlayService extends Service {
     private float touchX, touchY, startX, startY;
     private boolean dragging = false;
     private boolean panelVisible = false;
-    /** 探测计数：每 PROBE_MS 探测一次引擎；每 3 次（约 6 秒）顺带拉一次会话信息 */
+    /** 拖动中进入"拖底删除"暗示区（图标缩小变淡提示松手即隐藏）。 */
+    private boolean dismissHint = false;
+    /** 用户拖底主动隐藏后为 true；从通知栏「显示小鲸鱼」恢复。 */
+    private volatile boolean userHidden = false;
+    /** v1.13.11：悬浮图标当前吸附在右边？由拖动松手时的 snapToEdge() 决定。 */
+    private boolean snappedRight = false;
+    /** v1.13.11：App 在前台 → 悬浮窗应隐藏（由 MainActivity.onStart/onStop 维护）。 */
+    private volatile boolean foregroundWantsHidden = true;
+    /** v1.13.11：被虚拟屏预览「收起到小鲸鱼」钉住 —— 只负责持续拉预览帧，不再影响可见性。 */
+    private volatile boolean vscreenPinned = false;
+    /** 探测计数：每 PROBE_MS 探测一次引擎；每 3 次（约 6 秒）顺带扫一次会话写入器 */
     private int probeCount = 0;
-    private volatile boolean lastSessionRunning = false;
+    /** 最近一次扫到的"持锁会话"目录集合；null 表示还扫过。 */
+    private volatile HashSet<String> activeSessions = new HashSet<String>();
+    private volatile long finishedAt = 0L;
 
     public static int enginePort(Context ctx) {
         SharedPreferences sp = ctx.getSharedPreferences(PREFS, MODE_PRIVATE);
@@ -99,16 +133,14 @@ public class OverlayService extends Service {
         @Override public void run() {
             if (!isRunning) return;
             probeCount++;
-            // 探测放后台线程：HttpURLConnection 在主线程会抛 NetworkOnMainThreadException
+            final boolean scanSessions = probeCount % 3 == 0;
+            // 探测放后台线程：HttpURLConnection / /proc 扫描在主线程会卡界面
             new Thread(new Runnable() {
                 @Override public void run() {
                     final boolean up = engineAlive(enginePort);
-                    // 引擎在线时每 3 次探测拉一次会话信息（会话标题/AI 状态）
-                    if (up && probeCount % 3 == 0) {
-                        SessionInfo si = fetchSessionInfo();
-                        if (si != null) {
-                            lastSessionRunning = si.running;
-                        }
+                    if (up && scanSessions) {
+                        activeSessions = scanActiveSessions();
+                        lastProbeAt = System.currentTimeMillis();
                     }
                     handler.post(new Runnable() {
                         @Override public void run() {
@@ -134,20 +166,28 @@ public class OverlayService extends Service {
         buildOverlay();
         addToWindow();
         // 前后台联动：App 前台时隐藏悬浮窗（不挡界面），退后台时显示
-        applyVisible(!MainActivity.overlayForeground);
+        foregroundWantsHidden = MainActivity.overlayForeground;   // v1.13.11：改为记状态再统一应用
+        applyVisibleNow();
         handler.postDelayed(probeRunnable, 200);
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // 通知栏「显示小鲸鱼」：解除用户隐藏并抖一下示意
+        if (intent != null && ACTION_SHOW.equals(intent.getAction())) {
+            userHidden = false;
+            applyVisibleNow();
+            wiggle();
+        }
         // 允许通过 intent 指定端口（如换端口后重启）
         if (intent != null && intent.hasExtra("port")) {
             enginePort = intent.getIntExtra("port", enginePort);
             getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_PORT, enginePort).apply();
-            if (portText != null) portText.setText("端口：: " + enginePort);
         }
         return START_STICKY;
     }
+
+    private static final String ACTION_SHOW = "com.deepseek.harness.overlay.SHOW";
 
     @Override
     public void onDestroy() {
@@ -172,6 +212,11 @@ public class OverlayService extends Service {
             ch.setDescription("黑鲸鱼悬浮窗运行中（引擎状态指示）");
             nm.createNotificationChannel(ch);
         }
+        startForeground(NOTIF_ID, buildNotification());
+    }
+
+    /** 常驻通知（内容随引擎状态更新；常驻「显示小鲸鱼」动作，拖底隐藏后靠它找回）。 */
+    private Notification buildNotification() {
         Notification.Builder b;
         if (Build.VERSION.SDK_INT >= 26) {
             b = new Notification.Builder(this, CHANNEL_ID);
@@ -182,12 +227,20 @@ public class OverlayService extends Service {
         open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
         PendingIntent pi = PendingIntent.getActivity(this, 0, open,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        Notification n = b.setContentTitle("🐋 黑鲸鱼悬浮窗运行中")
-                .setContentText("引擎状态：" + (engineUp ? "运行中 :" + enginePort : "未运行"))
+        Intent show = new Intent(this, OverlayService.class);
+        show.setAction(ACTION_SHOW);
+        PendingIntent showPi = PendingIntent.getService(this, 1, show,
+                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+        try { b.addAction(new Notification.Action.Builder(null, "显示小鲸鱼", showPi).build()); }
+        catch (Throwable ignored) {
+            // 老系统 Action.Builder(null, ...) 不吃图标时退化：不显示动作也不影响主流程
+        }
+        return b.setContentTitle("🐋 DeepSeek Harness 运行中")
+                .setContentText("引擎状态：" + (engineUp ? "运行中（端口 " + enginePort + "）" : "未运行"))
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setContentIntent(pi)
+                .setOngoing(true)
                 .build();
-        startForeground(NOTIF_ID, n);
     }
 
     private void buildOverlay() {
@@ -197,103 +250,93 @@ public class OverlayService extends Service {
         rootView.setPadding(dp(10), dp(8), dp(10), dp(8));
         // 收起态无背景（只留小鲸鱼图标）；背景移到展开面板 panelView 上
 
-        // ===== 图标行（小鲸鱼 + 标题）=====
+        // ===== 图标行（小鲸鱼）=====
         LinearLayout iconRow = new LinearLayout(this);
         iconRow.setOrientation(LinearLayout.HORIZONTAL);
         iconRow.setGravity(Gravity.CENTER_VERTICAL);
         iconRow.setPadding(dp(4), dp(2), dp(4), dp(2));
 
         iconView = new ImageView(this);
-        iconView.setImageResource(R.drawable.ic_whale_black); // DSH 官方黑鲸鱼（无背景）
+        iconView.setImageResource(R.drawable.ic_whale_black); // DSH 鲸鱼（品牌蓝+白描边）
         iconView.setLayoutParams(new LinearLayout.LayoutParams(dp(40), dp(40)));
         iconRow.addView(iconView);
         rootView.addView(iconRow);
 
-        // ===== 状态面板（默认隐藏）=====
+        // ===== 状态面板（紧凑版，默认隐藏）=====
         panelView = new LinearLayout(this);
         panelView.setOrientation(LinearLayout.VERTICAL);
-        panelView.setPadding(dp(4), dp(4), dp(4), dp(2));
+        panelView.setPadding(dp(10), dp(8), dp(10), dp(8));
         GradientDrawable pbg = new GradientDrawable();
-        pbg.setColor(0xE61A2140);              // 深蓝半透明
-        pbg.setCornerRadius(dp(16));
+        pbg.setColor(getColor(R.color.panel_bg));              // 深蓝半透明（统一配色资源）
+        pbg.setCornerRadius(dp(12));
         panelView.setBackground(pbg);
 
         statusText = new TextView(this);
         statusText.setText("状态：检测中…");
-        statusText.setTextColor(0xFFE8EDFF);
-        statusText.setTextSize(12);
+        statusText.setTextColor(getColor(R.color.panel_text_bright));
+        statusText.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_caption));
         panelView.addView(statusText);
 
-        // AI 回复状态（session.list 的 running 字段，每 ~6 秒刷新）
+        // AI 会话状态（/proc 会话写入器扫描，每 ~6 秒刷新；v1.13.12 起不再是永远"空闲"）
         aiText = new TextView(this);
         aiText.setText("AI：—");
-        aiText.setTextColor(0xFF9DB4FF);
-        aiText.setTextSize(12);
+        aiText.setTextColor(getColor(R.color.panel_text_dim));
+        aiText.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_caption));
         panelView.addView(aiText);
 
         // v1.9 虚拟屏预览（默认隐藏）：悬浮窗实时显示虚拟屏画面
         vscreenImageView = new ImageView(this);
-        LinearLayout.LayoutParams vsp = new LinearLayout.LayoutParams(dp(240), dp(400));
+        LinearLayout.LayoutParams vsp = new LinearLayout.LayoutParams(dp(176), dp(298));
         vsp.topMargin = dp(6);
         vscreenImageView.setLayoutParams(vsp);
         vscreenImageView.setScaleType(ImageView.ScaleType.FIT_CENTER);
         vscreenImageView.setVisibility(View.GONE);
         vscreenImageView.setBackgroundColor(0x88000000);
-        vscreenImageView.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { /* 点一下无操作，可后续做全屏 */ }
-        });
         panelView.addView(vscreenImageView);
 
-        portText = new TextView(this);
-        portText.setText("端口：: " + enginePort);
-        portText.setTextColor(0xFF9DB4FF);
-        portText.setTextSize(12);
-        panelView.addView(portText);
-
-        // 按钮行
-        LinearLayout btnRow = new LinearLayout(this);
-        btnRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnRow.setGravity(Gravity.CENTER_VERTICAL);
-        LinearLayout.LayoutParams brp = new LinearLayout.LayoutParams(
+        // v1.13.12：按钮重做 —— 面板不需要大按钮，两行小胶囊足够；端口行整体移除
+        // （端口在控制台/通知里都有，天天显示在悬浮窗上没有信息量）。
+        LinearLayout btnRow1 = new LinearLayout(this);
+        btnRow1.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams r1p = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        brp.topMargin = dp(6);
-        btnRow.setLayoutParams(brp);
+        r1p.topMargin = dp(7);
+        btnRow1.setLayoutParams(r1p);
+        btnRow1.addView(pillButton("打开应用", new Runnable() { @Override public void run() {
+            Intent i = new Intent(OverlayService.this, MainActivity.class);
+            i.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
+            try { startActivity(i); } catch (Throwable ignored) {}
+            setPanelVisible(false, true);
+        }}));
+        btnRow1.addView(pillButton("虚拟屏", new Runnable() { @Override public void run() {
+            // 预览窗被「收起到小鲸鱼」后的回程入口；没有虚拟屏时桥服务会静默忽略
+            try { VsreenBridgeService.showPreviewFromWhale(); } catch (Throwable ignored) {}
+            setPanelVisible(false, true);
+        }}));
 
-        Button openBtn = smallButton("打开应用");
-        openBtn.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                Intent i = new Intent(OverlayService.this, MainActivity.class);
-                i.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
-                try { startActivity(i); } catch (Throwable ignored) {}
-            }
-        });
-        btnRow.addView(openBtn);
+        LinearLayout btnRow2 = new LinearLayout(this);
+        btnRow2.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams r2p = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        r2p.topMargin = dp(5);
+        btnRow2.setLayoutParams(r2p);
+        // 销毁屏：替代旧预览窗上的 ✕（用户要求销毁功能收进小鲸鱼面板）
+        destroyBtn = pillButton("销毁屏", new Runnable() { @Override public void run() {
+            try { VsreenBridgeService.destroyVscreenFromWhale(); } catch (Throwable ignored) {}
+            setPanelVisible(false, true);
+        }});
+        destroyBtn.setVisibility(View.GONE);
+        btnRow2.addView(destroyBtn);
+        btnRow2.addView(pillButton("收起", new Runnable() { @Override public void run() {
+            setPanelVisible(false, true);
+        }}));
 
-        Button collapseBtn = smallButton("收起");
-        collapseBtn.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { setPanelVisible(false); }
-        });
-        LinearLayout.LayoutParams cp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        cp.leftMargin = dp(6);
-        collapseBtn.setLayoutParams(cp);
-        btnRow.addView(collapseBtn);
-
-        Button closeBtn = smallButton("关闭");
-        closeBtn.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { stopSelf(); }
-        });
-        LinearLayout.LayoutParams xp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        xp.leftMargin = dp(6);
-        closeBtn.setLayoutParams(xp);
-        btnRow.addView(closeBtn);
-
-        panelView.addView(btnRow);
+        panelView.addView(btnRow1);
+        panelView.addView(btnRow2);
         rootView.addView(panelView);
-        setPanelVisible(false);
+        setPanelVisible(false, false);
 
-        // ===== 拖动 + 点击 =====
+        // ===== 拖动 + 点击 + 拖底隐藏 =====
         rootView.setOnTouchListener(new View.OnTouchListener() {
             private long downAt = 0;
             @Override public boolean onTouch(View v, MotionEvent ev) {
@@ -312,16 +355,23 @@ public class OverlayService extends Service {
                             lp.x = (int) (startX + (ev.getRawX() - touchX));
                             lp.y = (int) (startY + (ev.getRawY() - touchY));
                             try { wm.updateViewLayout(rootView, lp); } catch (Throwable ignored) {}
+                            updateDismissHint(ev.getRawY());
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
-                        if (!dragging && System.currentTimeMillis() - downAt < 400) {
-                            setPanelVisible(!panelVisible);
+                        if (dragging && dismissHint) {
+                            hideByDragToBottom();
+                        } else if (dragging) {
+                            snapToEdge();      // 拖完自动吸到最近的左右边缘（静置态=半藏）
+                            if (panelVisible) setPanelVisible(true, false);
+                        } else if (System.currentTimeMillis() - downAt < 400) {
+                            setPanelVisible(!panelVisible, true);
                         }
+                        setDismissHintInternal(false);
                         return true;
                     case MotionEvent.ACTION_OUTSIDE:
-                        // 点击悬浮窗外区域：收回面板
-                        setPanelVisible(false);
+                        // 点击悬浮窗外区域：收回面板（回到半藏态）
+                        if (panelVisible) setPanelVisible(false, true);
                         return true;
                 }
                 return false;
@@ -329,42 +379,73 @@ public class OverlayService extends Service {
         });
     }
 
-    private Button smallButton(String text) {
+    /** 面板里的小胶囊按钮（v1.13.12 重做：小、轻、不抢眼）。 */
+    private Button pillButton(String text, final Runnable action) {
         Button b = new Button(this);
         b.setText(text);
-        b.setTextSize(12);
-        b.setTextColor(0xFF4D6BFE);
+        b.setAllCaps(false);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_caption));
+        b.setTextColor(getColor(R.color.accent_brand));
+        b.setTypeface(null, Typeface.BOLD);
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(0xFFFFFFFF);
-        bg.setCornerRadius(dp(12));
+        bg.setCornerRadius(dp(11));
         b.setBackground(bg);
-        b.setPadding(dp(10), dp(4), dp(10), dp(4));
+        b.setSingleLine(true);
+        b.setPadding(dp(4), 0, dp(4), 0);
         b.setMinHeight(0);
         b.setMinWidth(0);
-        b.setAllCaps(false);
+        b.setMinimumHeight(0);
+        b.setMinimumWidth(0);
+        b.setHeight(dp(25));
+        LinearLayout.LayoutParams lp2 = new LinearLayout.LayoutParams(0, dp(25), 1f);
+        lp2.leftMargin = dp(3);
+        lp2.rightMargin = dp(3);
+        b.setLayoutParams(lp2);
+        b.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) {
+            try { action.run(); } catch (Throwable ignored) {}
+        }});
         return b;
     }
 
-    private void setPanelVisible(boolean show) {
-        panelVisible = show;
-        if (panelView != null) panelView.setVisibility(show ? View.VISIBLE : View.GONE);
-        // 注意：buildOverlay() 在 addToWindow() 之前调用（此时 lp 可能为 null），必须判空
-        if (lp != null) {
-            lp.width = WindowManager.LayoutParams.WRAP_CONTENT;
-            lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            try { wm.updateViewLayout(rootView, lp); } catch (Throwable ignored) {}
-        }
-    }
+    // ==================== 可见性 / 贴边 / 动画 ====================
 
     /** 悬浮窗整体可见性（App 前台隐藏、退后台显示；服务常驻只切视图）。 */
     public static void setOverlayVisible(boolean show) {
         OverlayService s = instance;
-        if (s != null) s.applyVisible(show);
+        if (s != null) { s.foregroundWantsHidden = !show; s.applyVisibleNow(); }
     }
 
-    private void applyVisible(boolean show) {
+    /**
+     * v1.13.11：虚拟屏预览「收起到小鲸鱼」。
+     * v1.13.12 语义收窄：pin 只代表"预览帧继续在小鲸鱼面板里拉"，**不再强制可见** ——
+     * 之前它会盖过前台隐藏，用户在 App 里也会看到小鲸鱼（报过"偶尔在 dsh 中也显示小鲸鱼"）。
+     * @param pin true=开始拉虚拟屏画面到面板；false=停止
+     */
+    public static void pinForVscreen(boolean pin) {
+        OverlayService s = instance;
+        if (s != null) s.applyVscreenPin(pin);
+    }
+
+    private void applyVscreenPin(boolean pin) {
         try {
-            if (rootView != null) rootView.setVisibility(show ? View.VISIBLE : View.GONE);
+            vscreenPinned = pin;
+            if (pin) startVscreenPreview();
+            else stopVscreenPreview();
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * 实际可见性。v1.13.12 起规则只有两条：
+     * ① App 在前台（foregroundWantsHidden）→ 隐藏，无论虚拟屏是否钉住；
+     * ② 用户拖底主动隐藏（userHidden）→ 隐藏，直到通知栏「显示小鲸鱼」。
+     */
+    private void applyVisibleNow() {
+        try {
+            if (rootView != null) {
+                boolean show = !foregroundWantsHidden && !userHidden;
+                rootView.setVisibility(show ? View.VISIBLE : View.GONE);
+            }
         } catch (Throwable ignored) {}
     }
 
@@ -378,22 +459,177 @@ public class OverlayService extends Service {
                 type,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+                        // FLAG_LAYOUT_NO_LIMITS：允许窗口越出屏幕边界 —— 静置"半藏"就靠它
                         | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
                         | WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
                 PixelFormat.TRANSLUCENT);
         lp.gravity = Gravity.TOP | Gravity.START;
         lp.x = dp(12);
         lp.y = dp(160);
-        try { wm.addView(rootView, lp); } catch (Throwable t) {
+        try {
+            wm.addView(rootView, lp);
+            rootView.post(new Runnable() { @Override public void run() { snapToEdge(); } });
+        } catch (Throwable t) {
             stopSelf();
         }
     }
 
+    /**
+     * v1.13.12：贴边 = 面板收起时把小鲸鱼**半藏**到屏幕边缘（露出约一半），
+     * 面板展开时完整贴边（否则面板会被截掉）。
+     */
+    private void snapToEdge() {
+        try {
+            if (lp == null || rootView == null) return;
+            int screenH = getResources().getDisplayMetrics().heightPixels;
+            int w = rootView.getWidth() > 0 ? rootView.getWidth() : dp(60);
+            int h = rootView.getHeight() > 0 ? rootView.getHeight() : dp(56);
+            snappedRight = (lp.x + w / 2) > getResources().getDisplayMetrics().widthPixels / 2;
+            lp.x = edgeXFor(w);
+            if (lp.y < 0) lp.y = 0;
+            if (lp.y > screenH - h) lp.y = Math.max(0, screenH - h);
+            wm.updateViewLayout(rootView, lp);
+        } catch (Throwable ignored) {}
+    }
+
+    /**
+     * 贴边坐标：snappedRight 决定靠哪边；tucked 决定是否半藏。
+     * 面板收起（静置）→ 半藏：x 让窗口越出屏幕 (1-露出的比例)；展开 → 完整可见 + 留 4dp 边距。
+     */
+    private int edgeXFor(int viewWidth) {
+        int screenW = getResources().getDisplayMetrics().widthPixels;
+        boolean tucked = !panelVisible;
+        if (tucked) {
+            int off = Math.round(viewWidth * (1f - TUCK_VISIBLE_FRACTION));
+            return snappedRight ? screenW - viewWidth + off : -off;
+        }
+        return snappedRight ? Math.max(dp(4), screenW - viewWidth - dp(4)) : dp(4);
+    }
+
+    /** 面板显示/隐藏；animate=true 时带旋转抖动 + 位置过渡（唤出、收起共用）。 */
+    private void setPanelVisible(boolean show, boolean animate) {
+        panelVisible = show;
+        if (panelView != null) panelView.setVisibility(show ? View.VISIBLE : View.GONE);
+        if (show) refreshPanelDynamicRows();
+        if (lp == null) return;
+        lp.width = WindowManager.LayoutParams.WRAP_CONTENT;
+        lp.height = WindowManager.LayoutParams.WRAP_CONTENT;
+        try { wm.updateViewLayout(rootView, lp); } catch (Throwable ignored) {}
+        if (!animate) {
+            snapToEdge();
+        } else {
+            wiggle();
+            animateToEdge();
+        }
+        if (rootView != null) {
+            rootView.post(new Runnable() { @Override public void run() {
+                // 布局落定后再夹一次（展开后面板更宽，贴右边缘会被推出屏幕）
+                if (panelVisible) clampPanelOnScreen(); else snapToEdge();
+            }});
+        }
+    }
+
+    /** 面板每次展开时刷新"看场景才该出现"的行（如销毁屏按钮）。 */
+    private void refreshPanelDynamicRows() {
+        try {
+            if (destroyBtn != null) {
+                destroyBtn.setVisibility(VsreenBridgeService.sVscreenRunning
+                        ? View.VISIBLE : View.GONE);
+            }
+        } catch (Throwable ignored) {}
+    }
+
+    /** 位置过渡：从当前 x 平滑滑到目标贴边位（半藏/完整随面板状态）。 */
+    private void animateToEdge() {
+        try {
+            if (lp == null || rootView == null) return;
+            int w = rootView.getWidth() > 0 ? rootView.getWidth() : dp(60);
+            final int targetX = edgeXFor(w);
+            final int fromX = lp.x;
+            if (fromX == targetX) return;
+            android.animation.ValueAnimator va =
+                    android.animation.ValueAnimator.ofInt(fromX, targetX);
+            va.setDuration(260);
+            va.setInterpolator(new OvershootInterpolator(0.6f));
+            va.addUpdateListener(new android.animation.ValueAnimator.AnimatorUpdateListener() {
+                @Override public void onAnimationUpdate(android.animation.ValueAnimator a) {
+                    if (lp == null || rootView == null) return;
+                    lp.x = (Integer) a.getAnimatedValue();
+                    try { wm.updateViewLayout(rootView, lp); } catch (Throwable ignored) {}
+                }
+            });
+            va.start();
+        } catch (Throwable ignored) {}
+    }
+
+    /** 旋转抖动动画（唤出/收起时的"小鲸鱼摆尾巴"）。只转图标，不转整块面板。 */
+    private void wiggle() {
+        try {
+            if (iconView == null) return;
+            android.animation.ObjectAnimator.ofFloat(
+                    iconView, View.ROTATION, 0f, -14f, 11f, -8f, 5f, 0f)
+                    .setDuration(420)
+                    .start();
+        } catch (Throwable ignored) {}
+    }
+
+    /** 拖动中：接近屏幕底部时给出"松手即隐藏"的暗示（图标缩小变淡）。 */
+    private void updateDismissHint(float rawY) {
+        int screenH = getResources().getDisplayMetrics().heightPixels;
+        boolean inZone = rawY > screenH - dp(DISMISS_ZONE_DP);
+        if (inZone != dismissHint) setDismissHintInternal(inZone);
+    }
+
+    private void setDismissHintInternal(boolean on) {
+        dismissHint = on;
+        try {
+            if (iconView == null) return;
+            iconView.animate().scaleX(on ? 0.62f : 1f).scaleY(on ? 0.62f : 1f)
+                    .alpha(on ? 0.7f : 1f).setDuration(140).start();
+        } catch (Throwable ignored) {}
+    }
+
+    /** 拖到底部松手：隐藏小鲸鱼（通知栏「显示小鲸鱼」可恢复）。 */
+    private void hideByDragToBottom() {
+        userHidden = true;
+        try {
+            rootView.animate().alpha(0f).scaleX(0.5f).scaleY(0.5f).setDuration(180)
+                    .withEndAction(new Runnable() { @Override public void run() {
+                        try {
+                            rootView.setAlpha(1f);
+                            setDismissHintInternal(false);
+                            applyVisibleNow();
+                        } catch (Throwable ignored) {}
+                    }}).start();
+        } catch (Throwable ignored) {
+            applyVisibleNow();
+        }
+        try {
+            android.widget.Toast.makeText(getApplicationContext(),
+                    "小鲸鱼已隐藏，可从通知栏「显示小鲸鱼」恢复", android.widget.Toast.LENGTH_LONG).show();
+        } catch (Throwable ignored) {}
+    }
+
+    private void clampPanelOnScreen() {
+        try {
+            if (lp == null || rootView == null) return;
+            int w = rootView.getWidth();
+            if (w <= 0) return;
+            if (!panelVisible) {
+                lp.x = edgeXFor(w);
+            } else {
+                int maxX = getResources().getDisplayMetrics().widthPixels - w - dp(4);
+                if (lp.x > maxX) lp.x = Math.max(dp(4), maxX);
+            }
+            wm.updateViewLayout(rootView, lp);
+        } catch (Throwable ignored) {}
+    }
+
+    // ==================== 引擎探测 / AI 会话状态 ====================
+
     /** 探测引擎是否在跑。
      *  v1.13：0.1.5 起首页需要一次性 token —— 不带 token 返回 401 + 纯文本
-     *  “dsh web authentication required…”，带有效 token 返回 303 跳转；两种都说明“引擎在跑”。
-     *  旧实现只认首页 HTML 里的 <title>DeepSeek Harness</title>，于是引擎明明在跑（401）
-     *  也被判成“未运行” → 悬浮窗与常驻通知一直显示“未启动”（用户实测）。 */
+     *  “dsh web authentication required…”，带有效 token 返回 303 跳转；两种都说明“引擎在跑”。 */
     private boolean engineAlive(int port) {
         HttpURLConnection c = null;
         try {
@@ -401,7 +637,6 @@ public class OverlayService extends Service {
             c.setConnectTimeout(1200);
             c.setReadTimeout(1500);
             c.setRequestProperty("User-Agent", "dsh-overlay-probe");
-            // 不跟随重定向：303 就是“token 有效”，跟随反而会把 token 浪费掉
             c.setInstanceFollowRedirects(false);
             int code = c.getResponseCode();
             if (code == 303 || code == 302) return true;
@@ -442,60 +677,42 @@ public class OverlayService extends Service {
         }
     }
 
-    /** 会话信息（仅取 AI 回复状态 running） */
-    private static class SessionInfo {
-        boolean running;
-    }
-
-    /** 拉取最近会话信息：POST /api/session.list（标准 RPC 协议）。
-     *  响应结构实测：{"type":"server-response","result":{"ok":true,"value":{"items":[...]}}}
-     *  items[0] 字段：sessionId/updatedAt/running/blank/cwd/agentPreset（新会话无 title，blank=true）。
-     *  无会话/失败返回 null，不抛异常（悬浮窗探测线程静默）。 */
-    private SessionInfo fetchSessionInfo() {
-        HttpURLConnection c = null;
+    /**
+     * 扫出"正在被引擎写入"的会话集合（session 目录路径）。
+     *
+     * 机制依据：dsh-session-persistence-jsonl 的 SessionWriteLease 在会话写入器存活期间
+     * 持有 <会话目录>/session.lock 的独占锁，释放 = 关闭 fd。所以
+     * 「同 uid 进程的 /proc/<pid>/fd 里存在指向 session.lock 的 fd」⟺ 该会话正在工作。
+     * node 是本 App 的子进程（同 uid），/proc 对同 uid 可读 —— findEnginePid 已验证过这条路。
+     *
+     * 旧实现走 POST /api/session.list：0.1.5 起要认证 cookie，悬浮窗拿不到（永远 401），
+     * 表现就是"AI：空闲"永远不变。此扫描不需要任何认证。
+     *
+     * /proc 完全扫不动（被 SELinux 拦等极端情况）返回 null，调用方保持上次结果。
+     */
+    private HashSet<String> scanActiveSessions() {
+        HashSet<String> out = new HashSet<String>();
         try {
-            String rpcId = "ov-" + System.currentTimeMillis();
-            String body = "{\"type\":\"client-request\",\"rpcId\":\"" + rpcId
-                    + "\",\"method\":\"session.list\",\"payload\":{}}";
-            c = (HttpURLConnection) new URL("http://127.0.0.1:" + enginePort + "/api/session.list").openConnection();
-            c.setRequestMethod("POST");
-            c.setRequestProperty("Content-Type", "application/json");
-            c.setDoOutput(true);
-            c.setConnectTimeout(1200);
-            c.setReadTimeout(1500);
-            c.getOutputStream().write(body.getBytes("UTF-8"));
-            int code = c.getResponseCode();
-            if (code < 200 || code >= 300) return null;
-            InputStream in = c.getInputStream();
-            ByteArrayOutputStream out = new ByteArrayOutputStream();
-            byte[] b = new byte[4096];
-            int n;
-            while ((n = in.read(b)) > 0) out.write(b, 0, n);
-            try { in.close(); } catch (Throwable ignored) {}
-            return findSessionInfo(new String(out.toByteArray(), "UTF-8"));
-        } catch (Throwable t) {
-            return null;
-        } finally {
-            if (c != null) c.disconnect();
-        }
-    }
-
-    /** 解析 session.list 响应：result.value.items[0]，取 title + running。
-     *  新会话（blank）无 title → 显示"新会话"。 */
-    private SessionInfo findSessionInfo(String json) {
-        try {
-            JSONObject o = new JSONObject(json);
-            JSONObject result = o.optJSONObject("result");
-            if (result == null) result = o;
-            JSONObject value = result.optJSONObject("value");
-            if (value != null) result = value;
-            JSONArray items = result.optJSONArray("items");
-            if (items == null || items.length() == 0) return null;
-            JSONObject s = items.optJSONObject(0);
-            if (s == null) return null;
-            SessionInfo info = new SessionInfo();
-            info.running = s.optBoolean("running", false);
-            return info;
+            File[] procs = new File("/proc").listFiles();
+            if (procs == null) return null;
+            for (File d : procs) {
+                String name = d.getName();
+                if (name == null || name.isEmpty() || !Character.isDigit(name.charAt(0))) continue;
+                File fdDir = new File(d, "fd");
+                String[] fds;
+                try { fds = fdDir.list(); } catch (Throwable t) { fds = null; }
+                if (fds == null) continue;   // 别的 uid 的进程：无权读，跳过
+                for (String fd : fds) {
+                    String target;
+                    try { target = new File(fdDir, fd).getCanonicalPath(); } catch (Throwable t) { continue; }
+                    int i = target.indexOf("/dshhome/sessions/");
+                    if (i < 0) continue;
+                    if (!target.endsWith("/session.lock")) continue;
+                    // 会话目录 = session.lock 所在目录（…/sessions/<cwd编码>/<session-id>）
+                    out.add(target.substring(0, target.lastIndexOf('/')));
+                }
+            }
+            return out;
         } catch (Throwable t) {
             return null;
         }
@@ -507,38 +724,45 @@ public class OverlayService extends Service {
             statusText.setText("状态：" + (engineUp ? "引擎运行中 ✓" : "引擎未运行"));
         }
         if (aiText != null) {
-            if (engineUp) {
-                aiText.setText(lastSessionRunning ? "AI：回复中…" : "AI：空闲");
-            } else {
-                aiText.setText("AI：—");
-            }
+            aiText.setText(aiStatusText());
         }
-        if (portText != null) {
-            portText.setText("端口：: " + enginePort);
-        }
+        // 面板开着的话顺带刷新销毁屏按钮的可见性
+        if (panelVisible) refreshPanelDynamicRows();
         // 更新常驻通知
         try {
             NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-            if (nm != null) {
-                Notification.Builder b;
-                if (Build.VERSION.SDK_INT >= 26) {
-                    b = new Notification.Builder(this, CHANNEL_ID);
-                } else {
-                    b = new Notification.Builder(this);
-                }
-                Intent open = new Intent(this, MainActivity.class);
-                open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
-                PendingIntent pi = PendingIntent.getActivity(this, 0, open,
-                        PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-                Notification n = b.setContentTitle("🐋 黑鲸鱼悬浮窗运行中")
-                        .setContentText("引擎状态：" + (engineUp ? "运行中 :" + enginePort : "未运行"))
-                        .setSmallIcon(R.drawable.ic_launcher)
-                        .setContentIntent(pi)
-                        .build();
-                nm.notify(NOTIF_ID, n);
-            }
+            if (nm != null) nm.notify(NOTIF_ID, buildNotification());
         } catch (Throwable ignored) {}
     }
+
+    /**
+     * AI 状态行：空闲 / 工作中会话（可多个）/ 已完成。
+     *  - 有持锁会话 → "工作中 N 个会话"；
+     *  - 上次还工作中、现在没了 → 记一个"刚完成"时间点，60 秒内显示"已完成"；
+     *  - 其余 → "空闲"。引擎不在跑时显示"—"。
+     */
+    private String aiStatusText() {
+        if (!engineUp) return "AI：—";
+        HashSet<String> cur = activeSessions;
+        if (cur == null) return "AI：—";       // 还没扫过 / /proc 扫不了
+        int n = cur.size();
+        long now = System.currentTimeMillis();
+        if (n > 0) {
+            lastSessionsHadWork = true;   // 边沿触发源：从"有会话工作"变"没有"时报已完成
+            finishedAt = 0L;
+            return n == 1 ? "AI：1 个会话工作中…" : "AI：" + n + " 个会话工作中…";
+        }
+        if (finishedAt == 0L && lastSessionsHadWork) {
+            finishedAt = now;
+        }
+        if (finishedAt > 0L && now - finishedAt < FINISHED_TTL_MS) {
+            return "AI：会话已完成 ✓";
+        }
+        lastSessionsHadWork = false;
+        return "AI：空闲";
+    }
+    /** 上次扫描是否看到过工作中的会话（用于"已完成"的边沿触发）。 */
+    private volatile boolean lastSessionsHadWork = false;
 
     // ==================== v1.9 虚拟屏预览（悬浮窗实时看 AI 操作虚拟屏） ====================
 
