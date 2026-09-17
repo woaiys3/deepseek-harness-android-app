@@ -60,7 +60,9 @@ public class Main {
      * 没人管的孤儿屏；看门狗负责销毁虚拟屏并退出进程（用户问过"强制关闭会不会
      * 销毁虚拟桌面"，现在答案是：会，20 秒内自动收掉）。
      */
-    private static final long HEARTBEAT_TIMEOUT_MS = 20000L;
+    // 60s（原 20s 偏紧）：桥的轮询虽然约 750ms 一次，但单次请求超时是 status 3s /
+    // preview 5s，一旦开始超时轮询会被拖长，20s 的余量可能被吃穿 → 误杀虚拟屏。
+    private static final long HEARTBEAT_TIMEOUT_MS = 60000L;
     private static volatile long sLastRequestAt = System.currentTimeMillis();
 
     private static final int DEFAULT_PORT = 8998;
