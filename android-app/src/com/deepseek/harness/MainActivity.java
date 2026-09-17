@@ -3168,11 +3168,21 @@ public class MainActivity extends Activity {
 
             File target;
             boolean skipIfExists = false;
-            if (additive && isDshroot && name.startsWith("dshroot/lib/node_modules/@deepseek-ai/")) {
-                // 记录新树里的顶层插件包名（@deepseek-ai/<pkg>/... 的第三段）
-                String rest = name.substring("dshroot/lib/node_modules/@deepseek-ai/".length());
-                int slash = rest.indexOf('/');
-                if (slash > 0) addPkgs.add(rest.substring(0, slash));
+            if (additive && isDshroot) {
+                // 记录新树里的插件包名。⚠ 真实布局是**嵌套**的：
+                //     dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/<pkg>/...
+                // 顶层 dshroot/lib/node_modules/@deepseek-ai/ 下只有 dsh 本身 ——
+                // 只认顶层前缀会得到 rest="dsh/node_modules/..."，取出来的"包名"是 dsh，
+                // 于是 addPkgs 恒为 {"dsh"}，下面的清理变成空转。
+                final String NESTED = "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/";
+                final String FLAT = "dshroot/lib/node_modules/@deepseek-ai/";
+                String rest = null;
+                if (name.startsWith(NESTED)) rest = name.substring(NESTED.length());
+                else if (name.startsWith(FLAT)) rest = name.substring(FLAT.length());
+                if (rest != null) {
+                    int slash = rest.indexOf('/');
+                    if (slash > 0) addPkgs.add(rest.substring(0, slash));
+                }
             }
             if (isDshroot && externalRoot != null) {
                 target = new File(externalRoot, name);
@@ -3240,9 +3250,17 @@ public class MainActivity extends Activity {
         // 增量补齐收尾：清理"新树里已不存在"的顶层插件包，防止旧副本被 Node 优先解析。
         // 只清 @deepseek-ai 插件层（包管理范畴，AI 不会改），不动整棵树。
         if (additive && addPkgs != null && !addPkgs.isEmpty()) {
-            File[] scope = { new File(destInternal, "dshroot/lib/node_modules/@deepseek-ai") };
+            // ⚠ 必须同时覆盖**嵌套层**：插件包实际都在
+            //   dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/
+            // 只扫顶层（里面只有 dsh 自己）等于什么都不清。
+            final String NESTED_DIR = "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai";
+            File[] scope = {
+                    new File(destInternal, NESTED_DIR),
+                    new File(destInternal, "dshroot/lib/node_modules/@deepseek-ai") };
             if (externalRoot != null) scope = new File[]{
+                    new File(destInternal, NESTED_DIR),
                     new File(destInternal, "dshroot/lib/node_modules/@deepseek-ai"),
+                    new File(externalRoot, NESTED_DIR),
                     new File(externalRoot, "dshroot/lib/node_modules/@deepseek-ai") };
             for (File dir : scope) {
                 File[] kids = dir.listFiles();
