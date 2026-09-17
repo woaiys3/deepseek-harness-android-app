@@ -1801,7 +1801,11 @@ public class MainActivity extends Activity {
                 "/dsh-tool-android/",
                 "/dsh-tool-accessibility/",
                 "/dsh-tool-shizuku/",
-                "/dsh-bash-local/"
+                "/dsh-bash-local/",
+                // grep/glob 修复：fs-search 的 resolveRgPath 已改为 Android 走自带的 runtime/bin/rg
+                // （@vscode/ripgrep 没有 android 平台包，模块求值即 throw）。不在这张表里，
+                // 老版本升上来就仍是旧文件，grep/glob 会继续报 ripgrep launch failed。
+                "/dsh-tool-fs-search/"
         };
         int copied = 0;
         java.util.zip.ZipInputStream zis = null;
@@ -3098,7 +3102,13 @@ public class MainActivity extends Activity {
             if (builtin.isEmpty()) return true; // 无版本标记（旧 APK）→ 保守走全量
             File pkg = new File(dshrootBase, "dshroot/lib/node_modules/@deepseek-ai/dsh/package.json");
             if (!pkg.exists()) return true;
-            return !readFileText(pkg).contains("\"version\":\"" + builtin + "\"");
+            // ⚠ 必须真解析 JSON，不能用 contains("\"version\":\""+builtin+"\"")：
+            // dsh/package.json 是带空格的 pretty-print（  "version": "0.1.5-rc.1",  ），
+            // 严格拼接的字符串永远匹配不上 → 每次都被判"内核版本变了" →
+            // dshrootNeedsFullSync 恒为真 → dshroot-add / dshroot-fast 永远不触发，
+            // 每次升级都全量重写 2.5 万文件（"更新后又要解压一遍"的真根因）。
+            String v = new org.json.JSONObject(readFileText(pkg)).optString("version", "");
+            return !builtin.equals(v);
         } catch (Throwable t) {
             return true; // 读不到 → 保守全量
         }
