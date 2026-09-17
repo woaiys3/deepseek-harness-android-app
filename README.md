@@ -123,9 +123,9 @@
 
 下载 [Releases](https://github.com/woaiys3/deepseek-harness-android-app/releases) 里的 APK 安装即可：
 
-- **`DeepSeekHarness-official-v1.13.6.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
-- **`DeepSeekHarness-Lite-v1.13.6.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
-- **`DeepSeekHarness-compat-v1.13.6.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
+- **`DeepSeekHarness-official-v1.14.0.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
+- **`DeepSeekHarness-Lite-v1.14.0.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
+- **`DeepSeekHarness-compat-v1.14.0.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
 
 要求：
 - Android 7.0（API 24）及以上
