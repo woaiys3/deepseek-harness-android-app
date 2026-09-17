@@ -1,3 +1,97 @@
+## v1.14.0（正式版 + Lite 共存版 + 兼容版 · 2026-09-18）
+
+> 合并社区 @xhwxt 的 PR #22（壳层修复与改进，11 文件 +1546/−773），并修掉本轮查出的 4 个真 bug。
+> 其中「**快速同步自 v1.5.2 引入起从未生效**」是issue #20 之前用户最早那个疑问
+> ——「每次更新 APP 都要重新解压是 bug 吗」——的**真答案**。
+> versionCode **36**，内核仍为 DSH 0.1.5-rc.1。
+
+### 🎁 合并 PR #22（@xhwxt）
+
+- **覆盖安装丢模型/供应商配置（#20）**：`dshhome/settings.yaml` 与 `.credentials.yaml` 移出覆盖清单，
+  改入 `DSHHOME_USER_PATHS`，在 `extractPayload()`（写盘处）与 `refreshInternalConfig()`（配置刷新处）
+  **两处都拦**。真机日志 `refreshed 5 dshhome config files`（原为 6）验证生效。
+  > 我此前独立改过一份，但**他这份更彻底，故未重复施加**，以他的实现为准。
+- 另含沉浸式布局、桥服务类名、解压流程等改进（详见 PR）。
+
+### 🐛 `dshKernelChanged()` 用字符串拼接比内核版本 → 快速同步恒失效
+
+- **根因**（`MainActivity.java`）：
+  ```java
+  return !readFileText(pkg).contains("\"version\":\"" + builtin + "\"");
+  //                                        └─ 拼出 "version":"0.1.5-rc.1"（冒号后无空格）
+  //                                           而 dsh/package.json 是 pretty-print，实为 "version": "0.1.5-rc.1"
+  //                                           → contains 恒为 false → !false 恒为 true
+  ```
+  `dsh/package.json` 是带空格的 JSON，于是**恒判「内核变了」** → `dshrootNeedsFullSync` 恒真 →
+  `full` 恒 true → **`dshroot-fast` 与 `dshroot-add` 都是死代码**，每次升级全量重写 25,283 个文件。
+- **连带影响**：PR #22 那条「升级重解压」修复（`dshroot-add`）因此**完全没生效**
+  —— `layoutOnly = !full && ...`，而 `full` 恒真。
+- **起始版本**：解老包 payload 验证，v1.5.5 与 v1.9 的 `package.json` 都是 `"version": "0.1.1-rc.2",`（带空格）
+  → **从 v1.5.2 引入快速同步那天起就没工作过**。
+- **修法**：
+  ```java
+  String v = new org.json.JSONObject(readFileText(pkg)).optString("version", "");
+  return !builtin.equals(v);
+  ```
+- **验证**（真机，同机同场景同 `.complete`，只换 App）：
+  ```
+  23:31:50   extracted 25283 entries (mode=dshroot)       ← 修复前
+  23:36:25   extracted    82 entries (mode=dshroot-fast)  ← 修复后
+  ```
+
+### 🐛 `dshroot-add` 的「清理过期插件包」是空转（同 PR 内，同轮查出）
+
+- **背景**：PR #22 用「增量补齐 + 清理过期顶层插件包」替代旧代码的「整棵删树」，
+  其注释写明是为防「旧树的嵌套副本会被 Node 优先解析到（补丁包/依赖树换过就失效）」。
+- **它没起作用**。本项目 payload 是 hoisted+nested 混合布局：
+  ```
+  dshroot/lib/node_modules/@deepseek-ai/                                   ← 顶层，只有 dsh 一个包
+  dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/<pkg>/   ← 所有包都在这一层
+  ```
+  而实现里：记录只认顶层前缀（嵌套路径取出的「包名」恒为 `dsh`）→ `addPkgs` 恒为 `{"dsh"}`；
+  清理也只扫顶层目录（里面只有 `dsh`，且它在 `addPkgs` 里 → `continue`）
+  → **一个包都不会被删，整段空转**。
+- **为何现在才要紧**：在 `dshKernelChanged` 修好之前 `dshroot-add` 是死代码，空转无人发现；
+  修好之后它**真的会跑**了，这层保护缺失就成了实打实的缺口。
+- **修法**：识别真实嵌套前缀来记录包名；清理范围同时覆盖**嵌套层**与顶层（内外置 dshroot 都覆盖）。
+- **验证**（电脑，把 `extractPayload` **逐字抽自源码**、stub 掉 `getAssets`/`Os.chmod` 后跑真 payload）：
+
+  | 断言 | 修复前 | 修复后 |
+  |---|---|---|
+  | ① 白名单文件被强制覆盖 | PASS | PASS |
+  | ② 非白名单已存在文件保持原样 | PASS | PASS |
+  | ③ 磁盘缺失文件被补齐 | PASS | PASS |
+  | ④ 已存在插件包保留 | PASS | PASS |
+  | **⑤ 过期插件包被清理** | **FAIL** `staleExists=true` | **PASS** `false` |
+  | ⑥ REVISION 更新 | PASS | PASS |
+
+### 🐛 悬浮小鲸鱼 / 面板跑出屏幕（用户实测必现）
+
+- **根因**：贴边坐标用 `rootView.getWidth()` 算，而该值在 `wm.updateViewLayout()` 之后、
+  下一次 layout 之前仍是旧的。展开面板时按「小图标宽度」定位 → 面板被推出屏幕；
+  收起时按「面板大宽度」算半藏位 → 整只鲸鱼出屏。原实现的 `rootView.post()` 只延后一条消息，
+  常在 layout 之前；又因 `FLAG_LAYOUT_NO_LIMITS` 系统不夹边界。
+- **修法**：新增 `settleAfterLayout()`（`ViewTreeObserver.OnGlobalLayoutListener`，布局真正落定后
+  调 `applyEdgePos(true)`）+ `applyEdgePos(boolean animate)`。
+- ⚠️ **中途引入过一个回归**：第一版还挂了长期 `addOnLayoutChangeListener` → 拖动窗口/半藏时
+  系统重测宽度都会触发 layoutChange → 每帧把 x 拽回贴边位 → **横向拖不动、半藏站不住**。
+  用户实测报回后已撤掉，只保留一次性摆正。**教训：这类"纠偏"监听必须用完即卸。**
+
+### 🐛 PR #17 把 XML 注释写进 `<activity>` 开始标签内部 → 合并后 main 编不过
+
+- `aapt` 报 `AndroidManifest.xml:43: error: Error parsing XML: not well-formed (invalid token)`，
+  即**合并 PR 后的 main 处于编译阻塞状态**。注释移到标签之前修复。
+
+### 🐛 上游未声明推理强度时，无法给名单外模型配置推理强度（#21）
+
+- 本轮**按维护者决定不做**，issue 保持开启留待后续评估。
+
+### 🔧 虚拟屏看门狗阈值 20s → 60s
+
+- 请求超时可能拖长轮询，20s 余量偏紧会误杀虚拟屏。
+
+---
+
 ## v1.13.6（正式版 + Lite 共存版 + 兼容版 · 2026-09-15）
 
 > 接 v1.13.5：把「**升级用户**」那条路径也覆盖到 —— dex 收权在“文件已存在直接返回”分支也要做。
