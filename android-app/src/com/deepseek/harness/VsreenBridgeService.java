@@ -376,7 +376,7 @@ public class VsreenBridgeService extends Service {
     /** 浮层上的短提示（预览窗是 FLAG_NOT_FOCUSABLE，弹不出对话框）。 */
     private void toast(String msg) {
         try {
-            android.widget.Toast.makeText(getApplicationContext(), msg, android.widget.Toast.LENGTH_SHORT).show();
+            android.widget.Toast.makeText(getApplicationContext(), ShellLocale.t(msg), android.widget.Toast.LENGTH_SHORT).show();
         } catch (Throwable ignored) {}
     }
 
