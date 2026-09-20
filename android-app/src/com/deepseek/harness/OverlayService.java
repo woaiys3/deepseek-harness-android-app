@@ -160,6 +160,7 @@ public class OverlayService extends Service {
         super.onCreate();
         isRunning = true;
         instance = this;
+        ShellLocale.init(this); // язык панели китёнка и уведомлений
         enginePort = enginePort(this);
         wm = (WindowManager) getSystemService(WINDOW_SERVICE);
         startForegroundCompat();
@@ -207,9 +208,9 @@ public class OverlayService extends Service {
     private void startForegroundCompat() {
         NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
         if (Build.VERSION.SDK_INT >= 26) {
-            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "黑鲸鱼悬浮窗",
+            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, ShellLocale.t("黑鲸鱼悬浮窗"),
                     NotificationManager.IMPORTANCE_LOW);
-            ch.setDescription("黑鲸鱼悬浮窗运行中（引擎状态指示）");
+            ch.setDescription(ShellLocale.t("黑鲸鱼悬浮窗运行中（引擎状态指示）"));
             nm.createNotificationChannel(ch);
         }
         startForeground(NOTIF_ID, buildNotification());
@@ -231,12 +232,12 @@ public class OverlayService extends Service {
         show.setAction(ACTION_SHOW);
         PendingIntent showPi = PendingIntent.getService(this, 1, show,
                 PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
-        try { b.addAction(new Notification.Action.Builder(null, "显示小鲸鱼", showPi).build()); }
+        try { b.addAction(new Notification.Action.Builder(null, ShellLocale.t("显示小鲸鱼"), showPi).build()); }
         catch (Throwable ignored) {
             // 老系统 Action.Builder(null, ...) 不吃图标时退化：不显示动作也不影响主流程
         }
-        return b.setContentTitle("🐋 DeepSeek Harness 运行中")
-                .setContentText("引擎状态：" + (engineUp ? "运行中（端口 " + enginePort + "）" : "未运行"))
+        return b.setContentTitle(ShellLocale.t("🐋 DeepSeek Harness 运行中"))
+                .setContentText(ShellLocale.t("引擎状态：" + (engineUp ? "运行中（端口 " + enginePort + "）" : "未运行")))
                 .setSmallIcon(R.drawable.ic_launcher)
                 .setContentIntent(pi)
                 .setOngoing(true)
@@ -334,6 +335,7 @@ public class OverlayService extends Service {
         panelView.addView(btnRow1);
         panelView.addView(btnRow2);
         rootView.addView(panelView);
+        ShellLocale.apply(rootView); // 面板标签/按钮（打开应用、虚拟屏、销毁屏、收起）
         setPanelVisible(false, false);
 
         // ===== 拖动 + 点击 + 拖底隐藏 =====
@@ -667,7 +669,7 @@ public class OverlayService extends Service {
         }
         try {
             android.widget.Toast.makeText(getApplicationContext(),
-                    "小鲸鱼已隐藏，可从通知栏「显示小鲸鱼」恢复", android.widget.Toast.LENGTH_LONG).show();
+                    ShellLocale.t("小鲸鱼已隐藏，可从通知栏「显示小鲸鱼」恢复"), android.widget.Toast.LENGTH_LONG).show();
         } catch (Throwable ignored) {}
     }
 
@@ -785,8 +787,9 @@ public class OverlayService extends Service {
             statusText.setText("状态：" + (engineUp ? "引擎运行中 ✓" : "引擎未运行"));
         }
         if (aiText != null) {
-            aiText.setText(aiStatusText());
+            aiText.setText(ShellLocale.t(aiStatusText()));
         }
+        ShellLocale.apply(rootView); // 状态行「状态：… / AI：…」每次刷新后重译
         // 面板开着的话顺带刷新销毁屏按钮的可见性
         if (panelVisible) refreshPanelDynamicRows();
         // 更新常驻通知

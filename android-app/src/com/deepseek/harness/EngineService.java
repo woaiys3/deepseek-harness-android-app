@@ -27,15 +27,16 @@ public class EngineService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        ShellLocale.init(this); // язык уведомлений
         createChannel();
-        startForeground(NOTIF_ID, buildNotification("DeepSeek Harness 正在运行", "AI 引擎保活中，后台任务持续执行"));
+        startForeground(NOTIF_ID, buildNotification(ShellLocale.t("DeepSeek Harness 正在运行"), ShellLocale.t("AI 引擎保活中，后台任务持续执行")));
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         // 每次收到启动/重启意图都刷新通知（系统杀进程后 START_STICKY 重建也会走到这里）
         NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-        if (nm != null) nm.notify(NOTIF_ID, buildNotification("DeepSeek Harness 正在运行", "AI 引擎保活中，后台任务持续执行"));
+        if (nm != null) nm.notify(NOTIF_ID, buildNotification(ShellLocale.t("DeepSeek Harness 正在运行"), ShellLocale.t("AI 引擎保活中，后台任务持续执行")));
         // 定时任务自动执行：闹钟到点后带 scheduledTask extra 启动本服务，后台执行任务
         if (intent != null) {
             String task = intent.getStringExtra("scheduledTask");
@@ -87,9 +88,9 @@ public class EngineService extends Service {
         if (Build.VERSION.SDK_INT >= 26) {
             NotificationManager nm = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm == null) return;
-            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "引擎保活",
+            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, ShellLocale.t("引擎保活"),
                     NotificationManager.IMPORTANCE_LOW);
-            ch.setDescription("DeepSeek Harness 引擎运行状态");
+            ch.setDescription(ShellLocale.t("DeepSeek Harness 引擎运行状态"));
             nm.createNotificationChannel(ch);
         }
     }

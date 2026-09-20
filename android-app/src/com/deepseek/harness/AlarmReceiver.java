@@ -26,6 +26,7 @@ public class AlarmReceiver extends BroadcastReceiver {
     @Override
     public void onReceive(Context ctx, Intent intent) {
         try {
+            ShellLocale.init(ctx); // 进程可能被闹钟单独拉起，这里也要定语言
             String task = intent != null ? intent.getStringExtra("task") : null;
             String taskId = intent != null ? intent.getStringExtra("taskId") : null;
             if (task == null || task.isEmpty()) task = "定时任务时间到了";
@@ -36,9 +37,9 @@ public class AlarmReceiver extends BroadcastReceiver {
             NotificationManager nm = (NotificationManager) ctx.getSystemService(Context.NOTIFICATION_SERVICE);
             if (nm != null) {
                 if (Build.VERSION.SDK_INT >= 26) {
-                    NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "定时任务",
+                    NotificationChannel ch = new NotificationChannel(CHANNEL_ID, ShellLocale.t("定时任务"),
                             NotificationManager.IMPORTANCE_HIGH);
-                    ch.setDescription("AI 设置的定时提醒");
+                    ch.setDescription(ShellLocale.t("AI 设置的定时提醒"));
                     nm.createNotificationChannel(ch);
                 }
                 Intent open = new Intent(ctx, MainActivity.class);
@@ -51,7 +52,7 @@ public class AlarmReceiver extends BroadcastReceiver {
                 } else {
                     b = new Notification.Builder(ctx);
                 }
-                Notification n = b.setContentTitle("⏰ 定时任务")
+                Notification n = b.setContentTitle(ShellLocale.t("⏰ 定时任务"))
                         .setContentText(task)
                         .setSmallIcon(R.drawable.ic_launcher)
                         .setContentIntent(pi)

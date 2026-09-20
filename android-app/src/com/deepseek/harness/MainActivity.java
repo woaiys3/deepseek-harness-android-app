@@ -218,6 +218,7 @@ public class MainActivity extends Activity {
         // v1.13.12 起主题可在控制台选「跟随系统/浅色/深色」，不再只能跟系统。
         setTheme(themePrefersDark() ? R.style.AppTheme : R.style.AppTheme_Light);
         super.onCreate(savedInstanceState);
+        ShellLocale.init(this); // язык оболочки: 跟随系统 / 中文 / русский（仅影响显示）
         enginePort = defaultEnginePort(this); // 三版本各自独立端口（见 defaultEnginePort）
         applyStatusBar(); // 状态栏/导航栏底色跟随 App 主题（浅色模式不再是一条黑条）
         installCrashHandler();
@@ -329,7 +330,7 @@ public class MainActivity extends Activity {
         });
 
         statusView = new TextView(this);
-        statusView.setText("正在启动 DeepSeek Harness…");
+        statusView.setText(ShellLocale.t("正在启动 DeepSeek Harness…"));
         statusView.setTextColor(cSub());
         statusView.setTextSize(TypedValue.COMPLEX_UNIT_PX, getResources().getDimension(R.dimen.text_body));
         statusView.setGravity(Gravity.CENTER);
@@ -430,16 +431,16 @@ public class MainActivity extends Activity {
                 @Override public void run() {
                     try {
                         new AlertDialog.Builder(MainActivity.this)
-                                .setTitle("系统 WebView 版本过旧")
-                                .setMessage("检测到系统 WebView 内核为 Chromium " + ver
-                                        + "（DSH 界面需要 80 以上）。\n\n"
-                                        + "界面可能无法正常显示（白屏/无法交互），引擎本身不受影响。\n\n"
-                                        + "建议：① 更新\"Android System WebView\"后重试；"
-                                        + "② 安装「DeepSeek Harness 兼容版」（专为老设备优化）。")
-                                .setPositiveButton("去更新", new DialogInterface.OnClickListener() {
+                                .setTitle(ShellLocale.t("系统 WebView 版本过旧"))
+                                .setMessage(ShellLocale.t("检测到系统 WebView 内核为 Chromium ") + ver
+                                        + ShellLocale.t("（DSH 界面需要 80 以上）。\n\n")
+                                        + ShellLocale.t("界面可能无法正常显示（白屏/无法交互），引擎本身不受影响。\n\n")
+                                        + ShellLocale.t("建议：① 更新\"Android System WebView\"后重试；")
+                                        + ShellLocale.t("② 安装「DeepSeek Harness 兼容版」（专为老设备优化）。"))
+                                .setPositiveButton(ShellLocale.t("去更新"), new DialogInterface.OnClickListener() {
                                     @Override public void onClick(DialogInterface d, int w) { openWebViewUpdate(); }
                                 })
-                                .setNegativeButton("继续尝试", null)
+                                .setNegativeButton(ShellLocale.t("继续尝试"), null)
                                 .show();
                     } catch (Throwable ignored) {}
                 }
@@ -697,7 +698,7 @@ public class MainActivity extends Activity {
         int cur = themeMode();
         for (int i = 0; i <= 2; i++) {
             final int mode = i;
-            TextView row = cText(themeModeLabel(i) + (i == cur ? "  ✓" : ""), 14f, cText(), false);
+            TextView row = cText(ShellLocale.t(themeModeLabel(i)) + (i == cur ? "  ✓" : ""), 14f, cText(), false);
             row.setPadding(0, dp(12), 0, dp(12));
             row.setOnClickListener(new View.OnClickListener() {
                 @Override public void onClick(View v) {
@@ -710,6 +711,38 @@ public class MainActivity extends Activity {
             box.addView(row);
         }
         conDialogView("界面主题", box, null, null, "关闭");
+    }
+
+    /** 界面语言当前值的显示文案（语言名本身不翻译）。 */
+    private String langModeLabel(int mode) {
+        if (mode == ShellLocale.LANG_ZH) return "中文";
+        if (mode == ShellLocale.LANG_RU) return "Русский";
+        return "跟随系统";
+    }
+
+    /** 控制台「界面语言」行的三选一弹窗；只重绘原生界面，不重启引擎。 */
+    private void conLangDialog() {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        final String[] labels = { "跟随系统", "中文", "Русский" };
+        final int[] modes = { ShellLocale.LANG_SYSTEM, ShellLocale.LANG_ZH, ShellLocale.LANG_RU };
+        int cur = ShellLocale.mode();
+        for (int i = 0; i < labels.length; i++) {
+            final int mode = modes[i];
+            TextView row = cText(ShellLocale.t(labels[i]) + (mode == cur ? "  ✓" : ""), 14f, cText(), false);
+            row.setPadding(0, dp(12), 0, dp(12));
+            row.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View v) {
+                    closeDialogOverlay();
+                    if (mode == ShellLocale.mode()) return;
+                    ShellLocale.setMode(MainActivity.this, mode);
+                    renderConsole();        // 语言只影响原生界面：重绘控制台即可
+                    refreshAllStatuses();
+                }
+            });
+            box.addView(row);
+        }
+        conDialogView("界面语言", box, null, null, "关闭");
     }
     private int cBg() { return getColor(isDark() ? R.color.shell_bg_dark : R.color.shell_bg_light); }
     private int cCard() { return getColor(isDark() ? R.color.shell_card_dark : R.color.shell_card_light); }
@@ -757,7 +790,7 @@ public class MainActivity extends Activity {
                 @Override public void run() {
                     try {
                         Toast.makeText(MainActivity.this,
-                                "设备架构为 " + abiDesc + "，DSH 引擎仅提供 arm64 版本，AI 引擎可能无法启动",
+                                ShellLocale.t("设备架构为 ") + abiDesc + ShellLocale.t("，DSH 引擎仅提供 arm64 版本，AI 引擎可能无法启动"),
                                 Toast.LENGTH_LONG).show();
                     } catch (Throwable ignored) {}
                 }
@@ -1184,16 +1217,19 @@ public class MainActivity extends Activity {
     private void renderGuidePage() {
         if (guideBody == null) return;
         guideBody.removeAllViews();
+        // 引导页正文/说明来自 GuidePage 对象，晚于 setContentView 才挂上去 →
+        // 这里 post 一次翻译（在本次消息之后执行，内容已经建好）。
+        guideBody.post(new Runnable() { @Override public void run() { ShellLocale.apply(guideBody); } });
         permRows.clear();
         guideActionBtn = null;
         boolean finishPage = guideIndex >= guidePages.size();
         int total = guidePages.size() + 1;
 
-        guideDots.setText(finishPage
+        guideDots.setText(ShellLocale.t(finishPage
                 ? "准备完成 · 最后一步"
-                : "第 " + (guideIndex + 1) + " / " + total + " 步");
+                : "第 " + (guideIndex + 1) + " / " + total + " 步"));
         guidePrevBtn.setEnabled(guideIndex > 0);
-        guideNextBtn.setText(finishPage ? "开始使用" : "下一步");
+        guideNextBtn.setText(ShellLocale.t(finishPage ? "开始使用" : "下一步"));
         guideSkipBtn.setVisibility(finishPage ? View.GONE : View.VISIBLE);
         guideSkipBtn.setText(guideIndex == guidePages.size() - 1 ? "跳过" : "跳过这页");
 
@@ -1240,14 +1276,14 @@ public class MainActivity extends Activity {
         try { granted = pg.provider.granted(); } catch (Throwable ignored) {}
 
         TextView t = new TextView(this);
-        t.setText(pg.title);
+        t.setText(ShellLocale.t(pg.title));
         t.setTextColor(cText());
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, 22);
         t.setTypeface(null, android.graphics.Typeface.BOLD);
         guideBody.addView(t, cTop(dp(14)));
 
         TextView d = new TextView(this);
-        d.setText(pg.desc);
+        d.setText(ShellLocale.t(pg.desc));
         d.setTextColor(cSub());
         d.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         d.setLineSpacing(dp(3), 1f);
@@ -1268,7 +1304,7 @@ public class MainActivity extends Activity {
         pr.provider = pg.provider;
         permRows.add(pr);
 
-        Button act = cButton(pg.actionLabel, true);
+        Button act = cButton(ShellLocale.t(pg.actionLabel), true);
         LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(46));
         alp.topMargin = dp(14);
@@ -1277,7 +1313,7 @@ public class MainActivity extends Activity {
             try { pg.action.onClick(v); } catch (Throwable ignored) {}
         }});
         act.setEnabled(!granted);
-        if (granted) act.setText("已授权 ✓");
+        if (granted) act.setText(ShellLocale.t("已授权 ✓"));
         guideBody.addView(act);
         guideActionBtn = act;
 
@@ -1291,7 +1327,7 @@ public class MainActivity extends Activity {
         GuidePage pg = guidePages.get(guideIndex);
         boolean granted = false;
         try { granted = pg.provider.granted(); } catch (Throwable ignored) {}
-        guideActionBtn.setText(granted ? "已授权 ✓" : pg.actionLabel);
+        guideActionBtn.setText(ShellLocale.t(granted ? "已授权 ✓" : pg.actionLabel));
         guideActionBtn.setEnabled(!granted);
     }
 
@@ -1306,16 +1342,16 @@ public class MainActivity extends Activity {
         for (PermRow pr : permRows) {
             boolean g = false;
             try { g = pr.provider.granted(); } catch (Throwable ignored) {}
-            pr.status.setText(g ? "已授权" : "未授权");
+            pr.status.setText(ShellLocale.t(g ? "已授权" : "未授权"));
             pr.status.setTextColor(g ? cGreen() : cRed());
         }
         // 工作区行状态（非权限，显示已设置/未设置）
         if (workspaceDescView != null) {
             String p = workspacePath();
             if (p == null || p.isEmpty()) {
-                workspaceDescView.setText("未设置：AI 文件操作在内部目录。点此选择外部文件夹（如 /sdcard/Documents）。");
+                workspaceDescView.setText(ShellLocale.t("未设置：AI 文件操作在内部目录。点此选择外部文件夹（如 /sdcard/Documents）。"));
             } else {
-                workspaceDescView.setText("已设置：" + p + "（点此更改或恢复默认）");
+                workspaceDescView.setText(ShellLocale.t("已设置：" + p + "（点此更改或恢复默认）"));
             }
         }
         // 翻页式引导：当前页的授权按钮状态跟着"是否已授权"走（从系统设置授权回来时刷新）
@@ -1336,18 +1372,18 @@ public class MainActivity extends Activity {
         if (cur == null || cur.isEmpty()) { openWorkspacePicker(); return; }
         try {
             new AlertDialog.Builder(this)
-                    .setTitle("AI 工作区")
-                    .setMessage("当前工作区：\n" + cur + "\n\n选择其他文件夹，或恢复默认？")
-                    .setPositiveButton("重新选择", new DialogInterface.OnClickListener() {
+                    .setTitle(ShellLocale.t("AI 工作区"))
+                    .setMessage(ShellLocale.t("当前工作区：\n") + cur + ShellLocale.t("\n\n选择其他文件夹，或恢复默认？"))
+                    .setPositiveButton(ShellLocale.t("重新选择"), new DialogInterface.OnClickListener() {
                         @Override public void onClick(DialogInterface d, int w) { openWorkspacePicker(); }
                     })
-                    .setNegativeButton("恢复默认", new DialogInterface.OnClickListener() {
+                    .setNegativeButton(ShellLocale.t("恢复默认"), new DialogInterface.OnClickListener() {
                         @Override public void onClick(DialogInterface d, int w) {
                             getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_WORKSPACE).apply();
                             refreshAllStatuses();
                         }
                     })
-                    .setNeutralButton("取消", null)
+                    .setNeutralButton(ShellLocale.t("取消"), null)
                     .show();
         } catch (Throwable ignored) {}
     }
@@ -1397,9 +1433,9 @@ public class MainActivity extends Activity {
             } else {
                 try {
                     new AlertDialog.Builder(this)
-                            .setTitle("无法使用该目录")
-                            .setMessage("无法解析所选文件夹的真实路径，请选择手机存储（内部存储或 SD 卡）内的文件夹。")
-                            .setPositiveButton("知道了", null)
+                            .setTitle(ShellLocale.t("无法使用该目录"))
+                            .setMessage(ShellLocale.t("无法解析所选文件夹的真实路径，请选择手机存储（内部存储或 SD 卡）内的文件夹。"))
+                            .setPositiveButton(ShellLocale.t("知道了"), null)
                             .show();
                 } catch (Throwable ignored) {}
             }
@@ -1508,11 +1544,11 @@ public class MainActivity extends Activity {
 
         if (rootOkNow || shizukuNow) {
             AlertDialog.Builder b = new AlertDialog.Builder(this);
-            b.setTitle("系统特权（可选）");
-            b.setMessage((rootOkNow ? "已检测到 Root（su）可用，AI 可以执行系统级操作。\n" : "") +
-                    (shizukuNow ? "Shizuku 已授权，AI 可以执行系统级操作。\n" : "") +
-                    "\n不授予特权也能正常使用：文件读写、预览、编辑只需「所有文件访问」权限。");
-            b.setNegativeButton("关闭", null);
+            b.setTitle(ShellLocale.t("系统特权（可选）"));
+            b.setMessage((rootOkNow ? ShellLocale.t("已检测到 Root（su）可用，AI 可以执行系统级操作。\n") : "") +
+                    (shizukuNow ? ShellLocale.t("Shizuku 已授权，AI 可以执行系统级操作。\n") : "") +
+                    ShellLocale.t("\n不授予特权也能正常使用：文件读写、预览、编辑只需「所有文件访问」权限。"));
+            b.setNegativeButton(ShellLocale.t("关闭"), null);
             b.show();
         } else if (binderOk) {
             // 服务在运行但未授权 → 请求 Shizuku 弹授权框；若系统/ROM 没弹出来，8 秒后引导手动授权
@@ -1611,15 +1647,15 @@ public class MainActivity extends Activity {
                 + "3. 找到 " + label + " → 打开开关\n\n"
                 + "授权后回到本页会自动刷新。";
         AlertDialog.Builder b = new AlertDialog.Builder(this);
-        b.setTitle("Shizuku 授权（需手动）");
-        b.setMessage(msg);
-        b.setPositiveButton("打开 Shizuku", new DialogInterface.OnClickListener() {
+        b.setTitle(ShellLocale.t("Shizuku 授权（需手动）"));
+        b.setMessage(ShellLocale.t(msg));
+        b.setPositiveButton(ShellLocale.t("打开 Shizuku"), new DialogInterface.OnClickListener() {
             @Override public void onClick(DialogInterface d, int w) { openShizukuApp(); }
         });
-        b.setNeutralButton("重新检测", new DialogInterface.OnClickListener() {
+        b.setNeutralButton(ShellLocale.t("重新检测"), new DialogInterface.OnClickListener() {
             @Override public void onClick(DialogInterface d, int w) { probeShizuku(); conToast("已重新检测"); }
         });
-        b.setNegativeButton("关闭", null);
+        b.setNegativeButton(ShellLocale.t("关闭"), null);
         b.show();
     }
 
@@ -1638,7 +1674,7 @@ public class MainActivity extends Activity {
                 @Override public void onClick(DialogInterface d, int w) { openShizukuApp(); }
             });
         }
-        b.setNeutralButton("重新检测", new DialogInterface.OnClickListener() {
+        b.setNeutralButton(ShellLocale.t("重新检测"), new DialogInterface.OnClickListener() {
             @Override public void onClick(DialogInterface d, int w) { probeShizuku(); }
         });
         b.setNegativeButton("关闭", null);
@@ -3851,7 +3887,7 @@ public class MainActivity extends Activity {
     private void setStatus(final String s) {
         ui.post(new Runnable() {
             @Override public void run() {
-                statusView.setText(s);
+                statusView.setText(ShellLocale.t(s));
                 if (consoleVisible) conSay(s);
             }
         });
@@ -3903,6 +3939,13 @@ public class MainActivity extends Activity {
     protected void onPause() {
         super.onPause();
         if (webView != null) webView.onPause();
+    }
+
+    /** 用 setContentView 建出来的原生页面（引擎页 / 权限引导页）顺带翻译一遍。 */
+    @Override
+    public void setContentView(View view) {
+        super.setContentView(view);
+        ShellLocale.apply(view);
     }
 
     @Override
@@ -4084,6 +4127,7 @@ public class MainActivity extends Activity {
     /** 控制台里显示一句状态：解压阶段进解压块，否则进引擎块。 */
     private void conSay(String s) {
         if (s == null) return;
+        s = ShellLocale.t(s);
         if (extracting) { conExtractMsg = s; if (conExMeta != null) conExMeta.setText(s); }
         else if (conEnMeta != null) conEnMeta.setText(s);
     }
@@ -4233,7 +4277,7 @@ public class MainActivity extends Activity {
 
     private void conToast(final String s) {
         ui.post(new Runnable() { @Override public void run() {
-            try { android.widget.Toast.makeText(MainActivity.this, s, android.widget.Toast.LENGTH_SHORT).show(); } catch (Throwable ignored) {}
+            try { android.widget.Toast.makeText(MainActivity.this, ShellLocale.t(s), android.widget.Toast.LENGTH_SHORT).show(); } catch (Throwable ignored) {}
         }});
     }
 
@@ -4241,10 +4285,11 @@ public class MainActivity extends Activity {
     private void renderConsole() {
         if (consoleBody == null) return;
         consoleBody.removeAllViews();
-        if (consolePage == 1) { renderConsolePerm(); return; }
-        if (consolePage == 2) { renderConsolePlug(); return; }
-        if (consolePage == 3) { renderConsoleLog(); return; }
-        renderConsoleMain();
+        if (consolePage == 1) { renderConsolePerm(); }
+        else if (consolePage == 2) { renderConsolePlug(); }
+        else if (consolePage == 3) { renderConsoleLog(); }
+        else { renderConsoleMain(); }
+        ShellLocale.apply(consoleLayer); // 控制台每页渲染完顺带翻译（幂等，重复调用无副作用）
     }
 
     private void renderConsoleMain() {
@@ -4363,11 +4408,24 @@ public class MainActivity extends Activity {
         themeRow.setPadding(0, dp(12), 0, dp(12));
         themeRow.addView(cText("界面主题", 12f, cSub(), false),
                 new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        themeRow.addView(cText(themeModeLabel(themeMode()) + " ›", 12f, cSub(), false));
+        themeRow.addView(cText(ShellLocale.t(themeModeLabel(themeMode())) + " ›", 12f, cSub(), false));
         themeRow.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { conThemeDialog(); }
         });
         col.addView(themeRow);
+        col.addView(cSep(0));
+        // 界面语言（跟随系统 / 中文 / русский）：与主题并列，改完立即重绘控制台
+        LinearLayout langRow = new LinearLayout(this);
+        langRow.setOrientation(LinearLayout.HORIZONTAL);
+        langRow.setGravity(Gravity.CENTER_VERTICAL);
+        langRow.setPadding(0, dp(12), 0, dp(12));
+        langRow.addView(cText("界面语言", 12f, cSub(), false),
+                new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        langRow.addView(cText(ShellLocale.t(langModeLabel(ShellLocale.mode())) + " ›", 12f, cSub(), false));
+        langRow.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conLangDialog(); }
+        });
+        col.addView(langRow);
         col.addView(cSep(0));
         // 检查更新（v1.12：不再启动时自动检查，改这里手动触发）
         LinearLayout upd = new LinearLayout(this);
@@ -4426,6 +4484,7 @@ public class MainActivity extends Activity {
         }
         box.addView(acts, cTop(dp(18)));
 
+        ShellLocale.apply(box); // 弹窗标题/正文/按钮（含返回键的退出确认）
         // 改用 Activity 内自绘浮层（见 showDialogOverlay 注释），
         // 不再走系统 AlertDialog —— 它会把主题的深色圆角面板画在卡片外面。
         showDialogOverlay(box);
@@ -4950,7 +5009,7 @@ public class MainActivity extends Activity {
         left.setOrientation(LinearLayout.VERTICAL);
         left.addView(cText(title, 13.5f, cText(), false));
         left.addView(cText(desc, 11f, cSub(), false));
-        Button act = cButton(ok ? "管理" : "去授权", false);
+        Button act = cButton(ShellLocale.t(ok ? "管理" : "去授权"), false);
         act.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
         if (noRoot) cSetEnabled(act, false);
         act.setOnClickListener(new View.OnClickListener() {
