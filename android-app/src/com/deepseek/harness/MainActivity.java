@@ -184,6 +184,9 @@ public class MainActivity extends Activity {
     // NetworkOnMainThreadException（被 catch 吞掉）→ 引擎明明在跑也永远判“未启动”
     // → 用户再点一次「启动引擎」就又拉起一个 node → EADDRINUSE（用户实测的“启动一会又变回去”）。
     private volatile boolean engineAliveCached = false;
+    // 端口上确实有 DSH 引擎，但它不是本应用这个数据目录拉起来的（手机上另一个 DSH 客户端先占住了端口）。
+    // 这种引擎没有本应用的 token，进主界面只能拿到它的 401 认证页 → 控制台单独提示，不再谎报“引擎运行中”。
+    private volatile boolean enginePortForeign = false;
     private volatile long engineProbeAt = 0L;
     private volatile boolean engineProbeBusy = false;
     private volatile boolean notifyServerStarted = false;  // v1.13：通知通道幂等启动标记
@@ -253,6 +256,29 @@ public class MainActivity extends Activity {
                         @Override public void run() { wv.loadUrl(webHomeUrl()); }
                     }, 2500L);
                 }
+            }
+
+            @Override
+            public void onReceivedHttpError(WebView view, android.webkit.WebResourceRequest request,
+                                            android.webkit.WebResourceResponse errorResponse) {
+                // 0.1.5 起首页要一次性 token：没带（或带了失效的）token 时引擎返回 401 + 一行纯文本正文。
+                // 401 是「成功的 HTTP 事务」，**不会**走 onReceivedError —— 旧实现没人管它，WebView 就把那行
+                // 纯文本当页面渲染出来：用户看到的白屏（只有左上角一行灰字），而且永远不会自愈。
+                // 这里改成回控制台并说明原因：要么端口被别的 DSH 客户端占着，要么手上的 token 已失效。
+                try {
+                    if (request == null || !request.isForMainFrame()) return;
+                    if (errorResponse == null || errorResponse.getStatusCode() != 401) return;
+                    engineTokenUrl = null;   // 手上这条已被引擎拒绝（一次性 token 用过即废）→ 清掉，别再拿它反复撞
+                    ui.post(new Runnable() { @Override public void run() {
+                        try {
+                            if (consoleVisible) return;
+                            showConsole();
+                            refreshConsole();
+                            conToast("首页返回 401（引擎要求认证）：端口可能被另一个 DSH 客户端占用，或本应用凭证已失效。\n"
+                                    + "请在控制台点「停止」再「启动引擎」（会重新生成凭证）。");
+                        } catch (Throwable ignored) {}
+                    }});
+                } catch (Throwable ignored) {}
             }
 
             @Override
@@ -3646,7 +3672,9 @@ public class MainActivity extends Activity {
         long deadline = start + 90000;
         while (System.currentTimeMillis() < deadline) {
             if (engineStartAborted) return;   // v1.13：用户点了「停止」→ 立即收手，别再刷“已等待 N 秒”
-            if (healthOk()) { loadHome(); executePendingScheduledTask(); return; }
+            // 只有确认是自己的引擎才进主界面：外来引擎（端口被别的 DSH 客户端占着）没有本应用的 token，
+            // 加载首页只会拿到 401 认证页（白屏）。
+            if (healthOk() && engineIsOurs()) { loadHome(); executePendingScheduledTask(); return; }
             long waited = (System.currentTimeMillis() - start) / 1000;
             setStatus("正在启动 DeepSeek Harness…（已等待 " + waited + " 秒）");
             try { Thread.sleep(1000); } catch (InterruptedException e) { return; }
@@ -3698,7 +3726,7 @@ public class MainActivity extends Activity {
                 if (engineStoppedByUser || engineStartAborted) return; // 用户主动停止 → 不再打扰
                 if (engineStartTs == 0L) return;                       // 期间被重启流程接管 → 收手
                 try {
-                    if (healthOk()) {
+                    if (healthOk() && engineIsOurs()) {
                         starting = false;
                         ui.post(new Runnable() { @Override public void run() {
                             try {
@@ -4023,9 +4051,12 @@ public class MainActivity extends Activity {
     private boolean conProbeEngineNow() {
         boolean up = false;
         try { up = healthOk(); } catch (Throwable ignored) {}
-        engineAliveCached = up;
+        // 端口上有引擎 ≠ 是本应用的引擎：外来引擎（另一个 DSH 客户端占着同一端口）没有本应用的 token，
+        // 认成“运行中”只会把用户送进 401 认证页（白屏）。两者分开记，控制台分别提示。
+        enginePortForeign = up && !engineIsOurs();
+        engineAliveCached = up && !enginePortForeign;
         engineProbeAt = System.currentTimeMillis();
-        return up;
+        return engineAliveCached;
     }
 
     /**
@@ -4046,6 +4077,32 @@ public class MainActivity extends Activity {
             while (end < tail.length() && !" \r\n\t".contains(String.valueOf(tail.charAt(end)))) end++;
             return tail.substring(at, end);
         } catch (Throwable t) { return null; }
+    }
+
+    /**
+     * 端口上的引擎是不是「本应用这个数据目录」拉起来的。
+     *
+     * 判据（由强到弱）：① 本实例抓到过带 token 的启动 URL；② 日志文件存在（尾部能捞到 token 就顺手存下）。
+     * ②之所以成立：只要本应用 spawn 过 node，files/dsh-web.log 必然被创建（App 读子进程 stdout 时写的），
+     * 而 App 的数据目录不会被别的应用写 —— 所以「端口有引擎、日志却根本不存在」只可能是别人的引擎。
+     *
+     * 为什么要判：手机上装了第二个 DSH 客户端（或本 App 的另一份数据目录）时，它可能先占住同一个端口。
+     * 旧实现把「端口上有 DSH 引擎」直接当成「自己的引擎已就绪」→ 不 spawn、不取 token，
+     * 进主界面只能拿到对方引擎的 401 认证页（一张白底黑字的白屏），控制台还显示「引擎运行中 · 还没有日志」，
+     * 用户完全无从判断（社区反馈：首次启动白屏 + 没有日志）。
+     */
+    private boolean engineIsOurs() {
+        if (engineTokenUrl != null && !engineTokenUrl.isEmpty()) return true;
+        if (!conLogFile().exists()) return false;
+        String u = conTokenFromLog();
+        if (u != null) engineTokenUrl = u;
+        return true;
+    }
+
+    /** 端口被别的 DSH 客户端占用时的统一提示（控制台文案与点击后的 toast 共用）。 */
+    private String foreignEngineHint() {
+        return "端口 " + enginePort + " 上已有另一个 DSH 客户端在跑（不是本应用启动的引擎）。\n"
+                + "请先关闭它（或重启手机）腾出端口，再点「启动引擎」。";
     }
 
     private void showConsole() {
@@ -4525,6 +4582,7 @@ public class MainActivity extends Activity {
         }
         boolean run = conEngineRunning();          // 真就绪（端口探测通过）
         boolean booting = conEngineBooting();      // 已拉起、还在监听前的空窗期
+        boolean foreign = enginePortForeign && !run;   // 端口有引擎，但不是本应用拉起的
         if (run && engineStartTs == 0L) engineStartTs = System.currentTimeMillis();
         // v1.13：只在“真就绪”时结束启动中；并且启动中不得点亮入口。
         // （反面教训：把“node 进程活着”当就绪 → 按钮提前亮、点进去 3080 未监听 → “点了没反应”）
@@ -4532,7 +4590,8 @@ public class MainActivity extends Activity {
         else if (starting && engineStartTs > 0
                 && System.currentTimeMillis() - engineStartTs > 150000L) starting = false;   // 超时兜底
         boolean busy = !run && (booting || starting);
-        if (conEnState != null) conEnState.setText(run ? "引擎运行中" : (busy ? "启动中…" : "未启动"));
+        if (conEnState != null) conEnState.setText(foreign ? "端口被占用（非本应用引擎）"
+                : run ? "引擎运行中" : (busy ? "启动中…" : "未启动"));
         if (conEnMeta != null) conEnMeta.setText(conEngineMetaText(run, ready, busy));
         if (conEnBtn != null) {
             conEnBtn.setText(run ? "打开主界面" : (busy ? "启动中…" : "启动引擎"));
@@ -4540,7 +4599,8 @@ public class MainActivity extends Activity {
         }
         cSetEnabled(conEnRestart, run || busy);
         cSetEnabled(conEnStop, run || busy);
-        if (conFoot != null) conFoot.setText(run ? "本地服务已就绪" : (busy ? "正在启动引擎…" : "就绪"));
+        if (conFoot != null) conFoot.setText(foreign ? "端口被占用（非本应用引擎）"
+                : run ? "本地服务已就绪" : (busy ? "正在启动引擎…" : "就绪"));
     }
 
     private String conExtractMetaText(boolean ready) {
@@ -4553,6 +4613,9 @@ public class MainActivity extends Activity {
     }
 
     private String conEngineMetaText(boolean run, boolean ready, boolean busy) {
+        if (enginePortForeign && !run) {
+            return "端口 " + enginePort + " 上的引擎不是本应用启动的 · 请关闭其它 DSH 客户端或重启手机";
+        }
         if (run) {
             long mins = engineStartTs > 0 ? Math.max(0, (System.currentTimeMillis() - engineStartTs) / 60000) : 0;
             return "端口 " + enginePort + " · 已运行 " + mins + " 分 · 通知 " + notifyPort();
@@ -4616,6 +4679,13 @@ public class MainActivity extends Activity {
 
     private void conEngineClickAfterProbe(boolean running) {
         if (starting) return;
+        if (enginePortForeign) {
+            // 端口被别的 DSH 客户端占着：spawn 只会 EADDRINUSE，白等 90 秒超时，
+            // 也不该进主界面（对方的引擎不认识我们 → 401 认证页）。直接说清怎么办。
+            conToast(foreignEngineHint());
+            refreshConsole();
+            return;
+        }
         if (running) {
             engineStartAborted = false;
             engineStoppedByUser = false;
@@ -4781,6 +4851,20 @@ public class MainActivity extends Activity {
     /** 只负责起引擎（文件已就绪）：健康探测 → spawnNode → 等就绪。v1.12 从 startEngine 拆出。 */
     private void launchEngine(File payload) {
         if (healthOk()) {
+            if (!engineIsOurs()) {
+                // 端口上这个引擎不是本应用拉起的（本数据目录连 dsh-web.log 都没有，见 engineIsOurs）：
+                // 绝不能当成“自己的引擎已就绪” —— 手上没有 token，loadHome() 只会显示对方的 401 认证页。
+                starting = false;
+                enginePortForeign = true;
+                engineAliveCached = false;
+                engineProbeAt = System.currentTimeMillis();
+                Log.w(TAG, "port " + enginePort + " held by a foreign dsh engine (no local dsh-web.log)");
+                ui.post(new Runnable() { @Override public void run() {
+                    refreshConsole();
+                    conToast(foreignEngineHint());
+                }});
+                return;
+            }
             starting = false;
             engineAliveCached = true;                        // v1.13：写回缓存 → 控制台立刻显示“引擎运行中”
             engineProbeAt = System.currentTimeMillis();
