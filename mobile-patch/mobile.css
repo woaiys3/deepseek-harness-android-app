@@ -1,11 +1,23 @@
 /* ============================================================
    deepdive 手机版 UI 优化 v0.3（对应 APK v1.3.1）
    ------------------------------------------------------------
+   ⚠️ 0.1.7 内核升级（APK v1.15.0）后的重大变更：选择器改为【属性选择器】。
+   - 原来写的是 Vite 哈希类名（._wrap_1ao1y_1 = _名字_hash_行号）。
+     前端每次重新构建，hash 必然变 → 0.1.7 升级后实测 **20 个选择器全部失效（0 命中）**，
+     整套移动端适配静默失效。
+   - 现统一改为 [class*="_名字_"]：只要前端还叫这个名字（hash/行号变了也无所谓）就继续生效。
+     属性选择器特异性与类选择器相同（0,1,0），不会改变原有优先级。
+   - 已核对 0.1.7 前端：15 个名字仍存在（answer/block/button/card/command/content/
+     input/item/itemLabel/label/line/markdown/output/separator/wrap）。
+   - ⚠️ 4 个名字在新前端已不存在（gallery / illustration / rail / thumbnail，
+     对应附件缩略图栏与图片画廊，这两个组件在 0.1.7 被重构）→ 已删除。
+   - ⚠️ **但「名字存在」≠「可以随便改」**：`_item_` / `_label_` / `_separator_` /
+     `_itemLabel_` 这四个名字在 0.1.7 命中的是【菜单/下拉菜单】组件，
+     不是当年那个侧栏图标行 → 详见下方「v1.15.1 修正」。
+   ------------------------------------------------------------
    v0.2 重写说明（历史）：
    - 旧版 mobile.css 使用的类名（gdEzaW_/hHd-Xa_/pbvGtq_/qSYn7G_ 等）
-     在真实前端构建中不存在，属"死代码"；本版全部替换为
-     0.1.0-rc.6 真实构建中的类名（_rail_1hk8w、_wrap_1ao1y、
-     _answer_d4nqi、_markdown_1nba0、_block_10eou 等）。
+     在真实前端构建中不存在，属"死代码"；当时改为 0.1.0-rc.6 的真实哈希类名（已废弃）。
    - 新增：竖屏适配（原 APK 锁横屏）、鲸鱼蓝皮肤、触摸优化。
    v0.3 新增（v1.3.1，全部为布局/溢出修复，不删功能）：
    - 消息操作条多行换行（.p-xYUq_actions flex-wrap）
@@ -63,51 +75,36 @@ input[type="search"] {
 /* ---------- 真实类名适配 ---------- */
 
 /* 输入框/搜索框：加大点击与输入区 */
-._wrap_1ao1y_1 {
+[class*="_wrap_"] {
   height: 44px;
   min-height: 44px;
   border-radius: 12px;
   padding: 0 12px;
 }
-._input_1ao1y_25 {
+[class*="_input_"] {
   font-size: 16px !important;
   line-height: 28px;
 }
 
-/* 侧栏图标行：图标项触屏友好 */
-._rail_1hk8w_10 {
-  gap: 12px;
-}
-._item_1hk8w_28 {
-  flex: 0 0 48px;
-  width: 48px;
-  height: 48px;
-}
-._thumbnail_1hk8w_35 {
-  width: 48px;
-  height: 48px;
-  border-radius: 14px;
-}
-
-/* 菜单项：点击区加大 */
-._item_19372_91 {
-  min-height: 40px;
-}
-._label_19372_123 {
-  padding: 6px 4px;
-}
+/* ⚠ v1.15.1 已删除（原「侧栏图标行」与「菜单项」）：
+   [class*="_rail_"] { gap: 12px }
+   [class*="_item_"] { flex: 0 0 48px; width: 48px; height: 48px }
+   [class*="_item_"] { min-height: 40px }
+   [class*="_thumbnail_"] { width/height: 48px; border-radius: 14px }
+   [class*="_label_"] { padding: 6px 4px }
+   删除原因见本文件头部「v1.15.1 修正」。 */
 
 /* 消息/回答内容：移动端全宽阅读，不挤压 */
-._answer_d4nqi_19,
-._markdown_1r4m5_5,
-._content_biesw_99 {
+[class*="_answer_"],
+[class*="_markdown_"],
+[class*="_content_"] {
   max-width: 100% !important;
 }
 
 /* 工具调用卡片：全宽 + 可读性 */
-._block_10eou_7,
-._output_10eou_162,
-._command_10eou_122 {
+[class*="_block_"],
+[class*="_output_"],
+[class*="_command_"] {
   max-width: 100% !important;
 }
 
@@ -125,14 +122,9 @@ input[type="search"] {
   padding-bottom: 0 !important;
 }
 
-/* 图片画廊：间距收紧 */
-._gallery_nrncx_1 {
-  gap: 8px;
-}
-
-/* 空状态 / 引导卡：宽度自适应 */
-._illustration_rcb0a_39,
-._card_9gj4p_13 {
+/* 空状态 / 引导卡：宽度自适应
+   （原 [class*="_gallery_"] / [class*="_illustration_"] 在 0.1.7 已无同名组件，已删） */
+[class*="_card_"] {
   max-width: 100% !important;
 }
 
@@ -144,62 +136,37 @@ input[type="search"] {
   }
 
   /* 会话/回答内容宽度：竖屏给足空间 */
-  ._answer_d4nqi_19,
-  ._markdown_1r4m5_5 {
+  [class*="_answer_"],
+  [class*="_markdown_"] {
     width: 100%;
     max-width: 100% !important;
   }
 
   /* 工具卡片、代码块：竖屏不横向溢出 */
-  ._block_10eou_7,
-  ._output_10eou_162,
-  ._content_biesw_99 {
+  [class*="_block_"],
+  [class*="_output_"],
+  [class*="_content_"] {
     width: 100% !important;
     max-width: 100% !important;
   }
 
   /* 底部输入区：触摸目标更大、更易点击 */
-  ._wrap_1ao1y_1 {
+  [class*="_wrap_"] {
     height: 48px;
     border-radius: 14px;
   }
-  ._input_1ao1y_25 {
+  [class*="_input_"] {
     font-size: 16px !important;
   }
 
-  /* 侧栏图标：竖屏下略收紧，避免挤占内容 */
-  ._rail_1hk8w_10 {
-    gap: 8px;
-  }
-  ._item_1hk8w_28 {
-    flex: 0 0 44px;
-    width: 44px;
-    height: 44px;
-  }
-  ._thumbnail_1hk8w_35 {
-    width: 44px;
-    height: 44px;
-  }
+  /* 侧栏图标（_rail_/_item_/_thumbnail_）规则已按头部「v1.15.1 修正」删除：
+     0.1.7 的 _item_ 是菜单项组件，强制 44×44 会把菜单文字裁掉。 */
 }
 
 /* ============ 设置页移动端优化（基于真机截图） ============ */
 @media (max-width: 1100px) {
-  /* 左侧设置菜单：项更高、标签更清晰 */
-  ._item_19372_91 {
-    min-height: 46px;
-  }
-  ._itemLabel_19372_173 {
-    font-size: 15px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  ._label_19372_123 {
-    padding: 8px 6px;
-  }
-  ._separator_19372_81 {
-    margin: 6px 0;
-  }
+  /* 设置菜单项尺寸（_item_/_itemLabel_/_label_/_separator_）规则已按头部「v1.15.1 修正」删除：
+     这四个名字在 0.1.7 都命中菜单/下拉菜单组件，会改坏菜单宽度与标签内边距。 */
 
   /* 设置说明文字：行距舒展，不再挤成竖排 */
   p,
@@ -210,7 +177,7 @@ input[type="search"] {
   }
 
   /* 顶部操作按钮（如"打开配置文件"）更大更好点 */
-  ._button_kz6gm_4 {
+  [class*="_button_"] {
     min-height: 40px;
     padding: 8px 14px;
   }
@@ -222,15 +189,7 @@ input[type="search"] {
   body {
     font-size: 14.5px;
   }
-  ._rail_1hk8w_10 {
-    gap: 8px;
-  }
-  ._item_1hk8w_28,
-  ._thumbnail_1hk8w_35 {
-    flex-basis: 44px;
-    width: 44px;
-    height: 44px;
-  }
+  /* _rail_/_item_/_thumbnail_ 规则已按头部「v1.15.1 修正」删除 */
 }
 
 /* ============ 窄屏：AI 消息操作条分多行 ============
@@ -252,11 +211,9 @@ input[type="search"] {
 }
 
 /* ============ 窄屏：会话标题栏给左上角三条杠让位 ============
-   0.1.1 的布局：三条杠 fixed 在左上角（8px 起、宽 36px），会盖住会话标题栏
-   （.wSkVaW_header 默认左 padding 20px），所以窄屏把它加到 52px。
-   0.1.5 已改版：三条杠归入常驻的侧边栏窄栏（hHd-Xa_toggle 位于 x=10），
-   会话区从 x≈56 开始，不再有遮挡；且 .wSkVaW_header 这个类名在 0.1.5 里已不存在，
-   下面这条规则对 0.1.5 是空操作（保留只为兼容旧前端）。 */
+   聊天区顶部 header（会话标题/面包屑）默认左 padding 20px，
+   会被 fixed 在左上角（8px 起、宽 36px）的三条杠按钮盖住；
+   窄屏下把标题栏左内边距加大，让标题从三条杠右侧开始。 */
 @media (max-width: 640px) {
   .wSkVaW_header {
     padding-left: 52px !important;
@@ -285,9 +242,9 @@ input[type="search"] {
     scrollbar-gutter: auto !important;
   }
   /* 工具调用卡片：不贴屏幕左右边缘 */
-  ._block_10eou_7,
-  ._output_10eou_162,
-  ._content_biesw_99 {
+  [class*="_block_"],
+  [class*="_output_"],
+  [class*="_content_"] {
     margin-left: 2px !important;
     margin-right: 2px !important;
   }
@@ -317,12 +274,12 @@ input[type="search"] {
    终端卡片里的命令文本/输出行 white-space:pre 不换行，
    窄屏下会把卡片撑出屏幕；改为可换行（pre-wrap）。 */
 @media (max-width: 640px) {
-  ._command_10eou_122,
-  ._line_10eou_186 {
+  [class*="_command_"],
+  [class*="_line_"] {
     white-space: pre-wrap !important;
     word-break: break-all;
   }
-  ._block_10eou_7 {
+  [class*="_block_"] {
     max-width: 100% !important;
     box-sizing: border-box;
   }
