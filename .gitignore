@@ -1,5 +1,6 @@
 # 二进制与密钥（不进入仓库）
 *.apk
+*.idsig
 *.tar.aa
 *.tar.ab
 *.tar.ac
@@ -11,4 +12,5 @@ android-app/out/
 android-app/assets/
 .credentials.yaml
 payload.zip
-*.idsig
+*.bak
+*.bak-*
