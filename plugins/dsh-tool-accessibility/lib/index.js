@@ -90,6 +90,37 @@ function renderResult(value) {
   }];
 }
 
+/**
+ * android_touch_status 专用渲染：把 held[] 的坐标与按住时长如实回显。
+ * 通用 renderResult 只输出「操作成功。」——execute 返回了这些字段、schema 也声明了，
+ * 但 AI 看不到，而 touch_status 的全部意义就是「问一下现在按着什么」。
+ */
+function renderTouchStatus(value) {
+  value = renderValue(value);
+  if (!value.ok) return renderResult(value);
+  const held = Array.isArray(value.held) ? value.held : [];
+  const lines = [];
+  if (held.length === 0) {
+    lines.push("当前没有按住的虚拟手指。");
+  } else {
+    lines.push("当前按住 " + held.length + " 根手指：");
+    held.forEach((h) => {
+      const parts = [];
+      if (typeof h.finger === "number") parts.push("手指 " + h.finger);
+      if (typeof h.x === "number" && typeof h.y === "number") parts.push("像素(" + h.x + "," + h.y + ")");
+      if (typeof h.fx === "number" && typeof h.fy === "number") parts.push("分数(" + h.fx + "," + h.fy + ")");
+      if (typeof h.elapsedMs === "number") parts.push("已按住 " + h.elapsedMs + "ms");
+      lines.push("  " + (parts.length > 0 ? parts.join(" ") : "（字段缺失）"));
+    });
+  }
+  const meta = [];
+  if (typeof value.holdTimeoutMs === "number" && value.holdTimeoutMs > 0) meta.push("按住超时上限 " + value.holdTimeoutMs + "ms");
+  if (typeof value.maxFingers === "number" && value.maxFingers > 0) meta.push("最多 " + value.maxFingers + " 指");
+  if (typeof value.screenW === "number" && typeof value.screenH === "number" && value.screenW > 0) meta.push("屏幕 " + value.screenW + "x" + value.screenH);
+  if (meta.length > 0) lines.push(meta.join("，"));
+  return [{ type: "text", text: lines.join("\n") }];
+}
+
 /** 屏幕节点树渲染成 AI 可读文本列表（带索引，方便 android_tap 引用坐标）。 */
 function renderScreen(_args, value) {
   value = renderValue(value, _args);
@@ -284,8 +315,9 @@ function apply(ctx) {
     name: "android_type",
     description:
       "在当前聚焦的输入框中输入文本（通过无障碍服务）。输入前通常先用 android_tap 点击目标输入框使其聚焦。需要已开启无障碍服务。\n" +
-      "注意：目标输入框如果是网页/WebView（如网页版表单、contenteditable 编辑器），默认 setText 只改无障碍节点、不触发前端 input 事件，界面不刷新——此时请用 paste:true（走剪贴板粘贴，会触发前端更新）。原生 App 输入框默认即可。\n" +
-      "注：本工具是无障碍版输入（不需要 root/Shizuku）；已授权 Shizuku/root 时另有系统级 android_input（input text/tap/swipe/keyevent），两者能力不同。",
+      "限制（真机实测）：网页/WebView、contenteditable（例如 DSH 自己的聊天输入框）对无障碍输入不可靠——setText 只改无障碍节点、不触发前端 input 事件；paste:true 也常只落到输入法候选栏、不提交。这类目标请改用系统级 android_input（先 tap 聚焦再 text 输入，两条路径均已实测可用）。\n" +
+      "另一个前提：无障碍点击不保证建立输入焦点（键盘没弹出就是没聚焦）——先用 android_input 的 tap 聚焦并确认键盘弹出，再输入。原生 App 的 EditText 用默认 setText 即可。\n" +
+      "注：本工具是无障碍版输入（不需要 root/Shizuku）；android_input 需要已授权 Shizuku/root，两者能力不同。",
     parameters: {
       text: { type: "string", required: true, description: "要输入的文本" },
       paste: { type: "boolean", description: "是否用剪贴板粘贴方式输入（WebView/网页输入框建议 true；默认 false 用 setText）" }
@@ -752,7 +784,7 @@ function apply(ctx) {
           held: { type: "array", items: heldSchema }
         }
       },
-      render: (_a, v) => renderResult(v)
+      render: (_a, v) => renderTouchStatus(v)
     },
     async execute(args, exec) {
       const raw = await a11yRequest("/touch-status", undefined, 6000);
