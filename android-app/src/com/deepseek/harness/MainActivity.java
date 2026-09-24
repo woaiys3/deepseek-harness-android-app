@@ -110,6 +110,10 @@ public class MainActivity extends Activity {
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-subprocess-local/",
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-bash-local/",
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/",
+        // 本轮（v1.15.2）新增：三个内核补丁包，必须随 APK 覆盖
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-fs-local/",
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-ptc-runtime-node/",
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-llm-deepseek/",
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-tool-accessibility/",
         // v1.3.x 核心 UI 改动（侧栏改造/插件按钮）必须随 APK 覆盖：
         // 否则旧版升级用户的外部 dshroot 保留旧 client.js → 页面仍是旧 UI（无竖屏适配）
@@ -131,6 +135,18 @@ public class MainActivity extends Activity {
     private volatile boolean pendingShizukuReq = false;
     private static final int REQ_WORKSPACE_TREE = 400;
     private static final int REQ_FILE_CHOOSER = 500;
+    /** 导入备份（SAF 选 zip 文件）。 */
+    private static final int REQ_BACKUP_FILE = 600;
+
+    // ---------- 安全模式 / 启动失败计数 ----------
+    // 背景：引擎启动会解析 profile 的 patch 文件，一旦 YAML 语法坏掉（用户装的插件把配置写坏是常见路径），
+    // 内核会直接拒绝启动（实测：failed to parse overlay ...: YAMLException: duplicated mapping key），
+    // 而“修”这件事本身需要引擎跑起来让 AI 去改文件 —— 于是形成死结，只能清数据。
+    // 安全模式的做法：把 profile 的用户层整体旁置 + 恢复出厂文件，**不动用户数据**（会话/凭证/设置全保留）。
+    private static final String KEY_SAFE_MODE = "safe_mode_active";
+    private static final String KEY_BOOT_FAILS = "engine_boot_failures";
+    /** 连续启动失败多少次要提醒用户可用安全模式。 */
+    private static final int BOOT_FAIL_HINT_AT = 2;
 
     // 悬浮窗前后台联动：App 在前台时隐藏悬浮窗（不挡界面），退后台时显示（随时可查引擎状态）。
     // 由 onStart/onStop 维护；OverlayService 启动时按此标志决定初始可见性。
@@ -202,6 +218,7 @@ public class MainActivity extends Activity {
     private long lastVscreenEnsureTs = 0;
     // AI 工作区（可选）：外部共享存储目录，传给引擎作为 bash/文件工具的工作根目录
     private TextView workspaceDescView;
+    private TextView conWorkspaceDesc;             // 控制台「权限」页的工作区状态行（与引导完成页共用同一套选择逻辑）
 
 
     private interface StatusProvider { boolean granted(); }
@@ -1309,13 +1326,17 @@ public class MainActivity extends Activity {
             pr.status.setText(g ? "已授权" : "未授权");
             pr.status.setTextColor(g ? cGreen() : cRed());
         }
-        // 工作区行状态（非权限，显示已设置/未设置）
-        if (workspaceDescView != null) {
+        // 工作区行状态（非权限，显示已设置/未设置）——引导完成页与控制台「权限」页共用同一份状态
+        {
             String p = workspacePath();
-            if (p == null || p.isEmpty()) {
-                workspaceDescView.setText("未设置：AI 文件操作在内部目录。点此选择外部文件夹（如 /sdcard/Documents）。");
-            } else {
-                workspaceDescView.setText("已设置：" + p + "（点此更改或恢复默认）");
+            boolean unset = (p == null || p.isEmpty());
+            if (workspaceDescView != null) {
+                workspaceDescView.setText(unset
+                        ? "未设置：AI 文件操作在内部目录。点此选择外部文件夹（如 /sdcard/Documents）。"
+                        : "已设置：" + p + "（点此更改或恢复默认）");
+            }
+            if (conWorkspaceDesc != null) {
+                conWorkspaceDesc.setText(unset ? "未设置（AI 文件操作在内部目录）" : p);
             }
         }
         // 翻页式引导：当前页的授权按钮状态跟着"是否已授权"走（从系统设置授权回来时刷新）
@@ -1345,6 +1366,7 @@ public class MainActivity extends Activity {
                         @Override public void onClick(DialogInterface d, int w) {
                             getSharedPreferences(PREFS, MODE_PRIVATE).edit().remove(KEY_WORKSPACE).apply();
                             refreshAllStatuses();
+                            refreshConsolePermIfShown();
                         }
                     })
                     .setNeutralButton("取消", null)
@@ -1383,6 +1405,12 @@ public class MainActivity extends Activity {
             }
             return;
         }
+        if (requestCode == REQ_BACKUP_FILE) {
+            if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+                conImportFromUri(data.getData());
+            }
+            return;
+        }
         if (requestCode == REQ_WORKSPACE_TREE && resultCode == RESULT_OK && data != null && data.getData() != null) {
             Uri tree = data.getData();
             // 持久化 SAF 授权（重启后仍可访问该目录）
@@ -1394,6 +1422,7 @@ public class MainActivity extends Activity {
             if (path != null && !path.isEmpty()) {
                 getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_WORKSPACE, path).apply();
                 refreshAllStatuses();
+                refreshConsolePermIfShown();
             } else {
                 try {
                     new AlertDialog.Builder(this)
@@ -3322,7 +3351,10 @@ public class MainActivity extends Activity {
     //   表现为「模型配置莫名为空、要重填」（用户实测报障）。
     private static final String[] DSHHOME_CONFIG_PATHS = {
         "dshhome/cordis.patch.yml",
-        "dshhome/profiles/web/cordis.patch.yml",
+        // ⚠ 0.1.7 起 profiles/<name>/cordis.patch.yml 不再是空壳模板，而是**用户配置文档**：
+        //   内核的 dsh-config-editor 把它的 documentPath 指向 profileContext.patchPath，
+        //   设置页（模型/供应商等）的保存全部写在这个文件里。
+        //   它已改列入 DSHHOME_USER_PATHS，此处不再强制覆盖（否则 issue #20 会以新形式复发）。
         "dshhome/profiles/web/cordis.yml",
         "dshhome/profiles/web/package.json",
         "dshhome/profiles/web/pnpm-workspace.yaml"
@@ -3332,7 +3364,9 @@ public class MainActivity extends Activity {
     // 双保险：extractPayload（写盘）与 refreshInternalConfig（配置刷新）两处都拦。
     private static final String[] DSHHOME_USER_PATHS = {
         "dshhome/settings.yaml",
-        "dshhome/.credentials.yaml"
+        "dshhome/.credentials.yaml",
+        // 0.1.7：用户配置从此文件读取/写入（见上）。
+        "dshhome/profiles/web/cordis.patch.yml"
     };
 
     private boolean isDshhomeUserFile(String name) {
@@ -3680,6 +3714,8 @@ public class MainActivity extends Activity {
         // ① 回控制台（那里有真实状态与「启动引擎/日志」入口）；② 后台继续等引擎"迟到"——
         // 首启在真机上（首次建 profiles/冷启动）可能超过 90 秒，引擎一旦就绪自动进入主界面。
         setStatus("引擎启动超时（端口 " + enginePort + "），已回到控制台，引擎就绪后会自动进入");
+        // 累计连续失败：让控制台能把「引擎起不来 → 可用安全模式」这条出路推到用户面前。
+        bumpBootFailure();
         conEngineTimedOut();
     }
 
@@ -4025,6 +4061,8 @@ public class MainActivity extends Activity {
         try { up = healthOk(); } catch (Throwable ignored) {}
         engineAliveCached = up;
         engineProbeAt = System.currentTimeMillis();
+        // 引擎真的就绪 → 漬零连续失败计数（供安全模式提示用）。
+        if (up) resetBootFailures();
         return up;
     }
 
@@ -4320,6 +4358,46 @@ public class MainActivity extends Activity {
         enActs.addView(conEnStop, slp);
         col.addView(enActs, cTop(dp(12)));
 
+        // ②·5 救援（安全模式 / 备份）
+        // 解决的真实痛点：装的插件把 profile 的 patch 文件写成非法 YAML → 引擎直接拒启，
+        // 而「修」又得先让引擎跑起来 → 形成死结，过去只能清数据。
+        col.addView(cSep(dp(18)));
+        boolean safe = safeModeActive();
+        int fails = bootFailures();
+        col.addView(cText(safe ? "安全模式：已开启" : "救援", 15f, cText(), false), cTop(dp(16)));
+        String rescueDesc;
+        if (safe) {
+            rescueDesc = "已旁置 profile 的用户层，用出厂配置启动——会话/凭证/设置都还在。"
+                    + "修好之后再「退出安全模式」把用户层还回去。";
+        } else if (fails >= BOOT_FAIL_HINT_AT) {
+            rescueDesc = "连续 " + fails + " 次启动失败。很可能是装的插件把配置文件写坏了——"
+                    + "用「安全模式启动」跳过用户层，不丢任何数据。";
+        } else {
+            rescueDesc = "引擎起不来时，用安全模式跳过用户层启动（不丢数据）；"
+                    + "也可以随时导出全部数据做备份。";
+        }
+        col.addView(cText(rescueDesc, 11f, fails >= BOOT_FAIL_HINT_AT && !safe ? cRed() : cSub(), false), cTop(dp(7)));
+        LinearLayout rsActs = new LinearLayout(this);
+        rsActs.setOrientation(LinearLayout.HORIZONTAL);
+        Button safeBtn = cButton(safe ? "退出安全模式" : "安全模式启动", false);
+        safeBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { if (safeModeActive()) conExitSafeMode(); else conSafeMode(); }
+        });
+        rsActs.addView(safeBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        Button expBtn = cButton("导出全部数据", true);
+        expBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conBackupExport(); }
+        });
+        LinearLayout.LayoutParams elp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        elp.leftMargin = dp(8);
+        rsActs.addView(expBtn, elp);
+        col.addView(rsActs, cTop(dp(12)));
+        Button impBtn = cButton("从备份导入还原", false);
+        impBtn.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conBackupImport(); }
+        });
+        col.addView(impBtn, cTop(dp(8)));
+
         // ③ 三个入口
         col.addView(cSep(dp(20)));
         col.addView(cNavRow("授予权限", "存储 · 通知 · 悬浮窗 · 电池 · root · Shizuku · 无障碍", conPermSummary(), 1));
@@ -4340,6 +4418,14 @@ public class MainActivity extends Activity {
         });
         logActs.addView(lv);
         logActs.addView(le);
+        // v1.15.1：清空入口先前只在日志子页里，主页面看不到（用户反馈"清空日志还是没有"）。
+        // 这里补一个「清空」按钮，主页面一键直达；日志行本身也仍可点进日志页。
+        Button lc = cButton("清空", false);
+        lc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        lc.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { conClearLog(); }
+        });
+        logActs.addView(lc);
         LinearLayout logLeft = new LinearLayout(this);
         logLeft.setOrientation(LinearLayout.VERTICAL);
         logLeft.addView(cText("日志", 14f, cText(), false));
@@ -4350,6 +4436,13 @@ public class MainActivity extends Activity {
         logRow.setPadding(0, dp(12), 0, dp(12));
         logRow.addView(logLeft, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         logRow.addView(logActs);
+        // v1.15.1 修复：原来这一行只有「查看 / 分享」两个快捷按钮，**没有任何入口**
+        // 把 consolePage 设为 3 —— 于是渲染日志页的 renderConsoleLog()（含「清空日志」）
+        // 成了不可达的死代码，用户找不到清空入口。现在整行可点进入日志页，并补 › 提示。
+        logRow.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { consolePage = 3; renderConsole(); }
+        });
+        logRow.addView(cText("›", 14f, cSub(), false));
         col.addView(logRow);
         col.addView(cSep(0));
 
@@ -4936,9 +5029,54 @@ public class MainActivity extends Activity {
         addPermRow(col, "Shizuku（免 root 特权通道）", "有 root 时用 root；没 root 时装 Shizuku 走同一套能力", "shizuku");
         addPermRow(col, "无障碍服务（读屏 / 点屏）", "android_screen / tap / type / see（不需要 root 或 Shizuku）", "a11y");
         addPermRow(col, "安装未知应用", "android_package 装 APK 用", "install");
+        // issue #30：工作区入口原先只在首启引导完成页，走完引导就再无入口（只能清数据重走引导）。
+        // 这里复用同一套 onWorkspaceRowClick()，使权限页也能查看 / 更改 / 恢复默认。
+        addWorkspaceRow(col);
         col.addView(cText("root / Shizuku 二选一即可（root 优先）。root 只能由你在 root 管理器（Magisk / KernelSU）里授予本应用；设备没 root 时这一项显示「本机无 root」。",
                 11f, cSub(), false), cTop(dp(14)));
         conRefreshRootAsync();
+    }
+
+    /**
+     * 控制台「权限」页的 AI 工作区行：显示当前绑定路径，点按进入「更改 / 恢复默认」。
+     * 与引导完成页共用 onWorkspaceRowClick()，保证两条入口行为一致（issue #30）。
+     */
+    private void addWorkspaceRow(LinearLayout col) {
+        final String cur = workspacePath();
+        final boolean unset = (cur == null || cur.isEmpty());
+        LinearLayout left = new LinearLayout(this);
+        left.setOrientation(LinearLayout.VERTICAL);
+        left.addView(cText("AI 工作区（可选）", 13.5f, cText(), false));
+        conWorkspaceDesc = new TextView(this);
+        conWorkspaceDesc.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11);
+        conWorkspaceDesc.setTextColor(cSub());
+        conWorkspaceDesc.setPadding(0, dp(2), 0, 0);
+        conWorkspaceDesc.setText(unset ? "未设置（AI 文件操作在内部目录）" : cur);
+        left.addView(conWorkspaceDesc);
+        Button act = cButton(unset ? "选择" : "更改", false);
+        act.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f);
+        act.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { onWorkspaceRowClick(); }
+        });
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding(0, dp(13), 0, dp(13));
+        row.addView(left, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams alp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        alp.leftMargin = dp(8);
+        row.addView(act, alp);
+        row.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View v) { onWorkspaceRowClick(); }
+        });
+        col.addView(row);
+        col.addView(cSep(0));
+    }
+
+    /** 工作区变更后，若正停在控制台「权限」页就整页重绘（按钮文案「选择 / 更改」跟着变）。 */
+    private void refreshConsolePermIfShown() {
+        if (consoleVisible && consolePage == 1) renderConsole();
     }
 
     private void addPermRow(LinearLayout col, String title, String desc, final String id) {
@@ -5328,7 +5466,7 @@ public class MainActivity extends Activity {
         LinearLayout col = consoleBody;
         col.addView(conBackRow("日志"));
         col.addView(cText(conLogSummary(), 12f, cText(), false), cTop(dp(12)));
-        col.addView(cText("「查看」直接看末尾 200 行；「分享」调用系统分享（QQ / 微信 / 邮件…都能选），正文里带完整日志路径与末尾 400 行。",
+        col.addView(cText("「查看」直接看末尾 200 行；「分享」调用系统分享（QQ / 微信 / 邮件…都能选），正文里带完整日志路径与末尾 400 行。日志会随使用不断追加，太长不好读时可「清空日志」。",
                 11f, cSub(), false), cTop(dp(8)));
         LinearLayout acts = new LinearLayout(this);
         acts.setOrientation(LinearLayout.HORIZONTAL);
@@ -5342,9 +5480,73 @@ public class MainActivity extends Activity {
         lp.leftMargin = dp(8);
         acts.addView(e, lp);
         col.addView(acts, cTop(dp(14)));
+        // 只占一行的次要操作：日志积累久了会很大，给一个直接清空的入口（单独一行，避免窄屏挤在一起）
+        LinearLayout clearRow = new LinearLayout(this);
+        clearRow.setOrientation(LinearLayout.HORIZONTAL);
+        Button c = cButton("清空日志", false);
+        c.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View x) { conClearLog(); } });
+        clearRow.addView(c);
+        col.addView(clearRow, cTop(dp(10)));
     }
 
     private File conLogFile() { return new File(getFilesDir(), "dsh-web.log"); }
+
+    /**
+     * 与日志相关的全部文件：内部/外部两份 dsh-web.log + 两份 startup-diag.txt。
+     * 外部那份是 v1.7.1 起镜像的（/sdcard/<pkgRoot>/），两处都要清，否则外部的旧内容还在。
+     */
+    private File[] conLogTargets() {
+        File extRoot = new File(Environment.getExternalStorageDirectory(), pkgRoot());
+        return new File[]{
+                new File(getFilesDir(), "dsh-web.log"),
+                new File(getFilesDir(), "startup-diag.txt"),
+                new File(extRoot, "dsh-web.log"),
+                new File(extRoot, "startup-diag.txt"),
+        };
+    }
+
+    /**
+     * 清空日志。
+     * 关键：引擎写日志的句柄是追加模式（FileOutputStream(f, true) → O_APPEND），
+     * 所以把文件截断到 0 既不会打断正在运行的引擎，也不会丢后续日志 ——
+     * 追加写总是写到当前文件末尾，截断后自然从 0 重新开始。
+     * （不要用 delete()：那会把 inode 摘掉，引擎的旧句柄会继续往已删除的文件里写，
+     * 于是"显示已清空、新日志却消失"。）
+     */
+    private void conClearLog() {
+        long total = 0;
+        for (File f : conLogTargets()) {
+            try { if (f.exists()) total += f.length(); } catch (Throwable ignored) {}
+        }
+        if (total == 0) { conToast("日志已经是空的"); return; }
+        // 与控制台其余弹窗统一走自绘浮层（conDialog），不再用系统 AlertDialog
+        // ——后者会带一层主题面板外框，和本页其它弹窗不是一套视觉。
+        conDialog("清空日志",
+                "当前共 " + (total / 1024) + " KB。\n\n"
+                        + "清空不影响正在运行的引擎，之后的新日志会继续正常写入。",
+                "清空",
+                new Runnable() { @Override public void run() { conClearLogNow(); } },
+                "取消");
+    }
+
+    private void conClearLogNow() {
+        int n = 0;
+        long freed = 0;
+        for (File f : conLogTargets()) {
+            try {
+                if (!f.exists() || f.length() == 0) continue;
+                long len = f.length();
+                java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "rw");
+                try { raf.setLength(0); } finally { raf.close(); }
+                freed += len;
+                n++;
+            } catch (Throwable t) {
+                Log.w(TAG, "clear log failed: " + f, t);
+            }
+        }
+        conToast(n == 0 ? "没有可清空的日志" : ("已清空 " + n + " 个日志文件，释放 " + (freed / 1024) + " KB"));
+        if (consoleVisible && consolePage == 3) renderConsole();
+    }
 
     private String conLogSummary() {
         try {
@@ -5518,6 +5720,466 @@ public class MainActivity extends Activity {
             in.close();
             out.close();
         }
+    }
+
+    // ==================== 安全模式（救援启动） ====================
+    //
+    // 为什么需要它：引擎启动时要把 profile 的 patch 文件当配置解析。一旦这些文件
+    // 被写坏（用户装的插件写坏配置是常见路径），内核直接拒启：
+    //   dsh: failed to parse overlay <...>/profiles/web/cordis.patch.yml: YAMLException: ...
+    // 而「修它」又必须先把引擎跑起来（Web UI 与 AI 都靠引擎）—— 形成死结。
+    //
+    // 安全模式：把 profile 的**用户层**（可能被写坏的那些）整体旁置到旁边的
+    // web.userlayer-<时间>/，再从 APK 里恢复出厂 profile 文件。
+    // 用户数据（sessions / storages / .credentials.yaml / settings.yaml / 工作区绑定）**一律不动**。
+    // 引擎跑起来后，AI 可以直接读旁置目录里的坏文件去定位问题；修好后「退出安全模式」还回去。
+
+    /** profile 目录（web）。 */
+    private File profileDir() { return new File(payloadDir(), "dshhome/profiles/web"); }
+
+    /** 用户层：可能被用户/插件改坏、安全模式下要旁置的部分。 */
+    private static final String[] PROFILE_USER_LAYER = {
+            "cordis.patch.yml", "package.json", "pnpm-lock.yaml", "node_modules"
+    };
+
+    /** 出厂就该有的 profile 文件（payload.zip 里带，恢复安全模式时写回）。 */
+    private static final String[] PROFILE_SHIPPED = {
+            "cordis.yml", "cordis.patch.yml", "package.json", "pnpm-workspace.yaml"
+    };
+
+    /** 最近一次安全模式旁置目录名（退出安全模式时据此还原）。 */
+    private static final String KEY_SAFE_STASH = "safe_mode_stash";
+
+    private boolean safeModeActive() { return prefs().getBoolean(KEY_SAFE_MODE, false); }
+    private void setSafeModeFlag(boolean on) { prefs().edit().putBoolean(KEY_SAFE_MODE, on).apply(); }
+    private int bootFailures() { return prefs().getInt(KEY_BOOT_FAILS, 0); }
+    private void resetBootFailures() {
+        if (bootFailures() != 0) prefs().edit().putInt(KEY_BOOT_FAILS, 0).apply();
+    }
+    private void bumpBootFailure() {
+        final int n = bootFailures() + 1;
+        prefs().edit().putInt(KEY_BOOT_FAILS, n).apply();
+        Log.w(TAG, "engine boot failure #" + n);
+        ui.post(new Runnable() { @Override public void run() {
+            if (consoleVisible) refreshConsole();
+            if (n == BOOT_FAIL_HINT_AT) conToast("引擎连续启动失败：可在控制台用「安全模式启动」，不会丢数据");
+        }});
+    }
+
+    /** 安全模式启动（带确认）。 */
+    private void conSafeMode() {
+        conDialog("安全模式启动",
+                "做法：把 profile 的用户层（可能被插件写坏的配置）整体旁置，"
+                        + "用出厂配置启动引擎。\n\n"
+                        + "你的会话记录、API Key、模型配置、工作区绑定都会原样保留；"
+                        + "被旁置的文件也不删，启动后 AI 可以直接读它们来定位问题。\n\n"
+                        + "现在进入安全模式吗？",
+                "进入安全模式",
+                new Runnable() { @Override public void run() { conSafeModeNow(); } },
+                "取消");
+    }
+
+    private void conSafeModeNow() {
+        conToast("正在进入安全模式…");
+        new Thread(new Runnable() { @Override public void run() {
+            final String err;
+            try {
+                killEngineNow();
+                long deadline = System.currentTimeMillis() + 8000;
+                while (System.currentTimeMillis() < deadline && portListening(enginePort)) {
+                    try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+                }
+                err = enterSafeMode();
+            } catch (Throwable t) {
+                Log.e(TAG, "enter safe mode failed", t);
+                ui.post(new Runnable() { @Override public void run() { conToast("进入安全模式失败：" + t.getMessage()); } });
+                return;
+            }
+            ui.post(new Runnable() { @Override public void run() {
+                conToast(err == null ? "已进入安全模式，正在启动引擎…" : err);
+                refreshConsole();
+                if (err == null) { engineStoppedByUser = false; engineStartAborted = false; conEngineClick(); }
+            }});
+        }}, "safe-mode-on").start();
+    }
+
+    /** 退出安全模式（把旁置的用户层还回去）。 */
+    private void conExitSafeMode() {
+        conDialog("退出安全模式",
+                "把上次旁置的用户层放回去（覆盖当前出厂配置）。\n\n"
+                        + "如果刚才是因为插件把配置写坏才进的安全模式，建议先在对话里让 AI 把坏文件修好，"
+                        + "否则退出后可能又启动不了。\n\n确认退出吗？",
+                "退出并还原",
+                new Runnable() { @Override public void run() { conExitSafeModeNow(); } },
+                "取消");
+    }
+
+    private void conExitSafeModeNow() {
+        conToast("正在退出安全模式…");
+        new Thread(new Runnable() { @Override public void run() {
+            final String err;
+            try {
+                killEngineNow();
+                long deadline = System.currentTimeMillis() + 8000;
+                while (System.currentTimeMillis() < deadline && portListening(enginePort)) {
+                    try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+                }
+                err = exitSafeMode();
+            } catch (Throwable t) {
+                Log.e(TAG, "exit safe mode failed", t);
+                ui.post(new Runnable() { @Override public void run() { conToast("退出安全模式失败：" + t.getMessage()); } });
+                return;
+            }
+            ui.post(new Runnable() { @Override public void run() {
+                conToast(err == null ? "已退出安全模式，正在启动引擎…" : err);
+                refreshConsole();
+                if (err == null) { engineStoppedByUser = false; engineStartAborted = false; conEngineClick(); }
+            }});
+        }}, "safe-mode-off").start();
+    }
+
+    /** 真正干活：旁置用户层 + 恢复出厂 profile 文件。返回 null 表示成功，否则为错误文案。 */
+    private String enterSafeMode() {
+        try {
+            File dir = profileDir();
+            if (!dir.exists() && !dir.mkdirs()) return "无法创建 profile 目录：" + dir;
+            String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss").format(new java.util.Date());
+            File stash = new File(dir.getParentFile(), "web.userlayer-" + stamp);
+            if (!stash.exists() && !stash.mkdirs()) return "无法创建旁置目录：" + stash;
+            int moved = 0;
+            for (String name : PROFILE_USER_LAYER) {
+                File src = new File(dir, name);
+                if (!src.exists()) continue;
+                File dst = new File(stash, name);
+                if (!src.renameTo(dst)) { backupCopyRec(src, dst); backupDeleteRec(src); }
+                moved++;
+            }
+            int restored = restoreShippedProfileFiles();
+            prefs().edit().putBoolean(KEY_SAFE_MODE, true).putString(KEY_SAFE_STASH, stash.getName()).apply();
+            Log.w(TAG, "safe mode on: moved " + moved + " entries to " + stash + ", restored " + restored + " shipped files");
+            return null;
+        } catch (Throwable t) {
+            Log.e(TAG, "enterSafeMode", t);
+            return "进入安全模式失败：" + t.getMessage();
+        }
+    }
+
+    /** 把旁置的用户层放回去，并清掉安全模式标记。 */
+    private String exitSafeMode() {
+        try {
+            File dir = profileDir();
+            String stashName = prefs().getString(KEY_SAFE_STASH, null);
+            if (stashName == null || stashName.isEmpty()) {
+                setSafeModeFlag(false);
+                return "没有找到旁置目录，已直接关闭安全模式";
+            }
+            File stash = new File(dir.getParentFile(), stashName);
+            if (!stash.exists()) {
+                setSafeModeFlag(false);
+                return "旁置目录已不存在（" + stashName + "），已直接关闭安全模式";
+            }
+            int back = 0;
+            File[] kids = stash.listFiles();
+            if (kids != null) {
+                for (File src : kids) {
+                    File dst = new File(dir, src.getName());
+                    backupDeleteRec(dst);   // 先清掉出厂版，再把用户层放回
+                    if (!src.renameTo(dst)) { backupCopyRec(src, dst); backupDeleteRec(src); }
+                    back++;
+                }
+            }
+            setSafeModeFlag(false);
+            Log.w(TAG, "safe mode off: restored " + back + " entries from " + stash);
+            return null;
+        } catch (Throwable t) {
+            Log.e(TAG, "exitSafeMode", t);
+            return "退出安全模式失败：" + t.getMessage();
+        }
+    }
+
+    // ==================== 备份：导出 / 导入 ====================
+    // 用户需求：装插件把引擎弄崩时，能先把全部数据导出，清完重装再导回，什么都不丢。
+    // 与安全模式互补：安全模式解决「不用清数据就能启动」，导出/导入解决「换机、彻底重装、留底」。
+
+    private SharedPreferences prefs() { return getSharedPreferences(PREFS, MODE_PRIVATE); }
+
+    /** 参与备份的偏好项（其余是缓存/引擎运行态，不必带走）。 */
+    private static final String[] BACKUP_PREF_S = {
+            "workspace_path", "shizuku_app_id", "engine_port"
+    };
+    private static final String[] BACKUP_PREF_I = {
+            "engine_boot_failures"
+    };
+    private static final String[] BACKUP_PREF_B = {
+            "safe_mode_active", "setup_done"
+    };
+
+    /** 要导出/还原的用户数据根（相对 payload/dshhome）。 */
+    private static final String[] BACKUP_ROOTS = {
+            "sessions", "storages", ".credentials.yaml", "settings.yaml",
+            "settings.yaml.imported", "cordis.patch.yml", ".anonymous-user-id"
+    };
+
+    private void conBackupExport() {
+        conToast("正在打包全部数据…");
+        new Thread(new Runnable() { @Override public void run() {
+            File out = null; String err = null; int files = 0;
+            try {
+                String ts = new SimpleDateFormat("yyyyMMdd-HHmmss").format(new java.util.Date());
+                File dir = new File(Environment.getExternalStorageDirectory(), "Download");
+                if (!dir.exists()) dir.mkdirs();
+                out = new File(dir, "DSH备份-" + ts + ".zip");
+                files = writeBackupZip(out);
+            } catch (Throwable t) {
+                Log.e(TAG, "backup export", t);
+                err = t.getMessage(); out = null;
+            }
+            final File f = out; final String e = err; final int n = files;
+            ui.post(new Runnable() { @Override public void run() {
+                if (f == null) conToast("导出失败：" + e);
+                else conToast("已导出 " + n + " 个文件到 " + f.getAbsolutePath());
+            }});
+        }}, "backup-export").start();
+    }
+
+    /** 把用户数据 + 偏好写成一个 zip。返回写入的文件数。 */
+    private int writeBackupZip(File out) throws Exception {
+        File home = new File(payloadDir(), "dshhome");
+        byte[] buf = new byte[64 * 1024];
+        int n = 0;
+        java.util.zip.ZipOutputStream zos =
+                new java.util.zip.ZipOutputStream(new java.io.BufferedOutputStream(new FileOutputStream(out)));
+        try {
+            // manifest：只写能帮人判断“这是什么包”的最小事实
+            String manifest = "{\n"
+                    + "  \"kind\": \"dsh-android-backup\",\n"
+                    + "  \"format\": 1,\n"
+                    + "  \"app\": \"" + jesc(conVersionLabel()) + "\",\n"
+                    + "  \"package\": \"" + jesc(getPackageName()) + "\",\n"
+                    + "  \"saved_at\": \"" + jesc(new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new java.util.Date())) + "\"\n"
+                    + "}\n";
+            zipAddBytes(zos, "manifest.json", manifest.getBytes("UTF-8"));
+            // 偏好：用简单的 TSV（类型 + 值），避免再引一套 JSON 解析
+            zipAddBytes(zos, "prefs.txt", backupPrefsText().getBytes("UTF-8"));
+            // 用户数据
+            for (String rel : BACKUP_ROOTS) {
+                File src = new File(home, rel);
+                if (!src.exists()) continue;
+                n += zipAdd(zos, src, "dshhome/" + rel, buf);
+            }
+            // profile 用户层（可能被插件改坏，必须一起带走）
+            File pdir = profileDir();
+            for (String name : PROFILE_USER_LAYER) {
+                File src = new File(pdir, name);
+                if (!src.exists()) continue;
+                n += zipAdd(zos, src, "dshhome/profiles/web/" + name, buf);
+            }
+        } finally { try { zos.close(); } catch (Throwable ignored) {} }
+        return n;
+    }
+
+    private String backupPrefsText() {
+        StringBuilder sb = new StringBuilder("# dsh-android-backup prefs v1\n");
+        SharedPreferences p = prefs();
+        for (String k : BACKUP_PREF_S) { String v = p.getString(k, null); if (v != null) sb.append("S\t").append(k).append('\t').append(v).append('\n'); }
+        for (String k : BACKUP_PREF_I) { sb.append("I\t").append(k).append('\t').append(p.getInt(k, 0)).append('\n'); }
+        for (String k : BACKUP_PREF_B) { sb.append("B\t").append(k).append('\t').append(p.getBoolean(k, false)).append('\n'); }
+        return sb.toString();
+    }
+
+    private void zipAddBytes(java.util.zip.ZipOutputStream zos, String name, byte[] data) throws Exception {
+        zos.putNextEntry(new ZipEntry(name));
+        zos.write(data);
+        zos.closeEntry();
+    }
+
+    /** 递归把一个文件/目录写进 zip（跳过符号链接：内核会自己重建 profile 的链接）。返回文件数。 */
+    private int zipAdd(java.util.zip.ZipOutputStream zos, File f, String entryName, byte[] buf) throws Exception {
+        if (isSymlink(f)) return 0;
+        if (f.isDirectory()) {
+            zos.putNextEntry(new ZipEntry(entryName + "/"));
+            zos.closeEntry();
+            int n = 0;
+            File[] kids = f.listFiles();
+            if (kids != null) for (File k : kids) n += zipAdd(zos, k, entryName + "/" + k.getName(), buf);
+            return n;
+        }
+        zos.putNextEntry(new ZipEntry(entryName));
+        FileInputStream in = new FileInputStream(f);
+        try { int r; while ((r = in.read(buf)) > 0) zos.write(buf, 0, r); }
+        finally { in.close(); }
+        zos.closeEntry();
+        return 1;
+    }
+
+    /** 符号链接判定：canonical 路径与「父目录 + 文件名」不一致即为链接。 */
+    private boolean isSymlink(File f) {
+        try {
+            File p = f.getParentFile();
+            if (p == null) return false;
+            return !f.getCanonicalPath().equals(new File(p.getCanonicalPath(), f.getName()).getPath());
+        } catch (Throwable t) { return false; }
+    }
+
+    private void conBackupImport() {
+        try {
+            Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+            i.addCategory(Intent.CATEGORY_OPENABLE);
+            i.setType("*/*");
+            startActivityForResult(i, REQ_BACKUP_FILE);
+        } catch (Throwable t) { conToast("无法打开文件选择器：" + t.getMessage()); }
+    }
+
+    private void conImportFromUri(final Uri uri) {
+        conDialog("从备份导入还原",
+                "会把备份里的用户数据（会话 / 凭证 / 设置 / 工作区）写回本机，然后重启引擎。\n\n"
+                        + "当前同名数据会被覆盖（备份文件本身不动）。\n\n开始导入吗？",
+                "开始导入",
+                new Runnable() { @Override public void run() { conImportNow(uri); } },
+                "取消");
+    }
+
+    private void conImportNow(final Uri uri) {
+        conToast("正在导入…");
+        new Thread(new Runnable() { @Override public void run() {
+            final String err; int files = 0;
+            try {
+                killEngineNow();
+                long deadline = System.currentTimeMillis() + 8000;
+                while (System.currentTimeMillis() < deadline && portListening(enginePort)) {
+                    try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+                }
+                files = readBackupZip(uri);
+                err = null;
+            } catch (Throwable t) {
+                Log.e(TAG, "backup import", t);
+                ui.post(new Runnable() { @Override public void run() { conToast("导入失败：" + t.getMessage()); } });
+                return;
+            }
+            final int n = files;
+            ui.post(new Runnable() { @Override public void run() {
+                conToast("已导入 " + n + " 个文件，正在重启引擎…");
+                refreshConsole();
+                engineStoppedByUser = false; engineStartAborted = false;
+                conEngineClick();
+            }});
+        }}, "backup-import").start();
+    }
+
+    /** 读 zip 并还原。返回还原的文件数。 */
+    private int readBackupZip(Uri uri) throws Exception {
+        File base = payloadDir();
+        byte[] buf = new byte[64 * 1024];
+        int n = 0;
+        boolean sawManifest = false;
+        InputStream raw = getContentResolver().openInputStream(uri);
+        if (raw == null) throw new IOException("无法读取所选文件");
+        ZipInputStream zis = new ZipInputStream(raw);
+        try {
+            ZipEntry e;
+            while ((e = zis.getNextEntry()) != null) {
+                String name = e.getName();
+                if (name.endsWith("/")) { zis.closeEntry(); continue; }
+                if ("manifest.json".equals(name)) { sawManifest = true; zis.closeEntry(); continue; }
+                if ("prefs.txt".equals(name)) {
+                    java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                    int r; while ((r = zis.read(buf)) > 0) bos.write(buf, 0, r);
+                    applyBackupPrefs(new String(bos.toByteArray(), "UTF-8"));
+                    zis.closeEntry();
+                    continue;
+                }
+                if (name.startsWith("dshhome/")) {
+                    File out = new File(base, name);
+                    File parent = out.getParentFile();
+                    if (parent != null && !parent.exists() && !parent.mkdirs()) throw new IOException("mkdir failed: " + parent);
+                    FileOutputStream fos = new FileOutputStream(out);
+                    try { int r; while ((r = zis.read(buf)) > 0) fos.write(buf, 0, r); }
+                    finally { fos.close(); }
+                    n++;
+                }
+                zis.closeEntry();
+            }
+        } finally { try { zis.close(); } catch (Throwable ignored) {} }
+        if (!sawManifest) throw new IOException("这不像本应用的备份包（缺少 manifest.json）");
+        // 用户层已还原 → 不再处于安全模式
+        setSafeModeFlag(false);
+        return n;
+    }
+
+    private void applyBackupPrefs(String text) {
+        SharedPreferences.Editor ed = prefs().edit();
+        String[] lines = text.split("\n");
+        for (String line : lines) {
+            if (line.isEmpty() || line.startsWith("#")) continue;
+            String[] parts = line.split("\t", 3);
+            if (parts.length != 3) continue;
+            String type = parts[0], key = parts[1], value = parts[2];
+            try {
+                if ("S".equals(type)) ed.putString(key, value);
+                else if ("I".equals(type)) ed.putInt(key, Integer.parseInt(value.trim()));
+                else if ("B".equals(type)) ed.putBoolean(key, Boolean.parseBoolean(value.trim()));
+            } catch (Throwable ignored) {}
+        }
+        ed.apply();
+    }
+
+    /** 递归拷贝（rename 失败时的退路）。 */
+    private void backupCopyRec(File src, File dst) throws IOException {
+        if (src.isDirectory()) {
+            if (!dst.exists() && !dst.mkdirs()) throw new IOException("mkdir failed: " + dst);
+            File[] kids = src.listFiles();
+            if (kids != null) for (File k : kids) backupCopyRec(k, new File(dst, k.getName()));
+            return;
+        }
+        File parent = dst.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) throw new IOException("mkdir failed: " + parent);
+        java.io.FileInputStream in = new java.io.FileInputStream(src);
+        try {
+            FileOutputStream out = new FileOutputStream(dst);
+            try { byte[] b = new byte[64 * 1024]; int r; while ((r = in.read(b)) > 0) out.write(b, 0, r); }
+            finally { out.close(); }
+        } finally { in.close(); }
+    }
+
+    /** 递归删除。 */
+    private void backupDeleteRec(File f) {
+        try {
+            if (f.isDirectory()) {
+                File[] kids = f.listFiles();
+                if (kids != null) for (File k : kids) backupDeleteRec(k);
+            }
+            f.delete();
+        } catch (Throwable ignored) {}
+    }
+
+    /** 从 assets/payload.zip 把出厂的 profile 文件写回（安全模式的关键一步）。 */
+    private int restoreShippedProfileFiles() throws IOException {
+        File dir = profileDir();
+        if (!dir.exists() && !dir.mkdirs()) throw new IOException("无法创建 " + dir);
+        final String prefix = "dshhome/profiles/web/";
+        byte[] buf = new byte[64 * 1024];
+        int n = 0;
+        ZipInputStream zis = new ZipInputStream(getAssets().open("payload.zip"));
+        try {
+            ZipEntry e;
+            while ((e = zis.getNextEntry()) != null) {
+                String name = e.getName();
+                boolean want = false;
+                for (String s : PROFILE_SHIPPED) {
+                    if (name.equals(prefix + s)) { want = true; break; }
+                }
+                if (!want) { zis.closeEntry(); continue; }
+                File out = new File(dir, name.substring(prefix.length()));
+                FileOutputStream fos = new FileOutputStream(out);
+                try {
+                    int r;
+                    while ((r = zis.read(buf)) > 0) fos.write(buf, 0, r);
+                } finally { fos.close(); }
+                zis.closeEntry();
+                n++;
+            }
+        } finally { zis.close(); }
+        return n;
     }
 
     @Override
