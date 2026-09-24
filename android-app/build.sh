@@ -184,7 +184,7 @@ cp "$H/.dsh/profiles/web/cordis.patch.yml" "$P/staging/dshhome/profiles/web/"
 cp "$H/.dsh/profiles/web/cordis.yml" "$P/staging/dshhome/profiles/web/"
 cp "$H/.dsh/profiles/web/package.json" "$P/staging/dshhome/profiles/web/"
 cp "$H/.dsh/profiles/web/pnpm-workspace.yaml" "$P/staging/dshhome/profiles/web/"
-cp "$H/.dsh/settings.yaml" "$P/staging/dshhome/"
+cp "$H/.dsh/settings.yaml" "$P/staging/dshhome/" 2>/dev/null   || cp "$H/.dsh/settings.yaml.imported" "$P/staging/dshhome/settings.yaml"   || { echo "!! 找不到 .dsh/settings.yaml（也没有 settings.yaml.imported），中止"; exit 1; }
 
 # 安全检查：payload 里绝不能出现 API Key 或凭证文件
 if grep -rqE "sk-[A-Za-z0-9]{20,}" "$P/staging" 2>/dev/null; then
