@@ -1,99 +1,147 @@
+## v1.15.2（正式版 + Lite 共存版 + 兼容版 · 2026-09-24）
+
+> 修三处**只在真机上发作**的缺陷（PC / 静态验证都看不出来），来源是一份外部 AI 的
+> 全工具真机测试报告，逐条核实后确认并修复。versionCode **39**，内核仍 **DSH 0.1.7-rc.1**。
+
+### 🐛 `write` 工具无法新建文件（写已有文件正常）
+- **现象**：新建文件报 `EACCES: permission denied, link .../xxx.tmpdir/xxx.tmp -> xxx`；
+  工作区目录与 `/sdcard` 都失败，**覆盖**已有文件却成功。
+- **根因**：`dsh-fs-local` 的新建路径用硬链接发布（`link()`）保证“不覆盖”，而 Android
+  在 App 私有目录（f2fs + SELinux）与 FUSE 外部存储上**直接拒绝 `link()`**，且失败后没有回退。
+  （本项目 v1.6.1 曾修过同一个包的另一处 `link()`，升级 0.1.5 时这处漏移植了。）
+- **修法**：`link()` 因权限/不支持类错误码失败时，**先复查目标不存在**再退化为同目录 `rename()`；
+  目标已存在仍抛 `FS_NOT_OBSERVED`（保持“未读取不得覆盖”语义），`EEXIST` 等其它码仍走原路径。
+- **验证**：用真实出货代码 A/B（注入“拒绝 link”的文件系统）：修复前逐字复现报错，
+  修复后新建成功、覆盖仍被拒、`EEXIST`/`ENOSPC` 语义不变，10/10 断言通过。
+
+### 🐛 `workflow` 工具不可用（后台 worker 起不来）
+- **现象**：`workflow` 启动即失败：
+  `worker-exit: Node process exited before completing (1): CANNOT LINK EXECUTABLE ".../runtime/bin/node": library "libz.so.1" not found`。
+  bash 里 `node -e` 正常 —— 只有 worker 挂了。
+- **根因**：`dsh-ptc-runtime-node` 给 worker **故意的清空环境变量**（内核契约为“worker 的
+  `process.env` 从空开始”），但 node 会**丢弃值为 `undefined` 的键**，而 Android 内置 node 的
+  动态库（libz/libcrypto/libicu…）全靠 `LD_LIBRARY_PATH` 提供 → worker 直接链接失败。
+- **修法**：仅在 Android 上把 `LD_LIBRARY_PATH` 与 `OPENSSL_CONF`（Termux 共存所需）按需补回，
+  **其余环境变量仍保持清空**，内核契约不被放开。
+- **验证**：从真实源码逐字抽取这两段逻辑 + 真·spawn 子进程确认继承，8/8 断言通过。
+
+### 🐛 图片层失败被误报成「网络传输失败」并白等 5 次重试
+- **现象**：附件解码/校验失败时报 `DeepSeek Messages transport failed`（TRANSPORT），
+  看起来像网络问题；且 `TRANSPORT` 在默认可重试码里 → 一条消息白白退避重试 5 次
+  （实测约 15 秒），而失败发生在 `fetch()` 之前，重试注定无效。
+- **根因**：`dsh-llm-deepseek` 把所有非 `LlmError` 的异常统一包成 `TRANSPORT`，附件错误
+  （`AttachmentError`）因此被贴上网络标签，`cause` 也不落盘，事后查不出真因。
+- **修法**：附件层错误如实归类为非可重试的 `INVALID_REQUEST`，并把真实原因写进 message；
+  其它错误仍是 `TRANSPORT`（真网络抖动照旧重试），措辞也补上原因。
+- **验证**：从真实源码逐字抽取分类分支 + 注入真实 `AttachmentError`/网络错误对象，10/10 断言通过。
+
+### 🐛 `android_touch_status` 只回「操作成功。」（`held[]` 被丢掉）
+- 该工具返回了手指编号/坐标/按住时长，schema 也声明了，但通用渲染只输出“操作成功。”，
+  而“问一下现在按着什么”正是它的全部用途。现改为专用渲染，逐项回显手指、像素/分数坐标、
+  已按住毫秒数与超时上限。
+
+### 📝 `android_type` 的描述按真机实测改正
+- 原文写“WebView/网页输入框请用 `paste:true`”，而真机实测 `paste:true` 也常只落到
+  输入法候选栏、不提交。现改为如实说明：WebView/contenteditable 无障碍输入不可靠
+  （setText 不改前端；paste 只进候选栏），应改用特权版 `android_input`（先 tap 聚焦、
+  确认键盘弹出，再输入）—— 这条路已验证可用。
+
+---
+
+## v1.15.1（正式版 + Lite 共存版 + 兼容版 · 2026-09-24）
+
+> v1.15.0 上了真机之后暴露的回归修复。versionCode **38**，内核 **DSH 0.1.7-rc.1**。
+> ⚠️ **强烈建议从 v1.15.0 升级到本版**：v1.15.0 上所有 agent preset 会话都建不起来。
+
+### 🐛 【P0】所有会话都建不起来（v1.15.0 引入）
+- **现象**：装 v1.15.0 后发消息、恢复会话全部失败，报
+  `resume failed for session "…": workflow-ptc (@deepseek-ai/dsh-workflow-ptc): waiting for
+  ptcRuntime / tool-workflow (@deepseek-ai/dsh-tool-workflow): waiting for workflowEngine`。
+- **根因**：`cordis.patch.yml` 沿用了旧版本的 `- id: sandbox / disabled: true`。而 0.1.7 起
+  `dsh-ptc-runtime-node` 把 `sandbox` 列为注入依赖 → 一禁用，`ptc-runtime` 永久 pending →
+  `workflow-ptc` 拿不到 `ptcRuntime` → `workflowEngine` 缺失 → **standard / ptc / cordis
+  三套 preset 的会话 create/resume 全部报错**（引擎本身能起、网页能开，所以静态验证看不出来）。
+- **为什么旧版本禁它**：担心 `dsh-sandbox-local` 需要 koffi 原生模块。**实测该判断不成立**：
+  它只通过 `@deepseek-ai/node-addon-system` 的 landlock-run 解析平台包（缺失时 probe 判为
+  unusable），加载路径上没有任何原生 import，在“树内 0 个 `.node`”的环境里 import 成功。
+  真正的隔离只在 `confine()` 被调用时 fail-closed，而默认 preset 是 `danger-full-access`。
+- **修法**：恢复 `sandbox` 启用（只保留 `bash-sandbox` / `pwsh-sandbox` 禁用）。
+  bash 不受影响 —— `dsh-bash-local` 只注入 `subprocess`，从不调用 `ctx.sandbox`。
+- **验证**：本地 A/B 对照（禁用 → 复现同样报错；启用 → `session/create` 返回
+  `{ok:true, agentPreset:"standard"}`，启动日志 0 pending）；真机装上后引擎启动日志干净、
+  发消息正常。
+
+### 🐛 三条杠侧边栏消失（0.1.7 升级漏打的补丁）
+- 窄屏下左上角的三条杠按钮、浮层抽屉、遮罩全部不见了 —— 因为 0.1.7 升级时
+  `dsh-client-ui-layout` 的移动端补丁**没有重打**（上一轮误判它是“空补丁”）。
+- 现按 0.1.7 上游结构重打 4 处：窄屏侧栏不占列宽（`gridTemplateColumns` 置 0）、
+  展开时以浮层抽屉覆盖、左上角三条杠按钮、点击即收的透明遮罩；同时给 DragHandle 加 `!narrow`
+  （窄屏是抽屉，没有可拖的分栏）。
+
+### 🐛 控制台找不到「清空日志」
+- **根因**：日志页（`consolePage == 3`）原本**没有任何入口能进** —— `cNavRow` 只接了权限(1)/插件(2)，
+  于是渲染日志页的 `renderConsoleLog()`（含上一版新加的「清空日志」）成了不可达的死代码。
+- **修法**：① 主页面「日志」行整行可点进入日志页（并补 `›` 提示）；② 该行直接加一个「清空」按钮，
+  主页面一键直达。清空逻辑仍是截断（`setLength(0)`）而非删除，不会打断运行中的引擎。
+
+### 🐛 菜单被压成「一两个字」（属性选择器误伤）
+- **现象**：会话行的「归档/置顶」菜单、聊天区的工具气泡菜单显示成 `置 / 重 / 亻 / 収`，面板也歪了。
+- **根因**：`mobile.css` 上一版把选择器改成 `[class*="_名字_"]`（为避免哈希变化失效），
+  但只核对了“名字还在不在”，**没核对这个名字在 0.1.7 里属于哪个组件**。
+  实测 0.1.7 里名字恰好叫 `item` 的组件**只有菜单项**（模块 1t7on，同模块 root/list/submenu/label/separator…），
+  而我们的规则把它强制成 `width:48px; height:48px` → 文字被裁掉。
+  `_label_` / `_separator_` / `_itemLabel_` 同理；`_rail_` / `_thumbnail_` / `_gallery_` / `_illustration_` 在 0.1.7 已无同名组件（死规则）。
+- **修法**：删掉这 6 组会误伤的规则；保留的（`_wrap_`/`_input_`/`_answer_`/`_markdown_`/`_content_`/`_block_`/
+  `_output_`/`_command_`/`_card_`/`_button_`/`_line_`）都是**方向安全**的（只限制宽度/字号，不强制尺寸）。
+
+### 🐛 图片：损坏图能穿到上传（会话被永久毒死）+ 合法 PNG 发不出去（报 TRANSPORT）
+- **病灶**：Android 用的纯 JS `sharp-shim.js` 过去只解析文件头，`resize`/`png()`/`jpeg()` 全是空操作，
+  **返回原始字节却按请求格式标注**。同一处谎言分两个分支发作：
+  · 目标尺寸 ≥ 源尺寸时走直通，跳过 `verifyRequestImage()` → 坏图原样上传 → provider 400，
+    且图已进会话历史，**之后每次请求都复现**；
+  · 目标尺寸 < 源尺寸时进重编码，断言发现“声明 jpeg / 实为 png” → 抛 `AttachmentError`，
+    又被适配器包成 `TRANSPORT`（原始原因丢失）——**只对“需要缩放的非 JPEG 图”发作**（PNG/WebP/GIF）。
+- **修法（四处）**：
+  1. `sharp-shim.js` **重写**：新增**纯 JS 的 PNG 编解码**（CRC 校验 + inflate + 反滤波；
+     位深 1/2/4/8/16、颜色类型 0/2/3/4/6、隔行 0/1；输出 8 位 sRGB）→ `raw().toBuffer()` **真的解码**
+     （这是 `detectImage()` 唯一那道完整性防线）、`resize()` 对 PNG **真的生效**（顺带修了“识图大图不缩放”）。
+  2. `metadataOf()` 返回**真实 `hasAlpha`**（PNG 看 IHDR 颜色类型 + tRNS）。
+  3. `encode()` 不再硬编码 mediaType，改以**输出字节的真实格式**声明 → “声明 == 字节”永真。
+  4. `readRequestImageFile()` 的**快路径也校验**（删掉 `data === attachment.data` 就跳过断言的优化）。
+- **边界（已知取舍）**：JPEG/WebP/GIF 仍**原样透传、不缩小、不做像素级完整性校验**
+  （纯 JS 无法重编码，且 `raw().toBuffer()` 对它们**必须返回字节而不能抛错** ——
+  上游对所有格式都走这道校验，抛错会把全部 JPEG 一起拒掉）。它们会**如实声明真实格式**，不再被 provider 拒收。
+- **验证**：替身单测 24 项全过；坏图穿管实验（修复前能穿 / 修复后被拒）；
+  用真机拉回的真实截图（1008×1792）端到端跑通；35 个真实 PNG 解码→缩放→再编码往返全过；JPEG 无回归。
+
+### 🐛 控制台弹窗风格不统一（安全模式 / 清空日志）
+- 「安全模式启动」「退出安全模式」「清空日志」「从备份导入还原」四处仍是系统 `AlertDialog`，
+  会多出一层主题面板外框，与页面其它弹窗不是一套视觉。
+- 现全部改用 v1.14.0 已做好的自绘浮层 `conDialog(...)`：圆角卡片、跟随深浅色、同套字体/按钮、点空白取消。
+
+---
+
+## v1.15.0（正式版 + Lite 共存版 + 兼容版 · 2026-09-24）
+
+> 内核升级 **DSH 0.1.7-rc.1**（原 0.1.5-rc.1）。versionCode **37**。
+> 详见 `交接文档-内核017升级与v1.15.md`。**⚠️ 本版有一处 P0（见上），请直接用 v1.15.1。**
+
+- 内核 0.1.7-rc.1；payload 补丁面重做（7 个文件：flock 空锁回退、
+  `node-addon-require-builtin` 的 JS 回退、bash-local `sandboxMode`、fs-search 的 Android rg 回退、
+  attachment-local、session-persistence-jsonl）；移动端 `mobile.css` 改写为属性选择器
+  （Vite 哈希类名随前端构建变化，原先 20 个选择器在 0.1.7 上 0 命中）。
+- 新功能：控制台「安全模式启动 / 退出」与「导出全部数据 / 从备份导入还原」。
+
+---
+
 ## v1.14.0（正式版 + Lite 共存版 + 兼容版 · 2026-09-18）
 
-> 接 v1.13.6：以社区 @xhwxt 的 9 个修复为主体（#12~#19、#22），另修掉 4 个真 bug ——
-> 其中「**快速同步自 v1.5.2 引入起从未生效**」（每次升级都整棵重解压 2.5 万文件）是本轮最重要的一个。
 > versionCode **36**，内核仍为 DSH 0.1.5-rc.1。
+> 详见 `交接文档-v1.14.0.md`。
 
-### ✨ 新功能
-
-- **控制台「界面主题」设置**（跟随系统 / 浅色 / 深色）：WebView 的 `prefers-color-scheme` 跟随 `isLightTheme`，
-  前端随之切换。
-- **权限引导改翻页式**：一页一项、说明用途、可逐项跳过，最后一页含 AI 工作区与「开始使用」。
-- **小鲸鱼交互重做**：
-  - 静置半藏贴边（`FLAG_LAYOUT_NO_LIMITS`，窗口可越界 55%）；
-  - 收起 / 唤出旋转抖动动画；
-  - 拖到屏幕底部松手隐藏（悬浮窗无系统级拖底隐藏，气泡 API 会替换整个交互形态，故自实现），
-    通知栏常驻「显示小鲸鱼」动作可恢复；
-  - 面板紧凑化（小胶囊按钮）、移除端口行；虚拟屏运行时面板内提供「销毁屏」。
-- **虚拟屏预览窗控件外移为顶部小条**（点小条收起到小鲸鱼），✕ 移入鲸鱼面板。
-- **状态栏 / 导航栏颜色实时跟随页面底色**：注入 MutationObserver 经 JS 桥上报 +
-  body 透明时回退读 `<html>` 底色 + onResume 补采样。
-
-### 🐛 修复
-
-- **首次启动完成权限引导后卡在启动页**：根因是引擎启动超时（90s）后直接 `loadHome()`，
-  WebView 对着死端口反复重试，用户只能杀掉重开。现超时后回控制台并后台继续守望（最长 10 分钟），
-  引擎就绪后自动进入主界面。
-- **覆盖安装更新后重新解压整个内核树**：老版本升级上来（`.complete` 无布局标记或标记不同）会触发
-  `dshrootNeedsFullSync` → 2.5 万文件整棵重写。现布局差异不再触发全量，改走新的 `dshroot-add` 增量模式：
-  缺失文件才写入 + REVISION/白名单覆盖 + 清理新树中已不存在的插件包。解压进度文案也按实际动作区分
-  「首次解压」与「同步」。
-- **悬浮窗 AI 状态永远显示「空闲」**：0.1.5 加认证后，悬浮窗的 `POST /api/session.list` 先是 401，
-  实测该路径本身也 404（RPC 走 WebSocket）。现改为扫描 `/proc/<同 uid 进程>/fd` 中指向
-  `dshhome/sessions/**/session.lock` 的句柄 —— 该锁由会话写入器存活期间持有，是「会话正在工作」的一手证据，
-  且无需认证。显示：空闲 / N 个会话工作中… / 已完成 ✓。
-- **DSH 界面内偶尔浮现小鲸鱼**：虚拟屏预览「收起到小鲸鱼」的钉住状态会盖过前台隐藏。
-  现前台隐藏优先级最高，钉住只控制预览帧是否继续拉取。
-- **退出确认文案与实际不符**：退出只是关界面，node 在后台继续跑（这正是设计意图），
-  文案改为「服务器将在后台继续运行」。
-- **手机软键盘回车直接发送、无法换行**（#12）。
-- **控制台「重启 / 停止」点了没反应**（#13）：引擎其实没被重启。
-- **虚拟屏预览窗没有关闭/最小化入口，且能被缩放撑出屏幕**（#14）。
-- **状态栏被隐藏、顶部露出一大块黑条**（#15）。
-- **弹窗卡片外面还套着一层深色圆角框**（#16）。
-- **横竖屏跟随上一个应用，而不是跟随系统设置**（#17）。
-- **有虚拟屏预览窗时网页会被双指缩放**（#18）：`index.html` 的 viewport 缺
-  `maximum-scale` / `user-scalable=no`（现代 WebView 上 `setSupportZoom(false)` 并不权威），
-  补 viewport 声明 + 捕获阶段拦 ≥2 指的 `touchmove` / `gesture*`；预览窗是独立原生窗口，其自身缩放不受影响。
-- **桥服务按包名拼类名启动，改过包名的构建起不来**（#19）：`ClassNotFoundException`。
-- **覆盖安装更新后模型 / 供应商配置丢失**（#20）：`dshhome/settings.yaml` 与 `.credentials.yaml`
-  被当作可覆盖的本内置文件，版本号一变就无条件覆盖，而 `llm-*`、`agent-default-model` 全在这一个文件里。
-  现两者移出覆盖清单（改入 `DSHHOME_USER_PATHS`），在写盘与配置刷新两处都做拦截。
-
-### 🐛 补充修复（维护者）
-
-- **`dshKernelChanged()` 用字符串拼接比内核版本 → 快速同步恒失效**（本轮最重要）：
-  ```java
-  return !readFileText(pkg).contains("\"version\":\"" + builtin + "\"");
-  //                                        └─ 拼出 "version":"0.1.5-rc.1"（冒号后无空格）
-  //                                           而 dsh/package.json 是 pretty-print，实为 "version": "0.1.5-rc.1"
-  //                                           → contains 恒为 false → !false 恒为 true
-  ```
-  于是**恒判「内核变了」** → `full` 恒 true → **`dshroot-fast` 与 `dshroot-add` 都是死代码**。
-  这也让上面那条「升级重解压」修复**完全失效**（`layoutOnly = !full && ...`，而 `full` 恒真）。
-  解老包 payload 核实：v1.5.5 与 v1.9 的 `package.json` 同样是带空格的写法
-  → **从 v1.5.2 引入快速同步那天起就没工作过**。改用 `JSONObject.optString("version")` 取值比较。
-  真机验证（同机同场景，只换 App）：`extracted 25283 entries (mode=dshroot)` → `extracted 82 entries (mode=dshroot-fast)`。
-- **`dshroot-add` 的「清理过期插件包」是空转**：实现假设插件包在顶层
-  `dshroot/lib/node_modules/@deepseek-ai/` 下，但本项目 payload 是 hoisted+nested 混合布局
-  —— 顶层只有 `dsh` 一个包，其余全在
-  `dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/`。
-  记录端因此取出的「包名」恒为 `dsh`，清理端又只扫顶层目录（里面只有 `dsh`，恰在保留名单里）
-  → **一个包都不会被删**，作者注释里要防的「旧嵌套副本被 Node 优先解析」并未防住。
-  现识别真实嵌套前缀来记录包名，清理范围同时覆盖嵌套层与顶层（内外置 dshroot 均覆盖）。
-- **悬浮小鲸鱼 / 面板跑出屏幕**：贴边坐标用 `rootView.getWidth()` 计算，而该值在
-  `wm.updateViewLayout()` 之后、下一次 layout 之前仍是旧的。展开面板时按「小图标宽度」定位
-  → 面板被推出屏幕；收起时按「面板大宽度」算半藏位 → 整只鲸鱼出屏。原实现的 `rootView.post()`
-  只延后一条消息、常在 layout 之前；又因 `FLAG_LAYOUT_NO_LIMITS` 系统不夹边界。
-  现改用 `ViewTreeObserver.OnGlobalLayoutListener`，布局真正落定后再摆正。
-- **PR #17 把 XML 注释写进 `<activity>` 开始标签内部** → `aapt` 报
-  `AndroidManifest.xml:43: error: Error parsing XML: not well-formed (invalid token)`，
-  即合并后的 main **处于编译阻塞状态**。注释移到标签之前修复。
-
-### 🔧 调整
-
-- 虚拟屏看门狗阈值 **20s → 60s**：请求超时可能拖长轮询，20s 余量偏紧会误杀虚拟屏。
-
-### ⚠️ 已知边界
-
-- 从 ≤ v1.13.6 升级上来（`.complete` 无布局标记）首次启动走的是**增量同步**而非全量，
-  属预期；若仍有异常请附启动日志中 `extracted N entries (…, mode=…)` 一行反馈。
-- 正式版与 Lite 共存版**同时启动**时 **8999 端口互斥** → 虚拟屏实际二选一。
-- 虚拟屏为 PUBLIC 类型显示，部分系统弹窗（如输入法）行为与主屏有差异。
-
-### 🙏 致谢
-
-本版 9 个修复来自社区 @xhwxt（#12~#19、#22），其中 #18 因与 main 冲突由维护者手动并入。
+- 修复覆盖安装丢模型/供应商配置（`settings.yaml` / `.credentials.yaml` 移出强制覆盖清单）；
+  小鲸鱼跑出屏幕（布局落定后再贴边）；**升级后「每次都要重新解压」的真因**
+  （`dshKernelChanged` 字符串比对恒为真 → 快速同步从未生效）；`dshroot-add` 清理过期插件包空转。
 
 ---
 
