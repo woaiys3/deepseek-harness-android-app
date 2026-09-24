@@ -1,23 +1,33 @@
-# dsh-android-patch: v2
+# dsh-android-patch: v3
 # Android 兼容性 patch
 # 已修复：subprocess-local（node-pty → child_process；koffi 惰性加载）、
 #        attachment-local（sharp → 纯 JS 头解析 sharp-shim.js）、
 #        bash-local（sandboxMode 覆盖）、session-persistence-jsonl（link → rename）
-# 禁用依赖无法编译原生模块的插件（sandbox、bash-sandbox）
-# 用 bash-local（仅依赖 subprocess，已加 sandboxMode 兼容）替代 bash-sandbox 提供 ctx.shell
+# 只禁用 bash-sandbox（用 bash-local 替代它提供 ctx.shell）。
+#
+# ⚠ v1.15 修正：sandbox（@deepseek-ai/dsh-sandbox-local）**必须保持启用**。
+#   0.1.7 起 ptc-runtime（@deepseek-ai/dsh-ptc-runtime-node）inject 了 sandbox 服务，
+#   而 agent preset（standard / ptc / cordis 三套）都挂 workflow-ptc + tool-workflow：
+#   sandbox 一禁用 → ptc-runtime 永久 pending → workflow-ptc 拿不到 ptcRuntime →
+#   workflowEngine 缺失 → **所有 preset 会话 create/resume 直接失败**，报
+#   “workflow-ptc: waiting for ptcRuntime / tool-workflow: waiting for workflowEngine”。
+#   旧版本担心它“要 koffi”——实测不成立：sandbox-local 只通过 @deepseek-ai/node-addon-system
+#   的 landlock-run 解析平台包（缺失时 probe=unusable），全程惰性、加载路径无原生 import，
+#   在无 .node 的树里 import 成功、引擎干净启动（实测 0 pending）。真正的隔离只在
+#   confine() 被调用时 fail-closed，而默认 preset 是 danger-full-access，实际不会走到。
+#   bash 不受影响：dsh-bash-local 只 inject subprocess，从不调用 ctx.sandbox。
+#
 # v1.12：llm-pi-ai 取消禁用（旧版本误当它依赖原生模块）。
 # 0.1.5 树里 @earendil-works/pi-ai 纯 JS：5.7MB，openai / @anthropic-ai/sdk / @google/genai /
 # typebox 等依赖齐全，树内原生模块 0，实测可正常加载。
 # 它一旦被禁：设置 → 模型 取不到协议列表 →「添加提供方」永远置灰，
 # 且「自定义供应商」入口压根不渲染（见 CHANGES.md v1.12）。
-- id: sandbox
-  disabled: true
 - id: bash-sandbox
   disabled: true
 # rc.2 新增：PowerShell 沙箱（Android 无 pwsh，禁用）。
 # 注意：树里该插件的条目 id 是 pwsh-sandbox（不是 dsh-pwsh-sandbox）——
-# v1.6.5 起 id 不匹配导致禁用不生效，引擎启动时 pwsh-sandbox 等待 sandbox 服务
-# （sandbox 被禁用）→ pending → 启动失败、node 反复崩溃。v1.7.1 修正。
+# v1.6.5 起 id 不匹配导致禁用不生效，引擎启动时 pwsh-sandbox 会去等 sandbox 服务
+# → pending → 启动失败、node 反复崩溃。v1.7.1 修正 id。
 - id: pwsh-sandbox
   disabled: true
 # 会话日志导出按钮（右上角 session log，下载 ZIP）：移动端用不上，禁用留出空间
