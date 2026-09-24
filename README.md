@@ -15,10 +15,11 @@
 - 👁️ **无障碍屏幕助手**（v1.7.0）：系统设置开启「DeepSeek Harness 屏幕助手」后，AI 能**读屏、点击、输入、滚动、无障碍截图理解**——**不需要 root / Shizuku**，与特权通道互补
 - 🖥️ **虚拟屏 vscreen**（v1.10+）：AI 可以创建一块**独立于主屏的真·虚拟屏**，把 App 启动进去、在里面点击/滑动/输入，**你的主屏照常用**；右上角悬浮窗**实时显示虚拟屏画面**（H.264 视频流，可拖动、可双指缩放），AI 在干什么全程可见。实现移植自开源项目 [Operit](https://github.com/AAswordman/Operit)（LGPL-3.0，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）
 - 🎛️ **原生控制台**（v1.12+）：冷启动先进 App 自己的控制台（**解压 / 权限 / 插件开关 / 日志** 四页），不必先等引擎起来；引擎状态判定全面重做——探测不再吃掉一次性 token、不再误报“未启动”、不会重复拉起两个引擎
+- 🚑 **救援能力**（v1.15+）：控制台提供「**安全模式启动 / 退出**」与「**导出全部数据 / 从备份导入还原**」。插件把配置写成非法 YAML 会导致引擎拒启（历史上只能清数据），安全模式把用户层整体旁置后用出厂配置启动、**不动会话与凭证**；备份导出把会话/插件/配置打成 zip 存到 `Download`，换机或彻底重装可还原
 - 🔐 **Shizuku 通道改走 App 进程**（v1.13.1+）：特权命令执行从“引擎内 `rish` 子进程”改为**经 App 进程内的 Shizuku API**（新增本地 `/shell` 路由 + 随机令牌鉴权），根治手机上偶发的 `Request timeout. The connection between the current app … and Shizuku app …`
 - ⏰ **前台保活**（v1.4.0）：AI 干活时挂后台/锁屏不被杀，任务完成推送通知
 - 🔔 **AI 发通知**（v1.4.0）：只需通知权限，任务完成/需要关注时推送到通知栏
-- 🧠 **完整 DSH 内核**：`@deepseek-ai/dsh` **0.1.5-rc.1**（v1.11 升级），保留插件生态 + RPC API，前端用 DSH 原生界面
+- 🧠 **完整 DSH 内核**：`@deepseek-ai/dsh` **0.1.7-rc.1**（v1.15.0 升级），保留插件生态 + RPC API，前端用 DSH 原生界面
 - 📱 **移动端适配**：触摸优化 + 软键盘适配 + 首次启动权限引导页（9 项权限一站式配置）
 - 💾 **卸载不丢数据**：dshroot 外置到 `/sdcard/DeepSeekHarness`，重装/升级不清空 AI 的运行时改动
 - 🐋 鲸鱼品牌图标，横竖屏自由旋转
@@ -123,9 +124,12 @@
 
 下载 [Releases](https://github.com/woaiys3/deepseek-harness-android-app/releases) 里的 APK 安装即可：
 
-- **`DeepSeekHarness-official-v1.14.0.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
-- **`DeepSeekHarness-Lite-v1.14.0.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
-- **`DeepSeekHarness-compat-v1.14.0.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
+- **`DeepSeekHarness-official-v1.15.2.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
+- **`DeepSeekHarness-lite-v1.15.2.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
+- **`DeepSeekHarness-compat-v1.15.2.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
+
+> ⚠️ **从 v1.15.0 或更早版本升级，请直接装 v1.15.2**：v1.15.0 有一处 P0（所有 agent preset 会话都建不起来），v1.15.1 已修；v1.15.2 又修掉三个只在真机上发作的问题。完整变更见 [CHANGES.md](CHANGES.md)。
+> 覆盖安装**不会丢配置**（模型/供应商、API Key、会话都保留）；同签名可直接覆盖，无需卸载。
 
 要求：
 - Android 7.0（API 24）及以上
