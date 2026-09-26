@@ -14,6 +14,11 @@
    - ⚠️ **但「名字存在」≠「可以随便改」**：`_item_` / `_label_` / `_separator_` /
      `_itemLabel_` 这四个名字在 0.1.7 命中的是【菜单/下拉菜单】组件，
      不是当年那个侧栏图标行 → 详见下方「v1.15.1 修正」。
+   - ⚠️ **同一坑第二次复发（v1.15.3）**：`_markdown_` 还撞上了上游 primitives 的
+     `FileTypeIcon` —— 它给 SVG 的类名就是 `_markdown_<hash>_<行>`（见 FileTypeIcon.module.css
+     的 .markdown）。`width: 100%` 会把 16px 图标撑成整行宽（真机实测 324px），
+     同行文件名（`.k-1LKG_name`，min-width:0;overflow:hidden）被挤成 **0 宽**
+     → 现象：「文件行只有图标、没有名字」。已在竖屏块里加 SVG 例外规则（见该处注释）。
    ------------------------------------------------------------
    v0.2 重写说明（历史）：
    - 旧版 mobile.css 使用的类名（gdEzaW_/hHd-Xa_/pbvGtq_/qSYn7G_ 等）
@@ -140,6 +145,25 @@ input[type="search"] {
   [class*="_markdown_"] {
     width: 100%;
     max-width: 100% !important;
+  }
+
+  /* ⚠ v1.15.3 修正：上面的宽度规则会误伤【文件类型图标】。
+     上游 `dsh-client-ui-primitives` 的 FileTypeIcon 把 `_markdown_<hash>_<行>` 这个类名
+     用在了 SVG 上（FileTypeIcon.module.css 的 .markdown），于是 [class*="_markdown_"]
+     把本来 16px 的图标 SVG 撑成整行宽，同行文件名被挤成 0 宽
+     → 真机现象「文件行只有图标、没有名字」。
+     这里把尺寸还给 SVG 自身的 width/height 属性（auto = 采用属性值）：
+     · 只命中 svg 元素本身，普通容器与聊天正文完全不受影响；
+     · 特异性 (0,1,1) 高于出问题规则的 (0,1,0)，不依赖书写顺序；
+     · 不写死 16px，任何 size 的图标都按自身属性渲染。 */
+  svg[class*="_answer_"],
+  svg[class*="_markdown_"],
+  svg[class*="_content_"],
+  svg[class*="_block_"],
+  svg[class*="_output_"],
+  svg[class*="_command_"] {
+    width: auto !important;
+    height: auto !important;
   }
 
   /* 工具卡片、代码块：竖屏不横向溢出 */
