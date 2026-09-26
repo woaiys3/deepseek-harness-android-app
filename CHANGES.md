@@ -1,3 +1,159 @@
+## v1.16.1（正式版 + Lite 共存版 + 兼容版 · 2026-09-26）
+
+> 修 v1.16.0 上线后真机实测暴露的三个问题：**pip 不可用、npm 装出的 CLI 无法执行、npm 全局前缀不可写**。
+> versionCode **48**，内核仍 **DSH 0.1.7-rc.1**。
+
+### 🐛 pip 完全不可用（`No module named pip`）
+- **现象**：`python3 -m pip --version` → `No module named pip`；
+  `python3 -m ensurepip --upgrade` → `FileNotFoundError: .../ensurepip/_bundled/pip-26.1.2-py3-none-any.whl`；
+  `python3 -m venv` 跟着失败（venv 内部也是靠 ensurepip 装 pip）。
+- **根因**：Termux 把 pip 拆成独立包，`python` 这个包自带的 `ensurepip` **没有 `_bundled/` 目录**
+  （只有 `__init__.py` / `__main__.py` / `_uninstall.py`）。`ensurepip --version` 仍会打印
+  `pip 26.1.2`（那只是读硬编码版本号），极易误判。
+- **修法**：① 补 `ensurepip/_bundled/pip-26.1.2-py3-none-any.whl`（让 ensurepip / venv 可用）；
+  ② 把**同一版本** pip 预装进 `site-packages`（让 `python3 -m pip` 开箱可用）。两处同版本，不会冲突。
+- **验证**：真机 `pip --version` → `26.1.2`；`pip install requests` → 装上并 `import` 成功；
+  `python3 -m venv v` → 建成功且 venv 内 pip 可用。
+
+### 🐛 npm 装出来的 CLI 直接执行报 ENOENT
+- **现象**：`npx cowsay@1.6.0 hi` → `sh: .../.bin/cowsay: No such file or directory`；
+  `node .../cowsay/cli.js hi` 却正常。
+- **根因**：`.bin/*` 首行是 `#!/usr/bin/env node`，而 **Android 没有 `/usr/bin/env`**（只有 `/system/bin/env`），
+  内核按**绝对路径**找解释器 → 直接 exec 必 ENOENT。与包本身、与安装过程**都无关**。
+  npm 官方的 `bin-links/fix-bin.js` 在 Unix 上**只 chmod、不重写 shebang**（只处理 Windows CRLF）
+  → 配置解决不了，必须改代码。
+- **修法**：给内置 npm 的 `fix-bin.js` 打 **Android shebang 适配**：安装时自动把
+  `#!/usr/bin/env` 改写为 `#!/system/bin/env`（node 由 PATH 解析，引擎已把 payload 目录放进 PATH）。
+- **验证**：真机 `npm install cowsay` 后，`cowsay/cli.js` 首行变为 `#!/system/bin/env node`；
+  `./node_modules/.bin/cowsay hi` 与经 PATH 调用**都正常输出**；`npx` 同样通过。
+
+### 🐛 npm 默认全局前缀不可写
+- **现象**：`npm install -g xxx` 失败（`npm config get prefix` = `<payload>/runtime`，不可写）。
+- **根因**：npm 按 `dirname(dirname(process.execPath))` 推导前缀，而 execPath 在 payload 内；
+  即使可写也不该放那里 —— **payload 会被升级覆盖**。
+- **修法**：内置 npm 的 wrapper 把 `NPM_CONFIG_PREFIX` 指到 **`$HOME/.npm-global`**
+  （App 私有目录，可写且跨版本升级保留）；同时把 `<HOME>/.npm-global/bin` 加进引擎 `PATH`，
+  全局装的命令可直接调用。
+- **验证**：真机 `npm config get prefix` → `/data/user/0/.../files/.npm-global`；
+  `npm i -g cowsay` 后直接 `cowsay` 可执行。
+
+## v1.16.0（正式版 + Lite 共存版 + 兼容版 · 2026-09-26）
+
+> **payload 现在自带 Python 与 npm** —— 以前 AI 在手机上既没有 Python、也装不了 npm 包。
+> versionCode **47**，内核仍 **DSH 0.1.7-rc.1**。
+
+### ✨ 内置 Python 3.14.6
+- **为何要做**：AI 经常需要跑脚本做数据处理、解析、统计，此前完全没有 python（只有 bash + node）。
+- **做法**：沿用项目既有老路（rg / curl / git / pnpm 都这么来的）——
+  从 Termux 仓库取 aarch64 deb 解包；依赖闭包 17 个包，其中 4 个（openssl / zlib / libffi /
+  libsqlite3 等）我们**已有**，只新增 13 个 `.so` 及其 soname 实体名。
+- **产出**：`bin/python3` + `bin/python`（wrapper）→ `payload/python/`（本体 + 标准库 + lib-dynload）。
+  `bin/` 在引擎 PATH 上，AI 直接 `python3 xxx.py` 即可。
+- **取舍**：不带 `include/` 与 `pkgconfig`（只有现场编译 C 扩展才需要）；
+  **PYTHONHOME 不用设** —— python 按 argv0 自推 prefix（真机实测）。
+
+### ✨ 内置 npm 11.20.0 / npx
+- **为何要做**：payload **本来就有 node v26.4.0**（引擎就跑在它上面，`runtime/bin` 在 PATH 上，
+  AI 本就能 `node xxx.js`），但 Termux 的 nodejs 包**不含 npm**（npm 是单列的另一个 deb），
+  所以「装 node 包」这条链是断的。
+- **产出**：`bin/npm` + `bin/npx`（wrapper）→ `payload/npm/`（npm 本体）。
+- **取舍**：裁掉 `docs/`（2.4M）与 `man/`（466K）—— 纯文档，运行时用不到，16M → 13M。
+
+### 📦 体积
+APK **135.6MB → 151.1MB**（+15.5MB；Python 26M + npm 13M，APK 内为压缩存储）。
+
+## v1.15.9（正式版 + Lite 共存版 + 兼容版 · 2026-09-26）
+
+> 两件事：**插件挂载失败终于看得见** + **修 issue #33（每次开机配置被重置）**。
+> versionCode **46**，内核仍 **DSH 0.1.7-rc.1**。
+
+### 🐛 issue #33：每次开机配置被重置（报告人 @C4RP3N0CT3M）
+- **现象**：引擎启动时改写配置，用户在 `dshhome/cordis.patch.yml` 上的改动**每次开机被擦掉**。
+- **根因**：**App 期望的标记与配置文件里的标记不一致**：
+  代码里是 `dsh-android-patch: v2`，而 `config/cordis.patch.yml` 首行是 `v3`。
+  判定用 `content.contains("…: v2")` → **恒为 false** → 每次启动都判「配置不完整」→ 从 payload 重刷官方配置。
+  成因：v1.15.1 为强制升级用户迁移（修 sandbox P0）把 yml 标记提到 `v3`，
+  **但 App 侧那个常量没跟着改**，把「一次性迁移」变成了**永久循环**。
+- **修法**：常量跟到 `v3`（四份源码同步），并在注释写明「今后改 yml 标记必须同步改这里」。
+- **核验**：装机后每次启动都**不再**出现 `cordis.patch.yml missing or incomplete, restoring from payload.zip`。
+
+### ✨ 插件挂载失败可见：`$DSH_HOME/logs/plugins.log`
+- **问题**：插件装上了、引擎启动「零警告」，但插件功能就是不出现，日志一片干净。
+- **根因**：cordis 的 logger 默认只 push 进**内存 buffer**（上限 1000 条），
+  而 `dsh-app-boot` 注册的 exporter 把 warn/error 收进**局部变量**，**只在启动失败时**才随错误抛出 ——
+  启动成功就直接丢弃。
+- **修法**：在该 exporter 内顺手把 warn/error 追加写入 `$DSH_HOME/logs/plugins.log`
+  （1MB 自动重开；写盘失败全部 try/catch，**诊断功能不得拖垮启动**；不新增任何依赖）。
+- **收益**：插件缺依赖 / 挂载方式不对 / 插件间接口不兼容，从「隐形」变成「一眼可见」。
+
+## v1.15.8（· 2026-09-26）
+
+> 修两个「做好了却被上游机制吃掉」的问题。versionCode **45**。
+
+### 🐛 `git: 'remote-https' is not a git command`
+- **根因**：git 的远程助手**缺执行位**。payload.zip 里两类条目属性不同
+  （`bin/pnpm` 带 Unix 属性位，而 `git/libexec/...` 是 MS-DOS 属性），
+  解压后**权位完全由 App 的 `setExecutables()` 决定**，而清单里只列了 `bin/git`。
+- **修法**：`setExecutables()` 补上 `git-remote-{https,http}`。
+- **真机 A/B**：去掉执行位 → 逐字复现报错；`chmod +x` 后 → `git ls-remote` 返回 HEAD 哈希。
+
+### 🐛 装完插件 → 重启引擎 → 插件消失
+- **根因**：`dsh-plugin-manager` 把已装插件写进 profile 的 `package.json`
+  （`dependencies` + `dsh.profile.bundles` 就是**插件注册表**），
+  而该文件在 `DSHHOME_CONFIG_PATHS`（**整文件覆盖**）清单里 → 每次解压/刷新被打回 payload 模板。
+- **修法**：两处覆盖路径（`extractPayload` / `refreshInternalConfig`）改成**合并** ——
+  内置 bundle 跟着 APK 走，用户装的插件保留。
+
+## v1.15.7 / v1.15.6（· 2026-09-25/26）
+
+> 让 **ssh 形式的 git URL 自动改写成 https**（payload 没有 ssh 客户端，用户填
+> `git+ssh://git@github.com/...` 必报 `cannot run ssh`）。
+> v1.15.6 用「环境变量传 git 配置」的方案，**被内核的安全清洗干掉**：
+> 变量名 `GIT_CONFIG_KEY_<n>` 含 `KEY` → 命中 `SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i`
+> → 被当凭据洗掉，报 `missing config key GIT_CONFIG_KEY_0`。
+> v1.15.7 换成**写配置文件 + `GIT_CONFIG_GLOBAL`**（名字不含敏感词，能活过清洗），
+> 并把用户自己的 `~/.gitconfig` include 进来。同时保留 `GIT_TERMINAL_PROMPT=0`（需要凭据时立即失败，不挂住等 tty）。
+
+## v1.15.5（· 2026-09-25）
+
+> 内置 **git 2.55.0**（约 3.9MB）+ **修证书坑**。versionCode **42**。
+
+### ✨ 内置 git
+- 从 Termux aarch64 deb 取；只带主程序 + 两个远程助手 + templates，
+  **不带** `libexec/git-core/` 里那 146 个与主程序同尺寸的硬链接副本（照搬会撑到 536MB）。
+  依赖只新增 `libiconv.so` + `libcharset.so`（其余 libcurl/openssl/pcre2/zlib 早已随 curl 带入）。
+
+### 🐛 curl / git 全线证书报错
+- **根因**：内置 `libcrypto` 的 `OPENSSLDIR` 编译时**写死指向 Termux**
+  （`/data/data/com.termux/files/usr/etc/tls/cert.pem`），本机没装 Termux → OpenSSL 打不开
+  **直接报错、不回退**（`curl: (77) error adding trust anchors from file`）。
+- **修法**：启动时把系统 CA（`/system/etc/security/cacerts`，145 张）合成为 bundle，
+  并设置 `SSL_CERT_FILE` / `CURL_CA_BUNDLE` / `GIT_SSL_CAINFO`
+  —— **三个都要设**（实测只设 `SSL_CERT_FILE` 对 git 无效）。
+- **附带**：支持用户自己装的证书（每次启动重拼 bundle）。
+
+## v1.15.4（· 2026-09-25）
+
+> 修「工作区里 .md 文件只有图标没有名字」。versionCode **41**。
+
+- **现象**：文件列表里 `.md` 行只显示类型徽标，文件名不见（其它扩展名正常）。
+- **根因**：**我们自己的 CSS bug**。`mobile.css` 一条竖屏规则用 `[class*="_markdown_"]`
+  想管正文宽度，却**误命中文件类型图标的 SVG**（类名恰好是 `_markdown_1wejo_28`），
+  把 16px 图标撑成整行宽（实测 324px），同行文件名被挤成 **0 宽**。
+  （文件名本身完好，磁盘上是正常中文 —— 不是编码问题。）
+- **修法**：加一条**只命中 `svg` 本身**的还原规则（把尺寸还给 SVG 自身的 width/height 属性）。
+
+## v1.15.3（· 2026-09-25）
+
+> 修「添加插件」装不了任何插件。versionCode **40**。
+
+- **现象**：三种输入（本地目录 / 包名 / GitHub 地址）**全部**失败，只有一行 `退出码 127 / 无输出`。
+- **根因**：payload 里**从来没有 pnpm**（`bin/` 只有 bash，`runtime/bin/` 只有 node/rg/curl），
+  而 `dsh-plugin-manager` 全程 `pnpm add` → 127。
+- **修法**：内置 pnpm 10.18.3 的纯 JS bundle（**7.8MB / 5 文件**；砍掉 `dist/node_modules` 9.2MB、
+  win 的 `fastlist.exe`、darwin/win32 的 `reflink.*.node`）+ `bin/pnpm` wrapper +
+  加进 `setExecutables`（解压不保留执行位，不加就 127）。
+
 ## v1.15.2（正式版 + Lite 共存版 + 兼容版 · 2026-09-24）
 
 > 修三处**只在真机上发作**的缺陷（PC / 静态验证都看不出来），来源是一份外部 AI 的
