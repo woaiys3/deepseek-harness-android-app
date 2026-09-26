@@ -2,8 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools"
     package="com.deepseek.harness"
-    android:versionCode="39"
-    android:versionName="1.15.2">
+    android:versionCode="48"
+    android:versionName="1.16.1">
 
     <uses-sdk android:minSdkVersion="24" android:targetSdkVersion="28" />
 
