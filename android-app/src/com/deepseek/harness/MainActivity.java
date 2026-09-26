@@ -122,6 +122,9 @@ public class MainActivity extends Activity {
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist/mobile.css",
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist/mobile.js",
         "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-web-frontend/dist/index.html",
+        // v1.15.9：dsh-app-boot 打了「插件 warn 落盘」补丁（$DSH_HOME/logs/plugins.log）。
+        // 必须加白名单，否则同内核版本下 fast 同步不会覆盖它，补丁形同没打。
+        "dshroot/lib/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-app-boot/lib/index.js",
         "dshroot/lib/node_modules/@deepseek-ai/dsh/package.json"
     };
     // 外部 dshroot 解压完成标记（App 在 dshroot 补齐后写入；清空/重置时随目录删除）。
@@ -2152,8 +2155,14 @@ public class MainActivity extends Activity {
      *  背景：补丁配置被改/删会导致 sandbox/bash-sandbox 启用失败 → 启动崩溃。
      *  v1.12：改用顶部 marker 判定版本。旧实现靠“内容里必须有 llm-pi-ai”判定，
      *        而 v1.12 起 llm-pi-ai 已取消禁用 → 升级用户会被判为“不完整”并自动落地新配置
-     *        （正是我们想要的迁移效果）。 */
-    private static final String PATCH_CONFIG_MARKER = "dsh-android-patch: v2";
+     *        （正是我们想要的迁移效果）。
+     *  ⚠ v1.15.9：本常量必须与 config/cordis.patch.yml 首行的 marker **逐字相等**。
+     *        v1.15.1 把那个文件的 marker 提到 v3（强制迁移 sandbox 修复），而这里的
+     *        常量留在 v2 → 上面那句 contains() 恒为 false → 每次启动都判「配置不完整」
+     *        并从 payload 刷新官方配置，用户在 dshhome/cordis.patch.yml 上的改动被反复擦掉
+     *        （issue #33「引擎 boot 时重写全部配置」）。
+     *        今后改 yml 的 marker，必须同步改这一处（共四份源码）。 */
+    private static final String PATCH_CONFIG_MARKER = "dsh-android-patch: v3";
 
     private void ensurePatchConfig(File payload) {
         try {
@@ -3252,6 +3261,15 @@ public class MainActivity extends Activity {
                 continue;
             }
 
+            // v1.15.8：profile 清单是插件注册表，覆盖会抹掉已装插件（见 writeMergedProfileManifest）
+            if (PROFILE_MANIFEST_PATH.equals(name)) {
+                prepareTarget(target);
+                writeMergedProfileManifest(target, new String(readZipEntry(zis), "UTF-8"));
+                zis.closeEntry();
+                written++;
+                updateProgress(processed, total, written);
+                continue;
+            }
             File parent = target.getParentFile();
             if (parent != null && !parent.exists() && !parent.mkdirs()) throw new IOException("mkdir failed: " + parent);
             prepareTarget(target);
@@ -3395,6 +3413,13 @@ public class MainActivity extends Activity {
             File target = new File(payload, name);
             File parent = target.getParentFile();
             if (parent != null && !parent.exists() && !parent.mkdirs()) throw new IOException("mkdir failed: " + parent);
+            // v1.15.8：同上——这里是第二条覆盖路径（内核 revision 变化 / 补丁自检失败时触发）
+            if (PROFILE_MANIFEST_PATH.equals(name)) {
+                writeMergedProfileManifest(target, new String(readZipEntry(zis), "UTF-8"));
+                zis.closeEntry();
+                updated++;
+                continue;
+            }
             FileOutputStream fos = new FileOutputStream(target);
             int n;
             while ((n = zis.read(buf)) > 0) fos.write(buf, 0, n);
@@ -3489,7 +3514,31 @@ public class MainActivity extends Activity {
     }
 
     private void setExecutables(File payload) {
-        String[] execs = {"runtime/bin/node", "bin/bash", "runtime/bin/rg", "runtime/bin/curl"};
+        String[] execs = {"runtime/bin/node", "bin/bash", "runtime/bin/rg", "runtime/bin/curl",
+                // v1.15.3 内置 pnpm 的 wrapper：插件管理「添加插件」靠它解析 pnpm；
+                // 解压不保留执行位，必须每次启动 chmod，否则子进程报「找不到命令」(127)
+                "bin/pnpm",
+                // v1.15.5 内置 git：插件管理「添加 GitHub 地址」要先 git ls-remote 探活；
+                // 解压同样不保留执行位，不加就没有 x 位 → 子进程报「找不到命令」
+                "bin/git",
+                // v1.15.8 内置 git 的远程助手：与 bin/git 同因（zip 不保留执行位）。
+                // 缺了它 → git 能找到 exec-path 却执行不了助手，报
+                // "git: 'remote-https' is not a git command"（真机 A/B 实测复现）。
+                "git/libexec/git-core/git-remote-https",
+                "git/libexec/git-core/git-remote-http",
+                // v1.16.0 内置 python / npm：与 pnpm、git 同因（解压不保留执行位，不加就 127）。
+                // python 的两个 wrapper 是 sh 脚本，真正要可执行的是 python/bin/python3.14（ELF）。
+                "bin/python3",
+                "bin/python",
+                "python/bin/python3.14",
+                // v1.16.0 内置 npm / npx：node 本体早在 payload 里（引擎就跑在它上面），
+                // 缺的只是这两个 JS 入口 —— 不加 x 位则 AI 的 `npm install` 报 127。
+                "bin/npm",
+                "bin/npx",
+                // v1.16.1 内置 pip：python 自带的 ensurepip 在 Termux deb 里没带 wheel，
+                // 所以 pip 是**直接解进 site-packages** 的（同因：解压不保留执行位）。
+                "bin/pip",
+                "bin/pip3"};
         for (String p : execs) {
             File f = new File(payload, p);
             if (f.exists()) f.setExecutable(true, false);
@@ -3523,6 +3572,207 @@ public class MainActivity extends Activity {
         try { f.setWritable(false, false); } catch (Throwable ignored) {}   // chmod 失败（如 FUSE）时的兜底
     }
 
+    /**
+     * v1.15.5：把 Android 系统 CA（/system/etc/security/cacerts/*.0，PEM）拼成一个 bundle 文件。
+     *
+     * 为什么必须自己做：内置 curl/git 依赖的 libcrypto 把 OPENSSLDIR 编译死指向 Termux 的
+     * /data/data/com.termux/files/usr/etc/tls/cert.pem，而本机通常没装 Termux → 一个 CA 都拿不到，
+     * 所有 HTTPS 请求失败（实测 curl 报 (77) error adding trust anchors from file，git 报同一句）。
+     *
+     * 为什么不直接指向系统目录：该目录本身是 c_rehash 哈希目录（OpenSSL 认这种格式），但对 CAfile
+     * OpenSSL 是「文件不存在即硬报错」，不会回退到目录 —— 实测只设 SSL_CERT_DIR 仍然失败。合成为一个
+     * 真实存在的文件最稳，顺带把用户自己装的证书也带上。
+     *
+     * 缓存：证书数 + 最新 mtime 未变时复用，避免每次启动重写 ~750KB。
+     */
+    /**
+     * v1.15.7：生成 git 的配置文件（ssh→https 改写 + git 用的 CA + 沿用用户自己的全局配置）。
+     *
+     * 为什么用文件而不是环境变量：内核给子进程的是「洗过的」父环境
+     * （dsh-subprocess 的 scrubbedParentEnv，SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i），
+     * 而 git 用环境变量传配置的键名是 GIT_CONFIG_KEY_<n> —— 含 "KEY"，会被洗掉，
+     * 于是 GIT_CONFIG_COUNT 还在、KEY 没了 → "error: missing config key GIT_CONFIG_KEY_0"。
+     * 配置文件完全不受这套清洗影响。
+     *
+     * GIT_CONFIG_GLOBAL 指向本文件（它会替换默认的 ~/.gitconfig，所以把用户那份 include 进来）。
+     */
+    private File ensureGitConfig(File payload, File caBundle) {
+        File out = new File(new File(payload, "runtime/etc"), "gitconfig");
+        try {
+            File parent = out.getParentFile();
+            if (parent != null) parent.mkdirs();
+            StringBuilder sb = new StringBuilder();
+            sb.append("# DSH 手机版自动生成。每次启动引擎都会重写，改这里会被覆盖。\n");
+            File userCfg = new File(getFilesDir(), ".gitconfig");
+            if (userCfg.isFile() && !userCfg.getAbsolutePath().equals(out.getAbsolutePath())) {
+                sb.append("[include]\n\tpath = ").append(userCfg.getAbsolutePath()).append("\n");
+            }
+            sb.append("[url \"https://github.com/\"]\n");
+            sb.append("\tinsteadOf = git+ssh://git@github.com/\n");
+            sb.append("\tinsteadOf = ssh://git@github.com/\n");
+            sb.append("\tinsteadOf = git@github.com:\n");
+            sb.append("[url \"https://gitee.com/\"]\n");
+            sb.append("\tinsteadOf = git+ssh://git@gitee.com/\n");
+            sb.append("\tinsteadOf = ssh://git@gitee.com/\n");
+            sb.append("\tinsteadOf = git@gitee.com:\n");
+            if (caBundle != null) {
+                sb.append("[http]\n\tsslCAInfo = ").append(caBundle.getAbsolutePath()).append("\n");
+            }
+            java.io.FileOutputStream os = new java.io.FileOutputStream(out);
+            try {
+                os.write(sb.toString().getBytes("UTF-8"));
+            } finally {
+                os.close();
+            }
+            Log.i(TAG, "git config -> " + out.getAbsolutePath());
+            return out;
+        } catch (Throwable t) {
+            Log.w(TAG, "git config generation failed: " + t);
+            return null;
+        }
+    }
+
+    // v1.15.8：profile 的插件注册表。dsh-plugin-manager 装插件时把依赖与 bundle 名写在这里
+    // （saveManifest → <profile>/package.json 的 dependencies + dsh.profile.bundles），
+    // 所以它**不是**可以整文件覆盖的官方配置，必须合并（见 writeMergedProfileManifest）。
+    private static final String PROFILE_MANIFEST_PATH = "dshhome/profiles/web/package.json";
+
+    /** 把一个 zip 条目整个读出来（用于需要「先读后合并」的条目）。 */
+    private static byte[] readZipEntry(java.util.zip.ZipInputStream zis) throws IOException {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        byte[] b = new byte[8192];
+        int n;
+        while ((n = zis.read(b)) > 0) bos.write(b, 0, n);
+        return bos.toByteArray();
+    }
+
+    /**
+     * 写 profile 清单：以 payload 那份为基准，**合并**已有文件里的用户/插件内容。
+     *
+     * 为什么不能直接覆盖：这个文件是插件注册表 —— dsh-plugin-manager 把已装插件写进它的
+     * dependencies 与 dsh.profile.bundles。整文件覆盖会让「装完插件→重启引擎→插件消失」
+     * （真机实测报障）。合并后：内置 bundle 仍随 APK 更新，用户装的插件保留。
+     * 解析失败时退回「直接写 payload 默认值」，不因为一个坏文件卡住整轮解压。
+     */
+    private void writeMergedProfileManifest(File target, String shipJson) throws IOException {
+        String out = shipJson;
+        try {
+            if (target.isFile()) {
+                String mineJson = readFileText(target);
+                if (mineJson != null && mineJson.trim().length() > 0) {
+                    org.json.JSONObject ship = new org.json.JSONObject(shipJson);
+                    org.json.JSONObject mine = new org.json.JSONObject(mineJson);
+
+                    // dependencies：ship 同名优先，用户的额外项保留
+                    org.json.JSONObject shipDeps = ship.optJSONObject("dependencies");
+                    org.json.JSONObject mineDeps = mine.optJSONObject("dependencies");
+                    if (mineDeps != null) {
+                        if (shipDeps == null) {
+                            shipDeps = new org.json.JSONObject();
+                            ship.put("dependencies", shipDeps);
+                        }
+                        java.util.Iterator<String> it = mineDeps.keys();
+                        while (it.hasNext()) {
+                            String k = it.next();
+                            if (!shipDeps.has(k)) shipDeps.put(k, mineDeps.get(k));
+                        }
+                    }
+
+                    // dsh.profile.bundles：并集（ship 的在前，顺序稳定）
+                    org.json.JSONObject shipDsh = ship.optJSONObject("dsh");
+                    org.json.JSONObject mineDsh = mine.optJSONObject("dsh");
+                    org.json.JSONObject shipProf = shipDsh == null ? null : shipDsh.optJSONObject("profile");
+                    org.json.JSONObject mineProf = mineDsh == null ? null : mineDsh.optJSONObject("profile");
+                    org.json.JSONArray shipB = shipProf == null ? null : shipProf.optJSONArray("bundles");
+                    org.json.JSONArray mineB = mineProf == null ? null : mineProf.optJSONArray("bundles");
+                    java.util.List<String> names = new java.util.ArrayList<>();
+                    if (shipB != null) for (int i = 0; i < shipB.length(); i++) {
+                        String v = shipB.optString(i, "");
+                        if (v.length() > 0) names.add(v);
+                    }
+                    if (mineB != null) for (int i = 0; i < mineB.length(); i++) {
+                        String v = mineB.optString(i, "");
+                        if (v.length() > 0 && !names.contains(v)) names.add(v);
+                    }
+                    if (!names.isEmpty()) {
+                        if (shipDsh == null) {
+                            shipDsh = new org.json.JSONObject();
+                            ship.put("dsh", shipDsh);
+                        }
+                        if (shipProf == null) {
+                            shipProf = new org.json.JSONObject();
+                            shipDsh.put("profile", shipProf);
+                        }
+                        org.json.JSONArray arr = new org.json.JSONArray();
+                        for (String v : names) arr.put(v);
+                        shipProf.put("bundles", arr);
+                    }
+                    out = ship.toString(2) + "\n";
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "profile manifest merge failed, writing payload default", t);
+            out = shipJson;
+        }
+        File parent = target.getParentFile();
+        if (parent != null && !parent.exists() && !parent.mkdirs()) throw new IOException("mkdir failed: " + parent);
+        FileOutputStream fos = new FileOutputStream(target);
+        try {
+            fos.write(out.getBytes("UTF-8"));
+        } finally {
+            fos.close();
+        }
+    }
+
+    private File ensureSystemCaBundle(File payload) {
+        File out = new File(new File(payload, "runtime/etc"), "cacert.pem");
+        try {
+            File dir = new File("/system/etc/security/cacerts");
+            File[] certs = dir.listFiles();
+            if (certs == null || certs.length == 0) return out.isFile() ? out : null;
+            int count = 0;
+            long newest = 0L;
+            for (File c : certs) {
+                if (c.isFile() && c.length() > 0) {
+                    count++;
+                    if (c.lastModified() > newest) newest = c.lastModified();
+                }
+            }
+            if (count == 0) return out.isFile() ? out : null;
+            String stamp = count + ":" + newest;
+            android.content.SharedPreferences sp = getSharedPreferences("dsh_prefs", MODE_PRIVATE);
+            if (out.isFile() && out.length() > 1024L && stamp.equals(sp.getString("ca_bundle_stamp", ""))) {
+                return out;
+            }
+            File parent = out.getParentFile();
+            if (parent != null) parent.mkdirs();
+            java.io.FileOutputStream os = new java.io.FileOutputStream(out);
+            try {
+                byte[] buf = new byte[8192];
+                for (File c : certs) {
+                    if (!c.isFile()) continue;
+                    java.io.FileInputStream in = new java.io.FileInputStream(c);
+                    try {
+                        int n;
+                        while ((n = in.read(buf)) > 0) os.write(buf, 0, n);
+                    } finally {
+                        in.close();
+                    }
+                    os.write('\n');
+                }
+            } finally {
+                os.close();
+            }
+            out.setReadable(true, false);
+            sp.edit().putString("ca_bundle_stamp", stamp).apply();
+            Log.i(TAG, "system CA bundle -> " + out.getName() + " (" + out.length() + " bytes, " + count + " certs)");
+            return out;
+        } catch (Throwable t) {
+            Log.w(TAG, "system CA bundle failed: " + t);
+            return out.isFile() ? out : null;
+        }
+    }
+
     private void spawnNode(File payload) throws IOException {
         File node = new File(payload, "runtime/bin/node");
         File binjs = new File(dshrootDir, REL_BINJS);
@@ -3554,8 +3804,47 @@ public class MainActivity extends Activity {
         // payload 自带的可读 openssl.cnf（build.sh 生成），有无 Termux 都稳定。
         File osslConf = new File(payload, "runtime/etc/openssl.cnf");
         if (osslConf.exists()) env.put("OPENSSL_CONF", osslConf.getAbsolutePath());
+        // v1.15.5：内置 git 的 Android 适配（与 pnpm 同批；插件管理「GitHub 地址」输入要靠它）。
+        //  · GIT_EXEC_PATH / GIT_TEMPLATE_DIR：Termux 构建把这些路径写死为 /data/data/com.termux/files/usr，
+        //    必须改指 payload 内 —— 否则 git 找不到远程助手（实测报 "unable to find remote helper for 'https'"）。
+        //    注意 git 还要靠 PATH 里的 `git` 去拉起该助手，而 payload/bin 本来就在 PATH 上。
+        //  · GIT_PAGER=cat：payload 没带 less，避免 git 去拉分页器。
+        //  · 证书：内置 curl/git 依赖的 libcrypto 把 OPENSSLDIR 编译死指向 Termux 的
+        //    /data/data/com.termux/files/usr/etc/tls/cert.pem；本机没装 Termux → 一个 CA 都拿不到，
+        //    HTTPS 一律失败（实测 curl 报 (77) error adding trust anchors，git 报同一句）。
+        //    把系统 CA 合成一个 bundle，再用各自认的变量指过去：curl 认 SSL_CERT_FILE / CURL_CA_BUNDLE，
+        //    git 认 GIT_SSL_CAINFO（实测三者在真机上都生效）。
+        File gitDir = new File(payload, "git");
+        env.put("GIT_EXEC_PATH", new File(gitDir, "libexec/git-core").getAbsolutePath());
+        env.put("GIT_TEMPLATE_DIR", new File(gitDir, "templates").getAbsolutePath());
+        env.put("GIT_PAGER", "cat");
+        // v1.15.7：ssh 形式的 git URL 在 Android 上永远不可用 —— payload 没带 ssh 客户端、也没有密钥，
+        // 用户填 git@github.com:user/repo.git / git+ssh://… / ssh://… 时报
+        // "error: cannot run ssh: No such file or directory"（真机实测）。
+        //
+        // 做法：把 ssh 形式用 git 的 url.<base>.insteadOf 改写成 https —— 但**不能靠环境变量传**
+        // （v1.15.6 的错误做法）：内核给 pnpm 的是「洗过的父环境」（dsh-subprocess 的
+        // scrubbedParentEnv：SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i），而 git 用环境变量
+        // 传配置的键名恰好叫 **GIT_CONFIG_KEY_<n>** —— 含 "KEY" 被当凭据洗掉，GIT_CONFIG_COUNT 却活下来
+        // → 真机报 "error: missing config key GIT_CONFIG_KEY_0"。
+        // 改成写配置文件（见 ensureGitConfig），用 GIT_CONFIG_GLOBAL 指过去：该名字不含
+        // KEY/PASSWORD/SECRET/TOKEN，能活过清洗（已按该正则逐项自查）。
+        env.put("GIT_TERMINAL_PROMPT", "0");   // 需要凭据时立刻失败，别挂住等 tty 输入（AI 的 bash 没有 tty）
+        File caBundle = ensureSystemCaBundle(payload);
+        if (caBundle != null) {
+            env.put("SSL_CERT_FILE", caBundle.getAbsolutePath());
+            env.put("CURL_CA_BUNDLE", caBundle.getAbsolutePath());
+            env.put("GIT_SSL_CAINFO", caBundle.getAbsolutePath());
+        }
+        File gitCfg = ensureGitConfig(payload, caBundle);
+        if (gitCfg != null) env.put("GIT_CONFIG_GLOBAL", gitCfg.getAbsolutePath());
+        // v1.16.1：npm 全局安装落点（$HOME/.npm-global/bin）也要在 PATH 上。
+        // npm 的默认前缀是 <payload>/runtime（payload 内，升级会被覆盖），所以内置 npm 的 wrapper
+        // 把它改到 $HOME/.npm-global（HOME = filesDir，可写且跨版本升级保留，见下一行）；
+        // 但装出来的命令落在 <HOME>/.npm-global/bin，不显式加进 PATH 则 AI 找不到。
         env.put("PATH", bin.getAbsolutePath() + ":" +
-                new File(payload, "runtime/bin").getAbsolutePath() + ":/system/bin:/system/xbin");
+                new File(payload, "runtime/bin").getAbsolutePath() + ":" +
+                new File(getFilesDir(), ".npm-global/bin").getAbsolutePath() + ":/system/bin:/system/xbin");
         env.put("HOME", getFilesDir().getAbsolutePath());
         env.put("DSH_HOME", home.getAbsolutePath());
         env.put("TMPDIR", tmp.getAbsolutePath());
