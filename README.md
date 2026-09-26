@@ -20,6 +20,9 @@
 - ⏰ **前台保活**（v1.4.0）：AI 干活时挂后台/锁屏不被杀，任务完成推送通知
 - 🔔 **AI 发通知**（v1.4.0）：只需通知权限，任务完成/需要关注时推送到通知栏
 - 🧠 **完整 DSH 内核**：`@deepseek-ai/dsh` **0.1.7-rc.1**（v1.15.0 升级），保留插件生态 + RPC API，前端用 DSH 原生界面
+- 🐍 **内置 Python 3.14.6 + pip**（v1.16.0/1.16.1）：AI 可直接写脚本做数据处理、解析、统计；`pip install` 可用、`venv` 可用，**免安装免配置**
+- 📦 **内置 npm / npx 11.20.0**（v1.16.0/1.16.1）：AI 可自己装 node 包，装出来的 CLI **可直接执行**（已适配 Android 没有 `/usr/bin/env` 这件事）
+- 🔌 **插件三条输入全通**（v1.15.3→v1.15.8）：本地目录 / 包名 / **GitHub 地址** —— 内置 pnpm 与 git 2.55.0，并把 curl / git 的证书链修好（启动时用系统 CA 合成 bundle）
 - 📱 **移动端适配**：触摸优化 + 软键盘适配 + 首次启动权限引导页（9 项权限一站式配置）
 - 💾 **卸载不丢数据**：dshroot 外置到 `/sdcard/DeepSeekHarness`，重装/升级不清空 AI 的运行时改动
 - 🐋 鲸鱼品牌图标，横竖屏自由旋转
@@ -124,11 +127,11 @@
 
 下载 [Releases](https://github.com/woaiys3/deepseek-harness-android-app/releases) 里的 APK 安装即可：
 
-- **`DeepSeekHarness-official-v1.15.2.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
-- **`DeepSeekHarness-lite-v1.15.2.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
-- **`DeepSeekHarness-compat-v1.15.2.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
+- **`DeepSeekHarness-official-v1.16.1.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
+- **`DeepSeekHarness-lite-v1.16.1.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
+- **`DeepSeekHarness-compat-v1.16.1.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
 
-> ⚠️ **从 v1.15.0 或更早版本升级，请直接装 v1.15.2**：v1.15.0 有一处 P0（所有 agent preset 会话都建不起来），v1.15.1 已修；v1.15.2 又修掉三个只在真机上发作的问题。完整变更见 [CHANGES.md](CHANGES.md)。
+> ⚠️ **从任何旧版本升级，请直接装 v1.16.1**：v1.15.0 有一处 P0（所有 agent preset 会话都建不起来，v1.15.1 已修）；v1.15.3 → v1.16.1 的 **9 个版本**修掉了「插件装不上 / GitHub 装插件不通 / 证书报错 / 插件重启后消失 / 每次开机配置被重置」，并新增 **内置 Python 与 npm**。完整变更见 [CHANGES.md](CHANGES.md)。
 > 覆盖安装**不会丢配置**（模型/供应商、API Key、会话都保留）；同签名可直接覆盖，无需卸载。
 
 要求：
