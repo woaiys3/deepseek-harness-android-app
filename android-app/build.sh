@@ -144,6 +144,176 @@ cat > "$P/staging/bin/bash" <<'EOF'
 exec /system/bin/sh "$@"
 EOF
 chmod +x "$P/staging/bin/bash"
+# 内置 pnpm（v1.15.3）：插件管理的「添加插件」全程 pnpm add，而 payload 原本不带 pnpm → 退出码 127，
+# 三种输入（本地目录 / 包名 / GitHub 地址）全装不上。这里把 pnpm 的纯 JS bundle 一起打进 payload：
+#   payload/bin/pnpm  ← wrapper（payload/bin 在引擎 PATH 上，所以插件管理器能直接找到 pnpm）
+#   payload/pnpm/     ← pnpm 本体（bin/pnpm.cjs + dist/pnpm.cjs 等）
+# 取舍：不带 dist/node_modules（实测安装流程不依赖它，省 9MB）；不带 *.node
+#      （本项目 payload 红线=不带原生模块，且 pnpm 只提供 darwin/win32 的）。
+if [ -d "$H/pnpm" ]; then
+  rm -rf "$P/staging/pnpm"
+  cp -r "$H/pnpm" "$P/staging/pnpm"
+  cat > "$P/staging/bin/pnpm" <<'PNPMEOF'
+#!/system/bin/sh
+# DSH 内置 pnpm 包装脚本（Android 适配）
+#  · 不能用 #!/usr/bin/env node —— Android 没有 /usr/bin/env
+#  · node 优先走 PATH（App 启动引擎时已把 payload/runtime/bin 放进 PATH），兜底按自身位置推导
+#  · 默认 copy 导入：app 私有目录（SELinux）与 FUSE 外部存储都拒绝硬链接，pnpm 默认 hardlink 会失败
+SELF="$0"
+case "$SELF" in
+  */*) ;;
+  *) SELF=$(command -v pnpm 2>/dev/null) ;;
+esac
+DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+NODE=$(command -v node 2>/dev/null)
+[ -x "$NODE" ] || NODE="$DIR/../runtime/bin/node"
+if [ -z "$DIR" ] || [ ! -f "$DIR/../pnpm/bin/pnpm.cjs" ]; then
+  echo "dsh: 内置 pnpm 缺失（$DIR/../pnpm/bin/pnpm.cjs）" >&2
+  exit 127
+fi
+exec "$NODE" "$DIR/../pnpm/bin/pnpm.cjs" --config.package-import-method=copy "$@"
+PNPMEOF
+  chmod +x "$P/staging/bin/pnpm"
+  echo "  内置 pnpm: bin/pnpm + pnpm/ ($(du -sh "$P/staging/pnpm" | cut -f1))"
+else
+  echo "  !! 未找到 pnpm/（插件管理「添加插件」将不可用）"
+fi
+
+# 内置 git（v1.15.5）：插件管理的「添加插件」支持 GitHub 地址（git 形态的 spec 会先 git ls-remote 探活），
+# AI 自己也能用 git。payload 原本不带 git → 与 pnpm 同因（子进程找不到命令）。
+#   payload/bin/git                  ← 主程序（在引擎 PATH 上；git 还要靠 PATH 里的 git 拉起远程助手）
+#   payload/git/libexec/git-core/    ← git-remote-https / git-remote-http（独立二进制，非内建）
+#   payload/git/templates/           ← 仓库模板（配 GIT_TEMPLATE_DIR）
+# 取舍：不打包 libexec/git-core 里那 146 个与主程序同尺寸的硬链接副本（git-add/git-branch/… 多为内建，
+#      由主程序在进程内处理）；不带 less（分页器，用 GIT_PAGER=cat 代替）。
+#      依赖库 libiconv.so / libcharset.so 走 runtime/lib（已在 LD_LIBRARY_PATH 上）。
+if [ -d "$H/git" ]; then
+  rm -rf "$P/staging/git"
+  mkdir -p "$P/staging/git/libexec/git-core"
+  cp -L "$H/git/bin/git" "$P/staging/bin/git"
+  cp -L "$H/git/libexec/git-core/git-remote-https" "$P/staging/git/libexec/git-core/"
+  cp -L "$H/git/libexec/git-core/git-remote-http"  "$P/staging/git/libexec/git-core/"
+  cp -r "$H/git/templates" "$P/staging/git/templates"
+  chmod +x "$P/staging/bin/git" "$P/staging/git/libexec/git-core/"*
+  echo "  内置 git: bin/git + git/ ($(du -sh "$P/staging/git" | cut -f1))"
+else
+  echo "  !! 未找到 git/（「添加插件」的 GitHub 地址输入与 AI 的 git 将不可用）"
+fi
+
+# 内置 Python（v1.16.0）：AI 常要跑脚本做数据处理/解析，payload 原本完全没有 python。
+# 走项目既有老路（rg / curl / git / pnpm 都是这么来的）：Termux aarch64 deb 解包。
+#   payload/bin/python3  ← wrapper（payload/bin 在引擎 PATH 上，AI 直接 python3 就能用）
+#   payload/python/      ← 本体（bin/python3.14 + lib/python3.14 标准库 + lib-dynload）
+# 依赖库统一走 runtime/lib（已在 LD_LIBRARY_PATH 上），本版新增 13 个 .so 及其 soname 实体名：
+#   libpython3.14 / libandroid-support / libandroid-posix-semaphore / libbz2 / libcrypt /
+#   libexpat / libgdbm(+compat) / liblzma / libncursesw / libpanelw / libreadline / libzstd
+#   （libffi / libsqlite3 / libssl / libcrypto / libz / libc++_shared 早已随 node 带入，复用）
+# 取舍：不带 include/（C 头）与 pkgconfig —— 只有现场编译 C 扩展才需要；
+#      PYTHONHOME **不用设**：python 按 argv0 自推 prefix=<payload>/python（真机实测通过）。
+if [ -d "$H/python" ]; then
+  rm -rf "$P/staging/python"
+  cp -r "$H/python" "$P/staging/python"
+  cat > "$P/staging/bin/python3" <<'PYEOF'
+#!/system/bin/sh
+# DSH 内置 Python 包装脚本
+#  · 不能用 #!/usr/bin/env python3 —— Android 没有 /usr/bin/env
+#  · LD_LIBRARY_PATH 兜底：正常由 App 启动引擎时设好，这里防手工执行时缺库
+SELF="$0"
+case "$SELF" in
+  */*) ;;
+  *) SELF=$(command -v python3 2>/dev/null) ;;
+esac
+DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+[ -n "$LD_LIBRARY_PATH" ] || { LD_LIBRARY_PATH="$DIR/../runtime/lib"; export LD_LIBRARY_PATH; }
+if [ -z "$DIR" ] || [ ! -x "$DIR/../python/bin/python3.14" ]; then
+  echo "dsh: 内置 python 缺失（$DIR/../python/bin/python3.14）" >&2
+  exit 127
+fi
+exec "$DIR/../python/bin/python3.14" "$@"
+PYEOF
+  chmod +x "$P/staging/bin/python3"
+  cp "$P/staging/bin/python3" "$P/staging/bin/python"
+  chmod +x "$P/staging/bin/python"
+  cat > "$P/staging/bin/pip" <<'PIPEOF'
+#!/system/bin/sh
+# DSH 内置 pip 包装脚本（与 bin/python3 同源，只换 -m 参数）
+SELF="$0"
+case "$SELF" in
+  */*) ;;
+  *) SELF=$(command -v pip 2>/dev/null) ;;
+esac
+DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+[ -n "$LD_LIBRARY_PATH" ] || { LD_LIBRARY_PATH="$DIR/../runtime/lib"; export LD_LIBRARY_PATH; }
+if [ -z "$DIR" ] || [ ! -x "$DIR/../python/bin/python3.14" ]; then
+  echo "dsh: 内置 python 缺失（$DIR/../python/bin/python3.14）" >&2
+  exit 127
+fi
+exec "$DIR/../python/bin/python3.14" -m pip "$@"
+PIPEOF
+  chmod +x "$P/staging/bin/pip"
+  cp "$P/staging/bin/pip" "$P/staging/bin/pip3"
+  chmod +x "$P/staging/bin/pip3"
+  echo "  内置 python: bin/python3 + python/ ($(du -sh "$P/staging/python" | cut -f1))"
+else
+  echo "  !! 未找到 python/（AI 的 python / python3 将不可用）"
+fi
+
+# 内置 npm（v1.16.0）：AI 需要自己装 node 包。payload **已有 node v26.4.0**（引擎就跑在它上面，
+# 且 runtime/bin 在引擎 PATH 上，AI 本就能直接 node xxx.js），但 Termux 的 nodejs 包不含 npm
+# （npm 是单列的另一个 deb），所以「装 node 包」这条链是断的。
+#   payload/bin/npm  ← wrapper → node + payload/npm/bin/npm-cli.js
+#   payload/bin/npx  ← wrapper → node + payload/npm/bin/npx-cli.js
+#   payload/npm/     ← npm 本体（bin/ lib/ node_modules/ package.json …）
+# 取舍：裁掉 docs/（2.4M）与 man/（466K）—— 纯文档，运行时用不到，16M → 13M。
+#      全局安装落点由 HOME 决定（App 里 HOME = filesDir，可写，无需额外配置）。
+if [ -d "$H/npm" ]; then
+  rm -rf "$P/staging/npm"
+  cp -r "$H/npm" "$P/staging/npm"
+  cat > "$P/staging/bin/npm" <<'NPMEOF'
+#!/system/bin/sh
+# DSH 内置 npm 包装脚本
+#  · 不能用 #!/usr/bin/env node —— Android 没有 /usr/bin/env
+#  · node 优先走 PATH（App 启动引擎时已把 payload/runtime/bin 放进 PATH），兜底按自身位置推导
+SELF="$0"
+case "$SELF" in
+  */*) ;;
+  *) SELF=$(command -v npm 2>/dev/null) ;;
+esac
+DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+NODE=$(command -v node 2>/dev/null)
+[ -x "$NODE" ] || NODE="$DIR/../runtime/bin/node"
+if [ -z "$DIR" ] || [ ! -f "$DIR/../npm/bin/npm-cli.js" ]; then
+  echo "dsh: 内置 npm 缺失（$DIR/../npm/bin/npm-cli.js）" >&2
+  exit 127
+fi
+#  · 全局安装落点改到 $HOME/.npm-global：默认前缀是 <payload>/runtime（payload 内，
+#    升级会被覆盖，且未必可写）；HOME = App filesDir，可写且跨版本升级保留。
+[ -n "$HOME" ] && { NPM_CONFIG_PREFIX="$HOME/.npm-global"; export NPM_CONFIG_PREFIX; }
+exec "$NODE" "$DIR/../npm/bin/npm-cli.js" "$@"
+NPMEOF
+  chmod +x "$P/staging/bin/npm"
+  cat > "$P/staging/bin/npx" <<'NPXEOF'
+#!/system/bin/sh
+# DSH 内置 npx 包装脚本（同 npm，只换入口）
+SELF="$0"
+case "$SELF" in
+  */*) ;;
+  *) SELF=$(command -v npx 2>/dev/null) ;;
+esac
+DIR=$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)
+NODE=$(command -v node 2>/dev/null)
+[ -x "$NODE" ] || NODE="$DIR/../runtime/bin/node"
+if [ -z "$DIR" ] || [ ! -f "$DIR/../npm/bin/npx-cli.js" ]; then
+  echo "dsh: 内置 npx 缺失（$DIR/../npm/bin/npx-cli.js）" >&2
+  exit 127
+fi
+exec "$NODE" "$DIR/../npm/bin/npx-cli.js" "$@"
+NPXEOF
+  chmod +x "$P/staging/bin/npx"
+  echo "  内置 npm: bin/npm + bin/npx + npm/ ($(du -sh "$P/staging/npm" | cut -f1))"
+else
+  echo "  !! 未找到 npm/（AI 的 npm / npx 将不可用）"
+fi
 
 # Shizuku 运行时（rish dex）：独立放 assets 供权限界面检测，同时放 payload 供 DSH 插件调用
 cp "$H/rish/rish_shizuku.dex" "$P/assets/rish_shizuku.dex"
