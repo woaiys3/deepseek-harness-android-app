@@ -15,6 +15,9 @@
 - 👁️ **无障碍屏幕助手**（v1.7.0）：系统设置开启「DeepSeek Harness 屏幕助手」后，AI 能**读屏、点击、输入、滚动、无障碍截图理解**——**不需要 root / Shizuku**，与特权通道互补
 - 🖥️ **虚拟屏 vscreen**（v1.10+）：AI 可以创建一块**独立于主屏的真·虚拟屏**，把 App 启动进去、在里面点击/滑动/输入，**你的主屏照常用**；右上角悬浮窗**实时显示虚拟屏画面**（H.264 视频流，可拖动、可双指缩放），AI 在干什么全程可见。实现移植自开源项目 [Operit](https://github.com/AAswordman/Operit)（LGPL-3.0，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)）
 - 🎛️ **原生控制台**（v1.12+）：冷启动先进 App 自己的控制台（**解压 / 权限 / 插件开关 / 日志** 四页），不必先等引擎起来；引擎状态判定全面重做——探测不再吃掉一次性 token、不再误报“未启动”、不会重复拉起两个引擎
+- 🎨 **控制台「一切皆自定义」**（v1.17.3）：一份 `/sdcard/<包名目录>/console/console.json` 就能改控制台的**外观**（配色 / 字号 / 圆角 / **照片背景**，含压暗·模糊·视差）、**布局**（卡片显隐顺序，甚至**整页自己拼控件树**）、**文案**（52 个键）、**行为**（自定义按钮 + 动作，含 shell）；主题包可**导出/导入 zip**，主题页内置 **5 条「让 AI 做主题包」提示词**与离线自检工具。坏配置自动回退、救援面不可移除、长按品牌字一键回默认 —— **永不因为配置打不开 App**
+- 🩹 **混装树自愈**（v1.17.3）：升级后引擎起不来（`cosmokit does not provide an export named …` 那一类）**不用再清数据** —— 控制台点一次「重新解压」即可修好；清理只发生在内核自己的 `@deepseek-ai` 命名空间、**只删 `dsh*` 陈旧包，绝不碰用户数据与第三方插件**
+- 🌐 **兼容版自带浏览器引擎**（v1.17.3）：compat 内嵌 **GeckoView**，不再依赖系统 WebView（Chromium 91~93 的老设备也能跑）；代价是体积约 250MB、minSdk 提升到 26
 - 🚑 **救援能力**（v1.15+）：控制台提供「**安全模式启动 / 退出**」与「**导出全部数据 / 从备份导入还原**」。插件把配置写成非法 YAML 会导致引擎拒启（历史上只能清数据），安全模式把用户层整体旁置后用出厂配置启动、**不动会话与凭证**；备份导出把会话/插件/配置打成 zip 存到 `Download`，换机或彻底重装可还原
 - 🔐 **Shizuku 通道改走 App 进程**（v1.13.1+）：特权命令执行从“引擎内 `rish` 子进程”改为**经 App 进程内的 Shizuku API**（新增本地 `/shell` 路由 + 随机令牌鉴权），根治手机上偶发的 `Request timeout. The connection between the current app … and Shizuku app …`
 - ⏰ **前台保活**（v1.4.0）：AI 干活时挂后台/锁屏不被杀，任务完成推送通知
@@ -127,12 +130,18 @@
 
 下载 [Releases](https://github.com/woaiys3/deepseek-harness-android-app/releases) 里的 APK 安装即可：
 
-- **`DeepSeekHarness-official-v1.17.1.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
-- **`DeepSeekHarness-lite-v1.17.1.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
-- **`DeepSeekHarness-compat-v1.17.1.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），老 WebView 设备可用
+- **`DeepSeekHarness-official-v1.17.3.apk`（正式版，推荐）**：包名 `com.deepseek.harness`，从旧版本同签名升级
+- **`DeepSeekHarness-lite-v1.17.3.apk`（Lite 共存版）**：包名 `com.deepseek.harness.beta`（端口 3082），与正式版完全独立、可同时安装；数据独立在 `/sdcard/DeepSeekHarnessLite/`，API Key 需单独填
+- **`DeepSeekHarness-compat-v1.17.3.apk`（兼容版）**：包名 `com.deepseek.harness.compat`（端口 3084），**内置 GeckoView（不依赖系统 WebView）**，老设备可用；体积约 250MB、要求 **Android 8.0（API 26）**及以上
 
-> ⚠️ **从任何旧版本升级，请直接装 v1.17.1**：本版**内核升级到 DSH 0.2.0-rc.2**（上游最新），并修了两个社区报告的缺陷（虚拟屏入口闪退、平板分屏界面白闪）；同时**移除了自研定时任务**（0.2.0 内核自带，可在控制台插件页启用）。历史上的 v1.15.3 → v1.16.1 还修掉了「插件装不上 / GitHub 装插件不通 / 证书报错 / 插件重启后消失 / 每次开机配置被重置」，并新增**内置 Python 与 npm**。完整变更见 [CHANGES.md](CHANGES.md)。
-> 覆盖安装**不会丢配置**（模型/供应商、API Key、会话都保留）；同签名可直接覆盖，无需卸载。
+> ⚠️ **从任何旧版本升级，请直接装 v1.17.3**（这是 v1.17.1 之后的第一次发布，内容覆盖 v1.17.2 + v1.17.3）：
+> ① **兼容版内嵌 GeckoView**，老设备不再白屏；② **控制台「一切皆自定义」**（主题包：外观含背景图 / 布局含整页控件树 / 文案 / 自定义按钮与动作）；
+> ③ **混装树自愈** —— 升级后引擎起不来可以一键「重新解压」修好，不必再清数据；④ 修掉两个真机问题：多模态全挂（`fsync EINVAL`）与展开侧边栏后正文纯白；
+> ⑤ 老 WebView 提示阈值 80 → 94（不再静默白屏）。**覆盖安装不会丢配置**（模型/供应商、API Key、会话、插件都保留）；同签名可直接覆盖，无需卸载。
+> 完整变更见 [CHANGES.md](CHANGES.md)。
+
+> ℹ️ 内核已是 **DSH 0.2.0-rc.2**（v1.17.0 升级，上游当前 latest），并**移除了自研定时任务**（0.2.0 内核自带 `@deepseek-ai/dsh-schedule`，到点作为 follow-up 投递回原会话，可在 控制台 →「插件」页启用）。v1.17.1 另修了两个社区报告的缺陷：虚拟屏入口闪退（[#36](https://github.com/woaiys3/deepseek-harness-android-app/issues/36)）、平板分屏界面白闪（[#37](https://github.com/woaiys3/deepseek-harness-android-app/issues/37)）。
+> 更早的 v1.15.3 → v1.16.1 修掉了「插件装不上 / GitHub 装插件不通 / 证书报错 / 插件重启后消失 / 每次开机配置被重置」，并新增**内置 Python 与 npm**。完整变更见 [CHANGES.md](CHANGES.md)。
 
 要求：
 - Android 7.0（API 24）及以上
@@ -172,7 +181,16 @@ mobile-patch/            移动端适配（注入 DSH 前端，不覆盖原生�
 plugins/                 手机端自定义 DSH 工具插件
 ├── dsh-tool-shizuku/    特权 shell（Shizuku 通道）
 ├── dsh-tool-android/    结构化系统操作（包管理/应用/设置/截图/输入）
-└── dsh-tool-accessibility/  无障碍读屏/模拟操作（v1.7.0）
+├── dsh-tool-accessibility/  无障碍读屏/模拟操作（v1.7.0）
+└── dsh-tool-vscreen/    虚拟屏工具（create/status/launch/see/tap/swipe/key/close，v1.10+）
+
+console-theme/           控制台主题包规范与工具链（v1.17.3，随 APK 分发到设备）
+├── THEME-PACK-SPEC.md   自包含规范（字段速查 / 卡片·积木·动作三张 id 表 / 5 条提示词模板）
+├── console.schema.json  机器可读 schema（与 App 侧解析同一套规则）
+├── console.example.json 可直接用的示例主题
+├── theme_pack_check.py  零依赖离线校验器（AI 生成主题包后自检用）
+├── test-checker.py      校验器自测（5 用例）
+└── make-demo-theme.py   扮演"生成主题包的 AI"：现画背景图 → 写配置 → 打包 → 自检
 
 dsh-patches/             DSH 源码补丁归档 + overlay
 ├── README.md            补丁说明（适配原因/升级 DSH/打包）
