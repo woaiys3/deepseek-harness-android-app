@@ -1,3 +1,206 @@
+## v1.17.3（正式版 + Lite 共存版 + 兼容版 · 2026-10-03）
+
+> ⚠️ **这是 v1.17.1 之后的第一次发布**，内容覆盖 **v1.17.2 + v1.17.3** 两级（中间那两级从未单独发布过）。
+> **一句话**：**兼容版自带浏览器引擎**、**控制台"一切皆自定义"（主题包）**、**升级后引擎起不来可以一键修好**。
+> versionCode **52**（从 v1.17.1 的 50 跨上来），内核仍 **DSH 0.2.0-rc.2**；同签名覆盖安装，**配置 / 会话 / 插件都不丢**。
+
+### 一、兼容版内嵌 GeckoView —— 不再依赖系统 WebView
+
+**为什么做**：老设备（Chromium 91~93）打开界面纯白（[#38](https://github.com/woaiys3/deepseek-harness-android-app/issues/38)），
+而"兼容版"此前同样是靠系统 WebView + 语法降级，救不了这一类设备。现在**兼容版自带 GeckoView 引擎**，与系统 WebView 版本彻底解耦。
+
+| 项 | 值 |
+|---|---|
+| 引擎 | GeckoView `157.0.20260924084938`（arm64） |
+| 体积 | compat 由 ~157MB → **250MB**（+86MB，13 个 `.so` + `omni.ja`） |
+| minSdk | compat 由 24 → **26**（正式版 / Lite 仍 24） |
+| 打包 | 无 Gradle：手工并入 12 个 androidx AAR + kotlin-stdlib/guava 等，`aapt --extra-packages` 逐个生成 R 类，`d8 --min-api 26`，**javac 后硬闸门断言 4 个 R 类存在** |
+| 接入 | `MainActivity` 里 `new WebView(...)` → 内层类 `GvWebView`（`GeckoView` + `GeckoSession`）：`loadUrl/goBack/onResume/onPause/destroy/setBackgroundColor` 接口不变，**上层 60+ 处调用一行没改** |
+
+- **有意退化两处（如实说明）**：① 该版 GeckoView **没有 JS 求值接口**（`evaluateJavascript` 无对应物），所以"页面底色回填"（`refreshPageBackground`）
+  改为**跟随 App 主题**；② `addJavascriptInterface("dshshell")` 无对应物，整段移除（该桥在本项目没有被使用）。
+- **真机实测**：不再闪退，先 `HARNESS / Loading plugins…` 约 40 秒后进入完整主界面，侧边栏抽屉正常，引擎 PID/端口正常。
+- ⚠ **未完成的部分**：发消息实跑、退出确认弹窗 / 鲸鱼悬浮窗 / 虚拟屏、**附件选择**（`handleFilePrompt` 写了但**尚未实测**）、
+  Chromium 91 那台设备的复测 —— 都还挂在 [#38](https://github.com/woaiys3/deepseek-harness-android-app/issues/38) 上。
+
+### 二、控制台"一切皆自定义"（主题包体系，四层全通）
+
+一份 `/sdcard/<包名目录>/console/console.json` 就能改控制台的**外观 / 布局 / 文案 / 行为**，改完存盘几秒生效（热重载）。
+配套**主题包**（zip）可导出/导入，主题页内置 5 条"让 AI 生成主题包"的提示词。
+
+| 层 | 能改什么 |
+|---|---|
+| **外观** | 深/浅两套配色（bg/card/text/sub/line/accent/green/red/track/statusBar）、字号（×0.8~1.4）、圆角（0~32）、日志等宽、logo、卡片不透明度；**背景图**：cover/contain/stretch/tile/center + 九宫格锚点 + 透明度 + 压暗 + 模糊（Android 12+）+ 视差 |
+| **布局** | 卡片显隐 / 顺序 / 默认页 / 详情默认展开 / 紧凑（间距减半）；**整页声明式控件树** `layout.pages`：`row/column/card/text/button/image/spacer/divider/builtin`，17 个内置积木（引擎启停、解压块、权限/插件摘要、日志预览、救援按钮、主题卡…），可自己拼页、加第二页 |
+| **文案** | 52 个键（主控台 33 + 主题页 19）：卡片标题、按钮、状态行、底部说明…（不写配置时**一字不变**） |
+| **行为** | `actions[]` 自定义按钮（主控台"我的按钮"卡片）：内置动作（引擎启停 / 解压 / 校验 / 打开权限·插件·日志 / 主题操作）、`url`、`clipboard`、`toast`、`settings`、**`shell`**（App 身份或特权）；可写成数组（组合动作） |
+
+- **主题页（控制台第 5 页）**：当前主题状态 + 五个操作（重新加载 / **导出主题包** / **导入主题包** / 恢复默认 / 打开主题目录）、
+  5 条可复制的提示词、规范与自检入口、可执行动作清单、**诊断**（看解析结果与回退项）。
+- **兜底与救援（永不因为配置打不开 App）**：语法错 → 整体回退 + 顶部黄条（`last-error.txt` 记原因，`console.json.bak` 留底）；
+  单项非法 → 只回退那一项并列出；schema 版本更高 → 整体回退；「恢复默认」= 改名 `console.json.disabled-<时间戳>`（不删）；
+  **救援面（救援卡片 / 主题页）不可从布局里移除**；逃生口：**长按左上角品牌字 →「以默认样式打开控制台」**。
+- **安全红线**：`shell`/`http`/`intent`/`prompt` 这类**可执行动作**，界面上是**红框按钮 + 点击时弹确认框 + 显示命令原文**
+  （并注明"它来自主题配置，可能是 AI 生成的"）—— **AI 生成的包不可能静默拿到执行能力**。
+- **随包分发**：`assets/console-theme/`（规范 `THEME-PACK-SPEC.md`、`console.schema.json`、示例、**零依赖离线校验器 `theme_pack_check.py`**）
+  首次运行解到 `/sdcard/<包名目录>/console/`，设备上的 AI 不联网也能读到规范、自己生成合规主题包。
+- **未做（如实列出）**：`behavior`（自动解压 / 自动起引擎 / 双击退出）、`http`/`intent` 真正执行、`prompt` 自动发给 AI（需内核 RPC）、
+  导入时"逐个确认 + 内容哈希"（目前是**点击时确认**，安全效果等价但少一道）、动作执行写进日志页、权限/插件/日志页的页内文案。
+
+### 三、混装树自愈：升级后引擎起不来，不用再清数据
+
+**现象**（真实故障）：内核升级后引擎报 `cosmokit does not provide an export named 'updateVolatile'` 直接拒启，
+**连"重新解压"都救不回**，用户唯一出路是「导出数据 → 清除数据 → 重建 → 还原」。
+
+**根因（两条）**：① 外部内核树在**全量模式**下仍然"文件已存在就跳过" → 上游改过的文件永远是旧的（引擎 import 到旧导出 → 拒启）；
+② 两种模式都**不清孤儿** → 上游删掉的文件留在树里，尤其 `…/dsh/node_modules/@deepseek-ai/` 下的**旧嵌套副本会被 Node 优先解析**。
+
+**修法（只在整个树全量同步时跑：内核版本变化 / 上次解压被打断 / 用户点「重新解压」）**：
+1. 全量模式**按 payload 覆盖写**（只覆盖 payload 里有的文件；用户文件与 profile 合并等既有规则**一律不变**）；
+2. 解压后**清掉 payload 已不存在的陈旧内核包**；
+3. **如实上报**：控制台 toast「解压完成（顺带清理了 N 个内核树里多余的文件）」，不静默。
+
+> **安全边界写死在代码里**（用户明确要求：不能删用户自己的东西、装的插件）：
+> 只在 `…/node_modules/@deepseek-ai`（顶层）与 `…/@deepseek-ai/dsh/node_modules/@deepseek-ai`（嵌套）**两个目录**里跑，
+> 且**只删名字以 `dsh` 开头的条目**；其他名字只记一条"跳过"日志，**一个都不动**。
+> 用户数据（`dshhome/**`）、第三方插件（`dshhome/profiles/**`）、AI 运行时产物**永不被删**。
+
+**真机验收（三条，全部通过）**：
+- ① **健康树零误删**：修好后再点「重新解压」→ `extracted 25787 entries`，**零 `prune stale`**、toast 不带"清理了 N 个"；对照文件 md5 全部不变；
+- ② **陈旧内核包被清**：真机上一次性清掉 **91** 个（含旧内核残留 `dsh-agent-presets` 与 `dsh-tool-vscreen` 的嵌套副本），
+  控制台文件计数 28,491 → **28,400**（正好 −91）；
+- ③ **用户的东西一个不少**：用 App 自带「导出全部数据」做前后对账（328 vs 329 条，逐条 SHA256）——
+  **消失 0 条**、内容变化只有时间戳文件、会话/插件/凭证原样；清理后引擎正常、`session/create` 返回
+  `{"ok":true,…,"agentPreset":"standard"}`。
+
+### 四、其他
+
+- **老 WebView 提示阈值 80 → 94**：0.2.0 前端真正需要的是 **Chromium 94**（`class static {}`），此前 80~93 的设备**静默白屏且不提示**；现在会明确告诉你"内核太旧 + 装兼容版"。
+- **三套彻底对齐**：official / Lite / compat 都由同一份最新源码重编并装机，设备端 `md5sum` 与发布包**逐字节一致**
+  （Lite 从 vc51/1.17.2 直接跨到 vc52/1.17.3）。
+
+### 五、已知限制（如实列出，未变）
+
+- **语音输入在 Android 上不可用**：上游把 `android-arm64` 硬排除在本地语音白名单外，且底层是原生模块，与本项目"payload 不带原生模块"冲突 → 需要上游支持。
+- **含 C 扩展的 Python 包**（numpy/pandas 等）装不了（无编译工具链）；纯 Python 包正常。
+- **侧栏终端 / Office 预览**依赖被剥离的原生模块，不可用。
+- 虚拟屏 **8998/8999 端口三变体共用**（正式版与 Lite 同时开虚拟屏只能二选一）；识图大图不缩放。
+- **compat 的 GeckoView 接入尚有待测项**（见 §一 的"未完成的部分"）。
+
+### 六、升级建议
+
+- 从任何旧版本**直接装 v1.17.3**（同签名可覆盖，不丢配置）；Lite 共存版与 compat 各自独立安装。
+- 升级后控制台若显示"未解压"，点一次「解压文件 / 重新解压」即可（versionCode 变了会走一次解压）。
+
+## v1.17.2（正式版 + Lite 共存版 + 兼容版 · 2026-10-03）
+
+> **修两个真机问题**：① 发截图 / `read_image` / `android_see` 等一切要走内容寻址附件存储的操作，
+> 全量报 `EINVAL: invalid argument, fsync`，整条链路中断；② 展开侧边栏后**正文整片消失（纯白）**。
+> versionCode **51**，内核仍 **DSH 0.2.0-rc.2**。
+> 报告来源：用户设备反馈（fsync 那条附带了逐级复现证据与根因定位；侧边栏那条为现场截图）。
+
+### 🐛 根因（三层，前两层不是 bug，第三层才是）
+
+真机逐级测试的实际结果：
+
+```
+/data/user/0               open->EACCES   ← 已被既有补丁挡下
+/data/user                 open->EACCES
+/data                      open->EACCES
+/                          open OK  sync->EINVAL   ← 真凶：裸奔的 sync 调用
+```
+
+1. **内核行为（非 bug）**：`fsync("/")` 返回 `EINVAL` 是 POSIX 允许的正常行为 —— 根目录是只读的，
+   没有任何需要落盘的目录项。
+2. **算法设计（可商榷，未改）**：`ensureDurableHome` 拿 `parse(home).root`（即 `/`）当目录持久化同步的边界；
+   在 Android 沙盒下 App 永远无法越过 `/data/user/0` 向上 `fsync`。也就是说「保证到 `/` 都持久」
+   在 Android 上原理上就不可达 —— 但目录同步本就是**尽力而为**，所以保留边界、只做容错。
+3. **★ 移植补丁缺陷（真 bug）**：`dsh-attachment-local` 的 `syncDirectory()` 里，
+   `open` 失败的 `catch` 已经处理了 `EACCES`/`EPERM`，**但紧随其后的 `handle.sync()` 完全没有 catch** ——
+   于是 `sync("/")` 的 `EINVAL` 直接抛穿整条附件写入链。
+
+### ✅ 修法
+
+把 `EINVAL` / `ENOTSUP` / `EOPNOTSUPP` 与 `EACCES` / `EPERM` 同等对待（「该目录不支持持久化同步」→ 跳过）；
+**但保留 `ENOSPC`（磁盘满）与 `EIO`（硬件 I/O 错误）的抛出**，不拿容错掩盖真实故障。
+
+| 包 | 位置 | 性质 |
+|---|---|---|
+| `dsh-attachment-local` | `syncDirectory()` | **真 bug**（真机上正在炸的就是它） |
+| `dsh-storage-json` | `fsyncDirectory()` | 同类加固（裸奔的目录 fsync） |
+| `dsh-session-persistence-jsonl` | `syncDirectory()` + `syncDirPosix()` | 同类加固（同上） |
+
+> **没有改的一处**：`dsh-fs-local` 的 `writeFileAtomic()` 里也有一个裸 `handle.sync()`，
+> 但那是对**临时文件句柄**（`open(tempPath, "wx")`）的 fsync —— 文件 fsync 裸奔是**正确**的，
+> 必须让 `ENOSPC`/`EIO` 照常抛出。**不要**把那处也加上容错。
+
+### 🔧 配套改动（缺一不可）
+
+- **`overlay-020` 固化**：`dsh-storage-json/lib/index.js` 成为 overlay-020 的**第 13 个补丁文件**；
+  另两个包的文件同步更新。`deploy-patches-020.sh` 的文件清单、关键补丁断言、语法自检一并扩容。
+- **App 白名单（四份 `MainActivity.java`）**：`FORCE_OVERWRITE_PREFIXES` 增加 `dsh-storage-json/`。
+  内核版本号没变 → 覆盖安装走 `dshroot-fast` 同步，**只覆盖白名单**；不加这一行，
+  这个补丁进包了也不会落到设备上（v1.11 / v1.15.1 / v1.15.2 都栽过这个坑）。
+
+### 🖼️ 第二个修复：展开侧边栏后正文整片消失（纯白）
+
+**现象**：手机上点左上角三条杠展开侧边栏后，侧边栏右边那一片是**纯白**，聊天内容完全不见。
+
+**根因（我方移动端补丁的缺陷，非上游）**：`dsh-client-ui-layout/lib/client.js` 的浮层抽屉补丁
+把 `sidebarCol` 这个 **grid item 自己**设成了 `position: fixed`。
+
+```
+网格：0px | 720px | 0px      （窄屏：侧栏与右栏都取 0，侧栏改浮层）
+子元素：sidebarCol(fixed→脱离流) · centerCol · rightbarCol
+```
+
+grid item 一旦脱离流，后面的两个子元素就**自动前移一列**：
+
+| | sidebarCol | centerCol（聊天） | rightbarCol |
+|---|---|---|---|
+| 修前（展开） | fixed 浮层 | 落到第 1 列 → **0px** ❌ | 落到第 2 列 → **720px** |
+| 修后（展开） | 在流内占 0px | 第 2 列 → **720px** ✅ | 第 3 列 → **0px** ✅ |
+
+于是聊天列宽度为 0 → 整片白，而那个空白右栏占满全屏。**折叠状态看起来正常**，所以只在「打开侧边栏」时才暴露。
+
+**修法**：`sidebarCol` 保持在流内（占 0px 的第 1 列），改用**内层 div** 承担 fixed + 阴影 —— 网格自动放置就不会错位（真机实测：`center 0→720`，`right 720→0`）。
+
+**真机复现与验证**（PLT120 / Android 15，用 Playwright 直连设备上正在跑的引擎，视口 720×1570）：
+
+| 步骤 | 结果 |
+|---|---|
+| 折叠态基线 | `grid = 0px 720px 0px`，center=720 ✅ 正常 |
+| 点三条杠展开 | center=**0**、right=**720** → **纯白复现** ❌ |
+| DOM 里把三列显式钉住 | center=**720**、right=0 → 证实根因 ✅ |
+| DOM 里换成内层 fixed 包装 | center=**720**、right=0，抽屉 280×1570 正常显示 → 采纳本方案 ✅ |
+
+> `dsh-client-ui-layout/lib/client.js` **本来就在 `FORCE_OVERWRITE_PREFIXES` 白名单里**，无需额外改 App。
+
+### 🧪 验证（本轮实际跑过的）
+
+| 项 | 方法 | 结果 |
+|---|---|---|
+| **errno 矩阵 + 整链走位** | 从 **v1.17.1 出货 APK 的 payload**（修复前）与**修复后的内核树**各**逐字抽出**真实函数体跑，注入假 `open`/句柄 | **PASS=141 FAIL=0** |
+| └ 关键 A/B | 同一段「逐级向上 fsync 到 `/`」走位：修复前在 `sync("/")` 抛 EINVAL（复现报告现象）；修复后通过 | ✅ |
+| └ 不吞真实故障 | `ENOSPC` / `EIO` / `EPERM` 仍然抛出；句柄始终关闭；`win32` 早退未变 | ✅ |
+| 图像回归（`sharp-shim` 单测） | `tmp-diag/v115/shim-test.mjs` | **PASS=24 FAIL=0** |
+| 图像回归（真实 PNG 往返） | `tmp-diag/v115/regress-test.mjs` | 40 个 PNG 全部往返成功、0 失败；JPEG 无回归 |
+| 引擎启动 | 用修复后的树 `--profile web`（`--expose-internals`） | 只打印一行 token URL，**零警告零 pending** |
+| 会话可建 | `tmp-diag/v1200/rpc-check.mjs` | `{"ok":true,"sessionId":"session-…","agentPreset":"standard"}` |
+| 配置树 | `--profile web --dump-config` | `not found` 命中 **0**；三个补丁包均在挂载列表 |
+| 落补丁脚本 | 复跑 `deploy-patches-020.sh`（对现役树） | **幂等**（`dsh/package.json` md5 不变）；14 个文件✅ / 10 条关键断言✅ / 语法自检 12 项 0 FAIL |
+| payload 红线 | `find dshroot -name '*.node' -o -name '*.so' -o -name '*.dll'` | **0**；树体积 **253M**（未变） |
+
+### 已知边界
+
+- **只覆盖 PNG 像素级校验**（非 PNG 仍原样透传）、`JPEG/WebP/GIF` 不缩小 —— 均为既有取舍，本轮未动。
+- 两条**已被坏图写入历史**的旧会话仍会复现旧错误（本轮修的是「不再产生新的失败」，不改已落盘数据）。
+- **语音输入在本项目上不可用**（用户再次反馈，本轮复核结论不变）：`dsh-experimental-speech-to-text-sensevoice/lib/index.js:200-207`
+  是**上游硬编码的平台白名单**，只有 `darwin-arm64/x64`、`linux-arm64/x64`、`win32-x64`，
+  **`android-arm64` 被排除**（报错原文即 `Local speech is unavailable for android-arm64`）；
+  且底层 `sherpa-onnx-node` 是**原生模块**，与本项目「payload 不带原生模块」的红线直接冲突。
+  该能力**不是我们能修的**，需上游支持 —— 归为上游需求，不在本版本内。
+
 ## v1.17.1（正式版 + Lite 共存版 + 兼容版 · 2026-10-01）
 
 > 在 v1.17.0（内核 0.2.0-rc.2）基础上**删除自研定时任务功能**：0.2.0 内核自带了定时任务，
